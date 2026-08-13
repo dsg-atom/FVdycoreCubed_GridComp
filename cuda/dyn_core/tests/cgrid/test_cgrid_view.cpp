@@ -26,4 +26,13 @@ int main() {
   pe_like.stride[1] = 17;
   assert(pe_like.offset(1, 0) == 0);
   assert(pe_like.offset(4, 2) == 37);
+
+  fv3::gpu::DeviceViewBase shared{};
+  shared.data = nullptr;
+  shared.rank = 3;
+  shared.lower = {-3, 2, 1, 0};
+  shared.stride = {1, 11, 77, 0};
+  auto v2 = fv3::gpu::cgrid::make_view<const double, 3>(shared);
+  assert(v2.offset(-3, 2, 1) == 0);
+  assert(v2.offset(-1, 4, 3) == 178);
 }

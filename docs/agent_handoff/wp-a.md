@@ -226,4 +226,115 @@ own content-derived SHA.
 5. Validate `DC10`, `DC20`, and `DC30` against authoritative Fortran savepoints.
 6. Integrate halo events, then hand off to WP-B.
 
+## WP-E V2 Resume
+
+### WP-E v2 commit consumed
+
+Consumed cherry-picked commit `32fa2ba` (`Add FV3 GPU internal contract version
+2`). The public ABI remains version 1; WP-A now targets internal contract 2 in
+`fv3_gpu_internal.hpp`.
+
+### Previous blockers and status
+
+- **CONTRACT CHANGE REQUEST 1 — PARTIALLY RESOLVED.** `FieldId`, O(1)
+  `FieldRegistry`, `ImmutableViews`, `NumericalConfig`, `WorkspaceId::cgrid`,
+  borrowed `Submission`, and `DependencyState` satisfy state lookup, common
+  configuration, persistent arena, stream, and halo-state requirements.
+  Authoritative `d2a2c_vect/c_sw` still cannot be expressed because stable
+  views do not include `cosa_s`, `rsin2`, `dxa`, `dya`, `rarea_c`, or an
+  unambiguous corner Coriolis `fC`; the local corner-fill dispatch also has no
+  operation parameters.
+- **CONTRACT CHANGE REQUEST 2 — RESOLVED BY WP-E V2.**
+  `NumericalDispatch::cgrid_vertical_solver` accepts the shared restricted
+  `ExecutionContext`, including registered views, vertical arena, borrowed
+  compute submission, and dependency state. Integration can now invoke WP-C's
+  C-column solver without a host transfer or WP-A solver duplication.
+
+### Additional implementation completed
+
+- Connected the existing exact nonhydrostatic pressure-gradient kernels to
+  `DeviceViewBase`/`FieldRegistry` without changing their numerical formulas.
+- Added `launch_cgrid_pressure_v2`, suitable for registration as
+  `NumericalDispatch::cgrid_pressure`.
+- The adapter validates internal contract context and compute-stream role,
+  resolves all required mutable and immutable fields by stable `FieldId`,
+  rejects the untranslated hydrostatic branch, derives `dt2=bdt/n_split/2`,
+  enqueues on the borrowed WP-E stream, and marks `H_CWIND` stale.
+- Extended the CPU indexing test to cover conversion from the WP-E v2 shared
+  device view.
+
+### Remaining missing routines
+
+Grouped `d2a2c_vect`, the rest of `c_sw`, `divergence_corner`, cubed-sphere
+corner fills, `update_dz_c`, and the WP-A pre/post adapter for
+`Riem_Solver_C`. The nested `divergence_corner_nest` branch remains outside the
+milestone-one global-grid configuration.
+
+### Resume compile status
+
+- WP-A C++ view test: PASS in R8 and R4.
+- WP-E package CMake build/tests: PASS in R8 and R4 after the WP-A header
+  changes (the WP-A `.cu` file is not part of the integration-owned CMake
+  target yet).
+- WP-A CUDA translation unit: NOT RUN because `nvcc` is unavailable.
+
+### Resume GPU execution status
+
+NOT RUN. CUDA compilation and an allocated GPU were unavailable.
+
+### Resume numerical validation status
+
+NOT RUN. No authoritative `DC10`, `DC20`, or `DC30` savepoints are present.
+
+### New contract issue
+
+#### CONTRACT CHANGE REQUEST 3
+
+Affected Gate A/WP-E contract: Gate A.1 immutable C-grid geometry and local
+corner-operation dispatch.
+
+Current definition: internal contract v2 provides `cosa_u/v`, `sina_u/v`,
+`rsin_u/v`, `sin_sg`, `cos_sg`, `f0`, `rarea`, and opaque edge/corner bytes.
+`NumericalDispatch::local_corner_fill` has signature
+`LaunchFn(const ExecutionContext&, fv3_gpu_error*)` and therefore carries no
+field, direction, width, or corner-operation selector.
+
+Observed numerical requirement: faithful global cubed-sphere `d2a2c_vect` and
+`c_sw` require scalar-center metric `cosa_s`, `rsin2`, edge-interpolation
+coordinates `dxa/dya`, corner-cell reciprocal area `rarea_c`, and corner
+Coriolis `fC`. Directional `fill_4corners`/`fill2_4corners` calls occur between
+dependent predictor phases and must name their field(s), x/y direction, width,
+and operation ordering.
+
+Fortran evidence: authoritative `model/sw_core.F90:103-512` reads `fC` and
+`rarea_c`; `model/sw_core.F90:2800-3139` reads `cosa_s`, `rsin2`, `dxa`, and
+`dya`; `model/sw_core.F90:103-512` calls directional corner fills separately
+for `delp/pt/w` before x and y flux construction.
+
+PACE reference evidence, if applicable: pinned PACE
+`DGrid2AGrid2CGridVectors` receives the corresponding grid quantities, while
+`CGridShallowWaterDynamics` registers distinct directional corner stencils and
+invokes them at specific points in the grouped operation.
+
+Proposed minimum change: add stable immutable `FieldId`/`FieldSpec` entries for
+the six numerically distinct grid arrays (or document exact, validated mappings
+to existing IDs if they are intentionally aliases). Replace or supplement the
+parameterless corner dispatch with an integration-owned request carrying stable
+field ID(s), x/y direction, halo width, and supported fill/copy operation. Keep
+the public C ABI unchanged.
+
+Affected work packages: WP-A and WP-E/integration; other horizontal packages
+may consume the same corner service.
+
+Blocking: yes, for completing `d2a2c_vect/c_sw` faithfully.
+
+### Resume milestone status
+
+- Translation: **PARTIAL / BLOCKED**
+- Package compilation: **PASS for CPU-visible WP-A and WP-E code; CUDA NOT RUN**
+- GPU execution: **NOT RUN**
+- Numerical validation: **NOT RUN**
+- GEOS integration: **NOT RUN**
+- Contract changes: **REQUESTED**
+
 WP-A BLOCKED

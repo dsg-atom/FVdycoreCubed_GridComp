@@ -1,6 +1,7 @@
 #pragma once
 
 #include "fv3_gpu_api.h"
+#include "fv3_gpu_internal.hpp"
 #include "fv3_gpu_types.hpp"
 
 #include <cstddef>
@@ -45,6 +46,17 @@ inline FieldView<T, Rank> make_view(const fv3_gpu_field_desc &desc,
   for (int d = 0; d < Rank; ++d) {
     view.lower[d] = desc.lower[d];
     view.stride[d] = desc.stride_elements[d];
+  }
+  return view;
+}
+
+template <typename T, int Rank>
+inline FieldView<T, Rank> make_view(const DeviceViewBase &device_view) {
+  FieldView<T, Rank> view{};
+  view.data = static_cast<T *>(device_view.data);
+  for (int d = 0; d < Rank; ++d) {
+    view.lower[d] = device_view.lower[d];
+    view.stride[d] = device_view.stride[d];
   }
   return view;
 }

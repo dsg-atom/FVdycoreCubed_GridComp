@@ -24,4 +24,9 @@ struct PressureGradientCArgs {
 fv3_gpu_status launch_pressure_gradient_c(const PressureGradientCArgs &args,
                                           void *stream);
 
+// WP-E v2 NumericalDispatch adapter. Integration registers this function in
+// NumericalDispatch::cgrid_pressure.
+int launch_cgrid_pressure_v2(const ExecutionContext &context,
+                             fv3_gpu_error *error);
+
 } // namespace fv3::gpu::cgrid

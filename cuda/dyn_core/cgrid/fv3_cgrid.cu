@@ -1,4 +1,5 @@
 #include "fv3_cgrid.hpp"
+#include "fv3_gpu_errors.hpp"
 
 #include <cuda_runtime.h>
 
@@ -72,6 +73,58 @@ fv3_gpu_status launch_pressure_gradient_c(const PressureGradientCArgs &a,
   pressure_gradient_c_y<<<grid, block, 0, cuda_stream>>>(a);
   return cudaPeekAtLastError() == cudaSuccess ? FV3_GPU_SUCCESS
                                               : FV3_GPU_CUDA_ERROR;
+}
+
+int launch_cgrid_pressure_v2(const ExecutionContext &context,
+                             fv3_gpu_error *error) {
+  int rc = validate_execution_context(context, error);
+  if (rc != FV3_GPU_SUCCESS)
+    return rc;
+  if (context.submission.stream_id != StreamId::compute)
+    return fail(error, FV3_GPU_INVALID_ARGUMENT, __func__,
+                "C pressure gradient requires the WP-E compute stream");
+
+  const auto required = [&](FieldId id, bool immutable = false)
+      -> const DeviceViewBase * {
+    const FieldRegistry *registry = immutable ? context.immutable->grid
+                                               : context.fields;
+    return registry == nullptr ? nullptr : registry->find(id);
+  };
+  const auto *delpc = required(FieldId::delpc);
+  const auto *pkc = required(FieldId::pkc);
+  const auto *gz = required(FieldId::gz);
+  const auto *uc = required(FieldId::uc);
+  const auto *vc = required(FieldId::vc);
+  const auto *rdxc = required(FieldId::rdxc, true);
+  const auto *rdyc = required(FieldId::rdyc, true);
+  if (!delpc || !pkc || !gz || !uc || !vc || !rdxc || !rdyc)
+    return fail(error, FV3_GPU_INVALID_ARGUMENT, __func__,
+                "C pressure gradient is missing a required registered field");
+  if (context.immutable->config.hydrostatic)
+    return fail(error, FV3_GPU_UNSUPPORTED_CONFIGURATION, __func__,
+                "hydrostatic p_grad_c is not translated");
+
+  const auto &b = context.immutable->bounds;
+  PressureGradientCArgs args{};
+  args.bounds = {b.is, b.ie, b.js, b.je, b.npz};
+  args.dt2 = static_cast<fv_real>(0.5 * context.immutable->config.bdt /
+                                  context.immutable->config.n_split);
+  args.delpc = make_view<const fv_real, 3>(*delpc);
+  args.pkc = make_view<const fv_real, 3>(*pkc);
+  args.gz = make_view<const fv_real, 3>(*gz);
+  args.uc = make_view<fv_real, 3>(*uc);
+  args.vc = make_view<fv_real, 3>(*vc);
+  args.rdxc = make_view<const fv_real, 2>(*rdxc);
+  args.rdyc = make_view<const fv_real, 2>(*rdyc);
+  rc = launch_pressure_gradient_c(args, context.submission.stream);
+  if (rc != FV3_GPU_SUCCESS)
+    return fail(error, static_cast<fv3_gpu_status>(rc), __func__,
+                "failed to enqueue C pressure-gradient kernels");
+  rc = context.dependencies->mark_stale(FV3_GPU_H_CWIND);
+  if (rc != FV3_GPU_SUCCESS)
+    return fail(error, static_cast<fv3_gpu_status>(rc), __func__,
+                "failed to mark C-wind halo stale");
+  return FV3_GPU_SUCCESS;
 }
 
 } // namespace fv3::gpu::cgrid
