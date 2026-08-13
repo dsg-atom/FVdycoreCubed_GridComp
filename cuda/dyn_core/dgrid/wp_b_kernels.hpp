@@ -152,6 +152,51 @@ inline void apply_ke_vorticity_momentum(const HorizontalBounds &b, int64_t k,
                    vort_fx(i, j, k);
 }
 
+// One del-n flux stage from sw_core.F90:del6_vt_flux.  Corner fills between
+// stages are deliberately external requests to the WP-E corner service.
+template <class T>
+inline void deln_flux_stage(const HorizontalBounds &b, int64_t k,
+                            FieldView<const T> q, FieldView<const T> del6_u,
+                            FieldView<const T> del6_v, T scale,
+                            FieldView<T> d2, FieldView<T> fx,
+                            FieldView<T> fy) {
+  for (int64_t j = b.js - 1; j <= b.je + 1; ++j)
+    for (int64_t i = b.is - 1; i <= b.ie + 1; ++i)
+      d2(i, j, k) = scale * q(i, j, k);
+  for (int64_t j = b.js; j <= b.je; ++j)
+    for (int64_t i = b.is; i <= b.ie + 1; ++i)
+      fx(i, j, k) = del6_v(i, j) * (d2(i - 1, j, k) - d2(i, j, k));
+  for (int64_t j = b.js; j <= b.je + 1; ++j)
+    for (int64_t i = b.is; i <= b.ie; ++i)
+      fy(i, j, k) = del6_u(i, j) * (d2(i, j - 1, k) - d2(i, j, k));
+}
+
+template <class T>
+inline void flux_divergence(const HorizontalBounds &b, int64_t k,
+                            FieldView<const T> fx, FieldView<const T> fy,
+                            FieldView<const T> rarea, FieldView<T> tendency) {
+  for (int64_t j = b.js; j <= b.je; ++j)
+    for (int64_t i = b.is; i <= b.ie; ++i)
+      tendency(i, j, k) =
+          (fx(i, j, k) - fx(i + 1, j, k) + fy(i, j, k) -
+           fy(i, j + 1, k)) * rarea(i, j);
+}
+
+template <class T>
+inline void vertical_velocity_damping_heat(
+    const HorizontalBounds &b, int64_t k, T d_con, T background,
+    FieldView<const T> w, FieldView<const T> dw, FieldView<T> heat_source,
+    FieldView<T> diss_est, bool do_skeb) {
+  for (int64_t j = b.js; j <= b.je; ++j) {
+    for (int64_t i = b.is; i <= b.ie; ++i) {
+      const T loss = background -
+          d_con * dw(i, j, k) * (w(i, j, k) + T(0.5) * dw(i, j, k));
+      heat_source(i, j, k) = loss;
+      if (do_skeb) diss_est(i, j, k) = loss;
+    }
+  }
+}
+
 // dyn_core.F90:mix_dp.  Vertical order is intentionally serial within each
 // column because a correction immediately changes the adjacent layer.
 template <class T>

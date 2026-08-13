@@ -64,5 +64,21 @@ int main() {
       FieldView<const T>(dm3), FieldView<const T>(dm3),
       FieldView<const T>(dm3), FieldView<T>(dvo));
   assert(vort[4] == T(-4));
+
+  std::vector<T> ones(25, T(1)), impulse(25, T(0));
+  std::vector<T> d2(25), fdx(25), fdy(25), tend(25);
+  impulse[12] = T(2);
+  auto done = desc(ones, 5, 5);
+  auto dimp = desc(impulse, 5, 5); auto dd2 = desc(d2, 5, 5);
+  auto dfdx = desc(fdx, 5, 5); auto dfdy = desc(fdy, 5, 5);
+  auto dtend = desc(tend, 5, 5);
+  fv3::gpu::dgrid::deln_flux_stage<T>(
+      {2, 2, 2, 2}, 0, FieldView<const T>(dimp), FieldView<const T>(done),
+      FieldView<const T>(done), T(3), FieldView<T>(dd2), FieldView<T>(dfdx),
+      FieldView<T>(dfdy));
+  fv3::gpu::dgrid::flux_divergence<T>(
+      {2, 2, 2, 2}, 0, FieldView<const T>(dfdx), FieldView<const T>(dfdy),
+      FieldView<const T>(done), FieldView<T>(dtend));
+  assert(tend[12] == T(-24));
   return 0;
 }

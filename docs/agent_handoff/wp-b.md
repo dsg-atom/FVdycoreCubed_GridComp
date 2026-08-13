@@ -252,6 +252,82 @@ commit); no push or merge was performed.
 
 WP-B BLOCKED
 
+## WP-E V3 / Gate A.2 Resume
+
+### Contract inventory verification
+
+Consumed WP-E v3 commit `f633546`. Read the v3 handoff, the complete Markdown
+and JSON numerical inventories, and the updated shared header/runtime tests.
+Every requirement associated with remaining milestone-one WP-B routines is
+marked `contract_available: yes`:
+
+- `d_sw`: state, all distinct metrics, topology, five transport orders, four
+  damping orders, scalar controls, level profiles, workspace, halos, corner
+  service, and per-dispatch `dt/acoustic_index` are available.
+- `fv_tp_2d`: order/limiter controls, area/face geometry, workspace, topology,
+  and directional corner service are available.
+- damping/`del6_vt_flux`: divergence/del6 coefficients, area scales, all
+  profiles/orders, diffusion pass, topology, and corner service are available.
+- WP-B height-transport service consumed by WP-C is represented by the existing
+  dispatch slot plus height order, limiter, `rdt`, profiles, and arena.
+
+The WP-E v2 contract request is therefore **RESOLVED BY WP-E V3**. No new
+shared-contract deficiency was found and no new contract request is made.
+
+### Work completed in this resume
+
+- Upgraded the existing adapter to `resolve_contract_v3`.
+- Audited and resolves every required milestone-one WP-B metric/profile ID,
+  immutable configuration, dispatch parameters, topology, transport workspace,
+  state field, and `H_CWIND/H_DIVGD` dependency.
+- Preserved all previously translated kernels unchanged except for the minimal
+  shared-view adaptation.
+- Added traceable `del6_vt_flux` first-stage flux construction and flux
+  divergence primitives; corner fills between repeated stages remain explicit
+  WP-E service boundaries.
+- Added vertical-velocity damping heat/SKEB bookkeeping matching Fortran local
+  operation order.
+- Extended deterministic component coverage for damping flux signs and
+  divergence.
+
+### Remaining numerical implementation
+
+The originally assigned milestone-one translation is still not complete.
+Missing code is complete order-specific `xppm/yppm/pert_ppm` transport,
+directional transverse flux construction, `xtp_u/ytp_v`, KE construction and
+panel-corner corrections, repeated high-order divergence damping with service
+calls, `smag_corner`, repeated `del6_vt_flux` orchestration, full heat/SKEB
+accumulation, inline tracer loops, and a CUDA dispatch launcher. This is an
+implementation deficit, not a shared-contract deficit.
+
+### Test status
+
+- Focused WP-B R8 C++17 build/test with `-Wall -Wextra -Werror`: PASS.
+- Focused WP-B R4 C++17 build/test with `-Wall -Wextra -Werror`: PASS.
+- WP-B v3 incomplete-context rejection test: PASS.
+- WP-E v3 standalone R8 build/runtime tests: PASS, 4/4.
+- WP-E v3 standalone R4 rerun: NOT RUN to completion because the NCCS scratch
+  build directory intermittently lost generated files. The focused WP-B R4
+  compile/test passed, and WP-E's v3 handoff records its own R4 coverage.
+- CUDA compilation/execution: NOT RUN; `nvcc` is unavailable.
+- Numerical savepoint validation: NOT RUN; authoritative savepoints are not
+  present.
+- GEOS integration: NOT RUN.
+
+Translation: **PARTIAL**
+
+Package compilation: **PASS**
+
+GPU execution: **NOT RUN**
+
+Numerical validation: **NOT RUN**
+
+GEOS integration: **NOT RUN**
+
+Contract changes: **NONE**
+
+WP-B BLOCKED
+
 ## WP-E V2 Resume
 
 ### WP-E v2 consumed
