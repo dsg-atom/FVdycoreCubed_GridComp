@@ -8,6 +8,8 @@ struct ContextData {
   fv3_gpu_create_desc create{};
   State state;
   Workspace workspace;
+  ImmutableViews immutable;
+  DependencyState dependencies;
   void *compute_stream = nullptr;
   void *transfer_stream = nullptr;
   uint64_t next_event = 1;
