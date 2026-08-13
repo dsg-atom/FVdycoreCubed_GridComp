@@ -31,4 +31,12 @@ int main() {
   double pe[n+1]{},aa[n+1]{},bb[n+1]{},dd[n+1]{},w1[n+1]{},gr[n+1]{},gam[n+1]{},pp[n+1]{},bet[n+1]{},p1[n+1]{};
   fv3::gpu::vertical::sim1_column(.1,287.,1.4,.286,.1,false,gm,cp,dm,pm,pem,sw,sdz,spt,0.,pe,aa,bb,dd,w1,gr,gam,pp,bet,p1,n);
   assert(pe[0]==0. && std::isfinite(pe[2]) && sdz[0]<0. && sdz[1]<0.);
+
+  double rdelp[n]={100.,120.},rpt[n]={300.,301.},rq[n]={.01,.02},rc[n]={.286,.286};
+  double rzh[n+1]={30.,10.,0.},rw[n]={1.,2.},rdm[n+1]{},rpm[n+1]{},rpem[n+1]{},rlog[n+1]{},rpk3[n+1]{},rgm[n+1]{},rcp[n+1]{},rdz[n+1]{},rw2[n+1]{},rpeg[n+1]{},rpelng[n+1]{};
+  fv3::gpu::vertical::riem3_precompute_column(rdelp,rpt,rq,rc,rzh,rw,10.,.286,9.8,true,true,rdm,rpm,rpem,rlog,rpk3,rgm,rcp,rdz,rw2,rpeg,rpelng,n);
+  assert(rpem[0]==10. && rpem[1]==110. && rpem[2]==230. && rdz[0]==-20. && rdz[1]==-10.);
+  double rpe2[n+1]={0.,1.,2.},rdelz[n]{},routzh[n+1]{},rpe[n+1]{},rpeln[n+1]{},rpk[n+1]{},rppe[n+1]{};
+  fv3::gpu::vertical::riem3_finalize_column(rpem,rlog,rpe2,rdz,rw,rw2,rdelz,routzh,5.,rpe,rpeln,rpk,rpk3,true,true,false,rppe,n);
+  assert(rpe[2]==230. && rppe[2]==232. && routzh[2]==5. && routzh[1]==15. && routzh[0]==35.);
 }

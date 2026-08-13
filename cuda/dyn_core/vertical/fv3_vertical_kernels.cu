@@ -63,9 +63,11 @@ int launch_dgrid_height_v2(const ExecutionContext &x,fv3_gpu_error *error) {
   fv3_gpu_event ready{};if(x.dependencies->require(FV3_GPU_H_DSCALAR,&ready)!=FV3_GPU_SUCCESS)return FV3_GPU_STATE_CONFLICT;
   const auto *z=x.fields->find(FieldId::zh),*d=x.fields->find(FieldId::delz),*w=x.fields->find(FieldId::ws),*s=x.fields->find(FieldId::zs);
   if(!z||!d||!w||!s)return FV3_GPU_INVALID_ARGUMENT;
-  const auto &b=x.immutable->bounds;const auto &c=x.immutable->config;if(b.npz<2||c.bdt==0||c.n_split<1)return FV3_GPU_UNSUPPORTED_CONFIGURATION;
+  const auto &b=x.immutable->bounds;const auto &c=x.immutable->config;
+  const auto &p=*x.dispatch_params;
+  if(b.npz<2||p.rdt==0)return FV3_GPU_UNSUPPORTED_CONFIGURATION;
   const dim3 t(16,8),g((b.ie-b.is+16)/16,(b.je-b.js+8)/8);
-  height_boundary_v2_kernel<<<g,t,0,static_cast<cudaStream_t>(x.submission.stream)>>>(view3(*z),view3(*d),view2(*w),view2(*s),b.is,b.ie,b.js,b.je,(int)b.npz,fv_real(c.n_split)/fv_real(c.bdt),fv_real(c.dz_min));
+  height_boundary_v2_kernel<<<g,t,0,static_cast<cudaStream_t>(x.submission.stream)>>>(view3(*z),view3(*d),view2(*w),view2(*s),b.is,b.ie,b.js,b.je,(int)b.npz,fv_real(p.rdt),fv_real(c.dz_min));
   return cudaGetLastError()==cudaSuccess?FV3_GPU_SUCCESS:FV3_GPU_CUDA_ERROR;
 }
 } // namespace fv3::gpu::vertical

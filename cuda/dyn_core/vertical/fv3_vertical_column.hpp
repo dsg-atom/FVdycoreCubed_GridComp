@@ -134,6 +134,50 @@ inline void sim1_column(T dt, T rgas, T gama, T kappa, T p_fac,
   }
 }
 
+// Riem_Solver3 column setup/finalization. Pressure output columns may have
+// arbitrary strides at the wrapper; these arrays are the contiguous arena
+// representation used by the sequential solver.
+template <class T>
+inline void riem3_precompute_column(const T *delp, const T *pt,
+                                    const T *q_con, const T *cappa,
+                                    const T *zh, const T *w, T ptop, T akap,
+                                    T grav, bool use_cond, bool moist_cappa,
+                                    T *dm, T *pm, T *pem, T *peln2, T *pk3,
+                                    T *gm, T *cp, T *dz, T *w2, T *peg,
+                                    T *pelng, int km) {
+  const T rgrav=T(1)/grav, peln1=std::log(ptop), ptk=std::exp(akap*peln1);
+  pem[0]=ptop;peln2[0]=peln1;pk3[0]=ptk;
+  peg[0]=ptop;pelng[0]=peln1;
+  for(int k=0;k<km;++k){
+    dm[k]=delp[k];
+    pem[k+1]=pem[k]+dm[k];peln2[k+1]=std::log(pem[k+1]);
+    pk3[k+1]=std::exp(akap*peln2[k+1]);
+    if(use_cond){peg[k+1]=peg[k]+dm[k]*(T(1)-q_con[k]);pelng[k+1]=std::log(peg[k+1]);}
+  }
+  for(int k=0;k<km;++k){
+    const T layer_pm=use_cond?(peg[k+1]-peg[k])/(pelng[k+1]-pelng[k])
+                             :dm[k]/(peln2[k+1]-peln2[k]);
+    pm[k]=layer_pm;
+    if(moist_cappa){cp[k]=cappa[k];gm[k]=T(1)/(T(1)-cp[k]);}
+    dm[k]*=rgrav;dz[k]=zh[k+1]-zh[k];w2[k]=w[k];
+  }
+  (void)pt;
+}
+
+template <class T>
+inline void riem3_finalize_column(const T *pem, const T *peln2,
+                                  const T *pe2, const T *dz, T *w,
+                                  const T *w2, T *delz, T *zh, T zs,
+                                  T *pe, T *peln, T *pk, T *pk3,
+                                  bool last_call, bool fp_out, bool use_logp,
+                                  T *ppe, int km) {
+  for(int k=0;k<km;++k){w[k]=w2[k];delz[k]=dz[k];}
+  if(last_call)for(int k=0;k<=km;++k){peln[k]=peln2[k];pk[k]=pk3[k];pe[k]=pem[k];}
+  for(int k=0;k<=km;++k)ppe[k]=fp_out?pe2[k]+pem[k]:pe2[k];
+  if(use_logp)for(int k=1;k<=km;++k)pk3[k]=peln2[k];
+  zh[km]=zs;for(int k=km-1;k>=0;--k)zh[k]=zh[k+1]-dz[k];
+}
+
 } // namespace fv3::gpu::vertical
 
 #undef FV3_VERTICAL_HD
