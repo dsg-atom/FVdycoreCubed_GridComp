@@ -235,3 +235,134 @@ Recorded by the local commit containing this handoff; run `git rev-parse HEAD`.
    only then connect WP-D pressure operators.
 
 WP-C BLOCKED
+
+## WP-E V2 Resume
+
+### WP-E v2 commit consumed
+
+Consumed `0cd0c9f` (`Add FV3 GPU internal contract version 2`) without
+restarting or replacing the earlier WP-C translation.
+
+### Previous blocker review
+
+- Stable field IDs and strided device views: **RESOLVED BY WP-E V2**.
+  `FieldId`, `FieldSpec`, and `FieldRegistry` cover all WP-C state, pressure,
+  transport-face, and immutable-grid fields, including unusual `pe/peln`
+  strides.
+- Immutable vertical constants and branch selectors: **PARTIALLY RESOLVED**.
+  `NumericalConfig` supplies `ptop`, `akap`, `a_imp`, `p_fac`, `scale_m`,
+  `dz_min`, `rdgas`, `grav`, timestep/splits, and compile-branch flags. It does
+  not supply the call-specific `last_call` (`remap_step`), `fp_out`
+  (`beta<-0.1`), or authoritative `m_split`/RIM `ms` value.
+- Persistent vertical workspace: **PARTIALLY RESOLVED**. V2 supplies one
+  persistent, aligned, non-overlapping `WorkspaceId::vertical` slice sized to
+  sixteen full interface arrays. This removes allocation ownership ambiguity,
+  but complete RIM/SIM translation must prove a lifetime-reuse map fits that
+  fixed capacity before integration.
+- Borrowed stream, halo dependencies, and coarse dispatch: **RESOLVED BY WP-E
+  V2**. The adapter consumes the borrowed compute stream, requires
+  `H_DSCALAR`, and uses the separate WP-B `dgrid_height_transport`, WP-C
+  `dgrid_height`, and `vertical_solver` dispatch boundaries.
+
+Overall classification of the original combined CONTRACT CHANGE REQUEST:
+**PARTIALLY RESOLVED**; exact Riemann dispatch remains blocking.
+
+### Additional implementation completed
+
+- Connected the existing `update_dz_d` boundary/monotonicity recurrence to v2
+  through `launch_dgrid_height_v2`. It looks up `zh`, `delz`, `ws`, and `zs`
+  using stable IDs, honors descriptor lower bounds/strides, requires
+  `H_DSCALAR`, enqueues on the borrowed stream, and derives the acoustic
+  reciprocal timestep as `n_split/bdt`.
+- Added an exact package-local translation of the dry and `MOIST_CAPPA`
+  `SIM1_solver` column arithmetic. It preserves the two Thomas solves, forward
+  pressure recurrence, backward substitution, bottom `ws` boundary, pressure
+  floor, and bottom-to-top `delz` recurrence. Work arrays are caller-provided;
+  it performs no allocation.
+- Preserved the previously translated `edge_profile` and height kernels.
+
+### Remaining missing routines
+
+- CUDA/arena connection for `SIM1` and complete `Riem_Solver3` precompute and
+  finalize.
+- `RIM_2D`, `SIM`, `SIM3`, and `SIM3p0` translations.
+- Full `update_dz_d` sequencing with WP-B's horizontal transport dispatch.
+- Shared column-solver entry used by WP-A's C-grid wrapper.
+
+### Compile status
+
+- WP-C column test compiled and ran in R8: PASS.
+- WP-C column test compiled and ran in R4: PASS.
+- WP-E v2 standalone R8 configure/build and runtime tests: PASS, 4/4.
+- CUDA compilation: NOT RUN (`nvcc` unavailable).
+- Package CUDA integration build: NOT RUN; integration-owned CMake was not
+  changed.
+
+### GPU execution status
+
+NOT RUN. No CUDA compiler or GPU allocation was available.
+
+### Numerical validation status
+
+NOT RUN. No authoritative `DC50_DHEIGHT_OUT` or `DC60_RIEM3_OUT` savepoints
+were found. The new SIM1 test checks finite deterministic column output, the
+zero top-pressure boundary, and negative layer thickness, but is not a Fortran
+equivalence test.
+
+### New CONTRACT CHANGE REQUEST
+
+Affected Gate A/WP-E contract: internal v2 `NumericalConfig` and
+`ExecutionContext` vertical-solver dispatch.
+
+Current definition: `NumericalConfig` exposes model `bdt`, `n_split`,
+`k_split`, and a generic `vertical_solver`, but `ExecutionContext` has no
+per-acoustic-call `last_call`, `fp_out`, or explicit Riemann `ms`.
+
+Observed numerical requirement: `Riem_Solver3` must receive the exact
+call-varying final/remap flag, full-pressure-output selector, and acoustic
+subcycle count. These control state writes and the number/order of RIM
+recurrences; they cannot be inferred safely from a stream sequence number.
+
+Fortran evidence: `dyn_core.F90` calls
+`Riem_Solver3(flagstruct%m_split, dt, ..., flagstruct%use_logp, remap_step,
+beta<-0.1)`. `nh_core.F90:Riem_Solver3` writes `pe/peln/pk` only when
+`last_call`, chooses full versus perturbation `ppe` using `fp_out`, and passes
+`ms` into `RIM_2D`; `RIM_2D` executes exactly `n=1..ms`.
+
+PACE reference evidence, if applicable: `NonhydrostaticVerticalSolver.__call__`
+receives `last_call` explicitly. PACE supports only SIM1 and therefore does not
+provide an RIM `ms` analogue or authoritative evidence for `fp_out`.
+
+Proposed minimum change: add a versioned per-dispatch step/control view to
+`ExecutionContext` containing `dt`, `vertical_ms`, `last_call`, and `fp_out`
+(or equivalent unambiguous values populated by integration from the public
+step and dyn-core loop state). Do not overload `Submission::sequence` or static
+configuration fields.
+
+Affected work packages: WP-C and integration/WP-E; WP-A also consumes the
+shared C-grid column solver controls.
+
+Blocking: yes, for exact integrated `Riem_Solver3`/`RIM_2D` dispatch; no, for
+continued package-local solver translation.
+
+### Resume files modified
+
+- `cuda/dyn_core/vertical/fv3_vertical_column.hpp`
+- `cuda/dyn_core/vertical/fv3_vertical_kernels.cuh`
+- `cuda/dyn_core/vertical/fv3_vertical_kernels.cu`
+- `cuda/dyn_core/tests/vertical/test_vertical_column.cpp`
+- `docs/agent_handoff/wp-c.md`
+
+Translation: PARTIAL
+
+Package compilation: PASS
+
+GPU execution: NOT RUN
+
+Numerical validation: NOT RUN
+
+GEOS integration: NOT RUN
+
+Contract changes: REQUESTED
+
+WP-C BLOCKED
