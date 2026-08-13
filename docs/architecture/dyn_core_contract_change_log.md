@@ -120,3 +120,25 @@ opaque public context nor another package's private implementation. The public
 No public struct or function signature changed. Existing public source and ABI
 remain compatible. Initialization now requires registered stable field IDs;
 this is the intended v2 validation tightening before production integration.
+
+## Gate A.2 / WP-E internal contract version 3
+
+Gate A.2 closes the numerical contract after the second WP implementation pass
+and an audit of every remaining milestone-one routine. The complete evidence
+and fields are in `dyn_core_numerical_contract_inventory.md` and its JSON
+companion.
+
+| Origin | Fortran evidence | Accepted solution | API impact | Consumers |
+|---|---|---|---|---|
+| WP-A | `sw_core:c_sw,d2a2c_vect` use `cosa_s,rsin2,dxa,dya,rarea_c,fC` and direction-specific `fill_4corners/fill2_4corners` | distinct metric IDs plus parameterized corner request | internal contract 3; public ABI unchanged | A, B, D |
+| WP-B | `sw_core:d_sw` arguments preserve five `hord_*`, four `nord*`, damping/profile arrays; body uses `rdxa/rdya,cosa,rsina,rsin2,divg_u/v,da_min*` | distinct immutable config members, metric IDs, level-profile IDs | internal source update | B, C-height |
+| WP-C | `nh_core:Riem_Solver3` accepts `ms,last_call,fp_out`; `RIM_2D` loops exactly `ms` | `DispatchParams` with explicit time/split/Riemann/output controls | internal execution-context extension | A, C, integration |
+| WP-D | `dyn_core` pressure/heating uses numerical `beta,d_ext,n_con,nf_ke,d_con,delt_max`; `a2b_edge` uses edge weights and grid/agrid coordinates | distinct config values and typed geometry IDs | internal source update | D, A edges |
+| Proactive audit | `update_dz_d` has its own `hord`, `lim_fac`, level `damp/ndif`; `d_sw` uses `do_f3d/do_skeb/use_sg`; repeated diffusion needs pass/count | height order, branch flags, profile IDs, pass controls | internal source update | B, C, D |
+| Proactive audit | Cubed-sphere formulas require edge neighbor orientation, vector signs, physical corner ownership, and periodic/global mode | immutable `TopologyView` and typed `EdgeNeighbor` | replaces opaque geometry concept internally | A, B, D, communication |
+| Proactive audit | Fortran corner calls vary by scalar/pair/vector, B/D staggering, axis, width, pass, and interpolation | `CornerServiceRequest` and `CornerServiceFn` | replaces parameterless `local_corner_fill` | A, B, D |
+
+No Gate A.2 request was rejected. CUDA-aware MPI, GPU implementation of the
+corner service, and optimization through workspace aliasing remain deferred;
+the contract required to implement them without another numerical metadata
+revision is present.
