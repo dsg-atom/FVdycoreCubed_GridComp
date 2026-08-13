@@ -155,3 +155,103 @@ See the Git commit containing this handoff (the document cannot contain its own 
 6. Add optional pressure/Rayleigh branches only after baseline validation.
 
 WP-D BLOCKED
+
+## WP-E V2 Resume
+
+### Contract consumed and blocker review
+
+Consumed WP-E internal contract v2 commit `56b9ebf` without restarting or
+rewriting the existing translations. The prior contract request is classified
+**PARTIALLY RESOLVED**:
+
+- **RESOLVED BY WP-E V2:** stable `FieldId` lookup and strided device views for
+  WP-D state/metrics; immutable bounds/config container; persistent
+  `WorkspaceId::operators`; borrowed `Submission`; named dependency state for
+  `H_ZH`, `H_PKC2`, `H_HEAT`, and `H_DWIND_NEXT`; coarse `nh_pressure` and
+  `post_loop_heating` dispatch entries.
+- **PARTIALLY RESOLVED:** immutable grid access includes `rdx/rdy`,
+  `rarea`, `del6_u/del6_v`, and opaque edge/corner byte fields, but no schema
+  exists for interpreting the edge geometry required by global `a2b_ord2/4`.
+- **STILL BLOCKING:** `NumericalConfig` records only `beta_nonzero`, not the
+  numerical `beta`; it omits `d_ext`, `n_con`, `nf_ke`, `d_con`, `delt_max`,
+  and the Rayleigh parameters. The generic zero-argument `local_corner_fill`
+  launch cannot select a field, x/y direction, halo band, or diffusion pass.
+
+### Additional implementation completed
+
+- Added a WP-E v2 binding adapter for all required WP-D fields and metrics.
+- Deterministically partitions the conservative operator arena into the twelve
+  persistent arrays provided by v2; it performs overflow and capacity checks.
+- Added integration-facing `launch_nh_pressure` and
+  `launch_post_loop_heating` functions matching `LaunchFn`.
+- Enforces readiness of `H_ZH/H_PKC2` before pressure and `H_HEAT` before
+  post-loop heating.
+- Enforces baseline global/nonhydrostatic capability gates and returns explicit
+  unsupported errors for missing pressure/heating branch configuration.
+- Preserved all previously translated numerical formulas unchanged except for
+  no numerical changes in this resume.
+
+Remaining numerical work is unchanged: global cubed-sphere A-to-B edge/corner
+corrections, diffusion corner orchestration, `one_grad_p`,
+`grad1_p_update`, integrated split/log variants, `Ray_fast`, and CUDA kernels.
+
+### Resume compile and validation status
+
+- R8 WP-D numerical source/test with `-Wall -Wextra -Werror`: **PASS**.
+- R4 WP-D numerical source/test with `-Wall -Wextra -Werror`: **PASS**.
+- R8 and R4 v2 adapter source with `-Wall -Wextra -Werror`: **PASS**.
+- V2 field/workspace/dependency binding test: **PASS**. Linking the CPU-safe
+  WP-E runtime emits pre-existing WP-E warnings when compiled manually without
+  CUDA; WP-D sources themselves are warning-clean.
+- GPU execution: **NOT RUN**; `nvcc` is unavailable.
+- Numerical/savepoint validation: **NOT RUN**; authoritative Gate A savepoints
+  are unavailable.
+- GEOS integration: **NOT RUN**.
+
+### CONTRACT CHANGE REQUEST — WP-D V2 numerical selectors and corner service
+
+Affected Gate A/WP-E contract: `NumericalConfig`, opaque edge geometry, and
+`NumericalDispatch::local_corner_fill` in internal contract version 2.
+
+Current definition: config provides `beta_nonzero` but no beta value and omits
+post-loop pass/limit selectors. Edge/corner geometry is an unversioned byte
+view. `local_corner_fill` has the generic `LaunchFn(ExecutionContext,error)`
+signature with no operation arguments.
+
+Observed numerical requirement: `split_p_grad` uses the actual beta in both
+`alpha=1-beta` and persistent `beta*du/dv`; `one_grad_p` requires `d_ext`;
+post-loop execution requires `n_con`, `nf_ke`, `d_con`, and `delt_max`.
+`del2_cubed` performs direction-specific corner copies for a named field and a
+shrinking pass band. Global A-to-B edge formulas need typed edge weights and
+grid/agrid coordinates. Boolean presence flags cannot reproduce these values.
+
+Fortran evidence: `dyn_core.F90` lines 1615-1956 use numerical `beta` and
+`d_ext`; lines 1138-1187 select `nf_ke` passes, `n_con` levels, and bounded
+`delt_max` heating; `del2_cubed` lines 2174-2283 calls direction 1 and 2 corner
+copies for each pass. `a2b_edge.F90` consumes `edge_w/e/s/n`, `grid`, `agrid`,
+`dxa`, and `dya` at global edges.
+
+PACE reference evidence, if applicable: pinned PACE preconstructs
+direction-specific `CopyCorners` objects, passes `nmax` to
+`HyperdiffusionDamping`, and passes `delt_time_factor` to heating. PACE rejects
+beta/log variants, so it cannot supply missing selector values.
+
+Proposed minimum change: add the listed immutable numerical scalars (or a
+versioned WP-D config subview); define a versioned typed edge-geometry schema;
+and replace/supplement the corner callback with a request containing stable
+field ID, x/y direction, and halo band. Keep stream/event ownership unchanged.
+
+Affected work packages: WP-D; WP-A also consumes typed A-to-B edge geometry;
+integration/WP-E owns the shared corner service.
+
+Blocking: yes for complete baseline global diffusion/A-to-B orchestration and
+nonbaseline pressure/post-loop branches; no for the already bound baseline
+local formulas.
+
+### Resume files added
+
+- `cuda/dyn_core/operators/wp_d_contract.hpp`
+- `cuda/dyn_core/operators/wp_d_contract.cpp`
+- `cuda/dyn_core/tests/operators/test_wp_d_contract.cpp`
+
+WP-D BLOCKED
