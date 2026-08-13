@@ -10,6 +10,6 @@ state.
 They are currently host-callable reference implementations, not submitted CUDA
 kernels. WP-E v2 now supplies field/grid registries, workspace slices,
 submission, and dependencies; `wp_b_contract.*` connects WP-B to those shared
-facilities. The remaining immutable metric and damping/order configuration gap
-is recorded in `docs/agent_handoff/wp-b.md`. Building a private replacement
-would violate Gate A.
+facilities. WP-E v3 closes the remaining immutable metric, topology, profile,
+and damping/order configuration gap; the adapter now audits all milestone-one
+WP-B inputs. Building a private replacement would violate Gate A.
