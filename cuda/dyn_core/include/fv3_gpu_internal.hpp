@@ -10,7 +10,7 @@
 
 namespace fv3::gpu {
 
-inline constexpr uint32_t internal_contract_version = 2;
+inline constexpr uint32_t internal_contract_version = 3;
 
 enum class FieldId : uint32_t {
   invalid=0, u, v, w, delz, pt, delp, q, q_con, cappa, pe, pk, peln,
@@ -19,7 +19,12 @@ enum class FieldId : uint32_t {
   dv, heat_source, ws3, z_rat, divg2,
   ak, bk, pfull, dp_ref, zs, area, rarea, dx, dy, dxc, dyc, rdx, rdy,
   rdxc, rdyc, cosa_u, cosa_v, sina_u, sina_v, rsin_u, rsin_v, sin_sg,
-  cos_sg, f0, del6_u, del6_v, edge_geometry, corner_geometry,
+  cos_sg, f0, del6_u, del6_v,
+  cosa_s, rsin2, dxa, dya, rarea_c, area_c, f_c,
+  rdxa, rdya, cosa, rsina, divg_u, divg_v,
+  grid_lonlat, agrid_lonlat, edge_w, edge_e, edge_s, edge_n,
+  damping_d2_bg, damping_d4_bg, damping_v, damping_w, damping_t,
+  damping_kgb, damping_ndif,
   count
 };
 
@@ -72,16 +77,45 @@ struct FieldRegistry {
 struct DomainBounds { int64_t is,ie,js,je,npz; uint32_t halo_width; };
 struct NumericalConfig {
   double ptop=0, akap=0, a_imp=1, p_fac=0, scale_m=1, dz_min=0;
-  double rdgas=0, grav=0, bdt=0;
-  int32_t hord=0, nord=0, n_split=1, k_split=1, vertical_solver=0;
+  double rdgas=0, grav=0;
+  double beta=0, d_ext=0, dddmp=0, d_con=0, lim_fac=0, zvir=0;
+  double da_min=0, da_min_c=0, delt_max=0;
+  double rayleigh_tau=0, rayleigh_ztop=0;
+  int32_t hord_tr=0, hord_mt=0, hord_vt=0, hord_tm=0, hord_dp=0;
+  int32_t hord_height=0, a2b_order=4;
+  int32_t nord=0, nord_v=0, nord_w=0, nord_t=0;
+  int32_t nf_ke=0, n_con=0, vertical_solver=0;
   uint8_t use_cond=0, moist_cappa=0, use_logp=0, inline_q=0;
-  uint8_t hydrostatic=0, nested=0, rot3=0, beta_nonzero=0;
+  uint8_t hydrostatic=0, rot3=0, do_f3d=0, do_skeb=0;
+  uint8_t use_sg=0, rayleigh_enabled=0, grid_type=0, reserved=0;
+};
+
+enum class TileEdge : uint8_t { west, east, south, north };
+enum class EdgeOrientation : uint8_t { aligned, reversed, swap_xy, swap_xy_reversed };
+struct EdgeNeighbor { int32_t rank=-1; int16_t tile=-1; TileEdge edge=TileEdge::west; EdgeOrientation orientation=EdgeOrientation::aligned; int8_t vector_sign_x=1, vector_sign_y=1; };
+struct TopologyView {
+  uint32_t contract_version=internal_contract_version;
+  int32_t tile=0;
+  std::array<EdgeNeighbor,4> neighbors{};
+  uint8_t global_cubed_sphere=1, nested=0, regional=0, periodic_x=0, periodic_y=0;
+  uint8_t sw_corner=0, se_corner=0, ne_corner=0, nw_corner=0;
+  std::array<int8_t,4> corner_owner_rank{{-1,-1,-1,-1}};
 };
 struct ImmutableViews {
   uint32_t contract_version=internal_contract_version;
   DomainBounds bounds{};
   NumericalConfig config{};
   const FieldRegistry *grid=nullptr;
+  const TopologyView *topology=nullptr;
+};
+
+struct DispatchParams {
+  uint32_t contract_version=internal_contract_version;
+  double dt=0, dt2=0, rdt=0;
+  uint64_t model_step=0, acoustic_sequence=0;
+  int32_t acoustic_index=0, n_split=1, k_split=1, vertical_ms=1;
+  int32_t diffusion_pass=0, diffusion_passes=0;
+  uint8_t init_step=0, end_step=0, last_call=0, fp_out=0, remap_step=0;
 };
 
 enum class WorkspaceId : uint8_t { cgrid, transport, vertical, operators, count };
@@ -117,10 +151,30 @@ struct ExecutionContext {
   uint32_t contract_version=internal_contract_version;
   const FieldRegistry *fields=nullptr;
   const ImmutableViews *immutable=nullptr;
+  const DispatchParams *dispatch_params=nullptr;
   const WorkspaceLayout *workspace=nullptr;
   Submission submission{};
   DependencyState *dependencies=nullptr;
 };
+
+enum class CornerOperation : uint8_t { fill, copy, fill_pair, vector_transform, a_to_b_edge };
+enum class Axis : uint8_t { x, y, both };
+enum class ComponentOrientation : uint8_t { scalar, x_component, y_component, vector_pair };
+struct CornerServiceRequest {
+  uint32_t contract_version=internal_contract_version;
+  CornerOperation operation=CornerOperation::fill;
+  FieldId first=FieldId::invalid, second=FieldId::invalid;
+  fv3_gpu_stagger stagger=FV3_GPU_STAGGER_A;
+  Axis axis=Axis::x;
+  ComponentOrientation orientation=ComponentOrientation::scalar;
+  uint32_t halo_width=1;
+  int32_t interpolation_order=0;
+  int32_t pass_index=0;
+  int8_t sign_x=1, sign_y=1;
+  fv3_gpu_event dependency=0;
+};
+using CornerServiceFn = int (*)(const ExecutionContext &, const CornerServiceRequest &, fv3_gpu_error *);
+int validate_corner_request(const ExecutionContext &, const CornerServiceRequest &, fv3_gpu_error *) noexcept;
 
 using LaunchFn = int (*)(const ExecutionContext &, fv3_gpu_error *);
 struct NumericalDispatch {
@@ -134,7 +188,7 @@ struct NumericalDispatch {
   LaunchFn vertical_solver=nullptr;
   LaunchFn nh_pressure=nullptr;
   LaunchFn post_loop_heating=nullptr;
-  LaunchFn local_corner_fill=nullptr;
+  CornerServiceFn corner_edge_service=nullptr;
 };
 
 int validate_execution_context(const ExecutionContext &, fv3_gpu_error *) noexcept;
