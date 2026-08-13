@@ -24,4 +24,11 @@ int main() {
   fv3::gpu::vertical::reconstruct_height_column(
       Column<double>{out, 1}, Column<const double>{thickness, 1}, 10., 3);
   assert(out[3] == 10. && out[2] == 14. && out[1] == 17. && out[0] == 19.);
+
+  constexpr int n=2;
+  double dm[n]={100.,120.},pm[n]={900.,1010.},pem[n+1]={10.,110.,230.};
+  double sw[n]={.1,.2},sdz[n]={-20.,-22.},spt[n]={300.,301.},gm[n]={1.4,1.4},cp[n]={.286,.286};
+  double pe[n+1]{},aa[n+1]{},bb[n+1]{},dd[n+1]{},w1[n+1]{},gr[n+1]{},gam[n+1]{},pp[n+1]{},bet[n+1]{},p1[n+1]{};
+  fv3::gpu::vertical::sim1_column(.1,287.,1.4,.286,.1,false,gm,cp,dm,pm,pem,sw,sdz,spt,0.,pe,aa,bb,dd,w1,gr,gam,pp,bet,p1,n);
+  assert(pe[0]==0. && std::isfinite(pe[2]) && sdz[0]<0. && sdz[1]<0.);
 }

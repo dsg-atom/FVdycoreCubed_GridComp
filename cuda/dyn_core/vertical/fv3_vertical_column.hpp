@@ -2,6 +2,7 @@
 
 #include "fv3_gpu_types.hpp"
 #include <cstddef>
+#include <cmath>
 
 namespace fv3::gpu::vertical {
 
@@ -96,6 +97,41 @@ FV3_VERTICAL_HD inline void reconstruct_height_column(Column<T> zh, const Column
                                       T surface_height, int km) {
   zh[km] = surface_height;
   for (int k = km - 1; k >= 0; --k) zh[k] = zh[k + 1] - dz[k];
+}
+
+// Exact dry/MOIST_CAPPA translation of nh_utils.F90:SIM1_solver for one
+// horizontal column. Callers provide all work arrays from persistent storage.
+template <class T>
+inline void sim1_column(T dt, T rgas, T gama, T kappa, T p_fac,
+                        bool moist_cappa, const T *gm2, const T *cp2,
+                        const T *dm, const T *pm, const T *pem, T *w, T *dz,
+                        const T *pt, T ws, T *pe, T *aa, T *bb, T *dd,
+                        T *w1, T *g_rat, T *gam, T *pp, T *bet, T *p1,
+                        int km) {
+  const T t1g = (moist_cappa ? T(1) : gama) * T(2) * dt * dt;
+  const T rdt = T(1) / dt, capa1 = kappa - T(1);
+  for (int k=0;k<km;++k) {
+    pe[k]=std::exp((moist_cappa?gm2[k]:gama)*std::log(-dm[k]/dz[k]*rgas*pt[k]))-pm[k];
+    w1[k]=w[k];
+  }
+  for(int k=0;k<km-1;++k){g_rat[k]=dm[k]/dm[k+1];bb[k]=T(2)*(T(1)+g_rat[k]);dd[k]=T(3)*(pe[k]+g_rat[k]*pe[k+1]);}
+  bet[0]=bb[0];pp[0]=T(0);pp[1]=dd[0]/bet[0];bb[km-1]=T(2);dd[km-1]=T(3)*pe[km-1];
+  for(int k=1;k<km;++k){gam[k]=g_rat[k-1]/bet[k-1];bet[k]=bb[k]-gam[k];pp[k+1]=(dd[k]-pp[k])/bet[k];}
+  for(int k=km-1;k>=1;--k)pp[k]-=gam[k]*pp[k+1];
+  for(int k=1;k<km;++k){const T f=moist_cappa?T(.5)*(gm2[k-1]+gm2[k]):T(1);aa[k]=t1g*f/(dz[k-1]+dz[k])*(pem[k]+pp[k]);}
+  bet[0]=dm[0]-aa[1];w[0]=(dm[0]*w1[0]+dt*pp[1])/bet[0];
+  for(int k=1;k<km-1;++k){gam[k]=aa[k]/bet[k-1];bet[k]=dm[k]-(aa[k]+aa[k+1]+aa[k]*gam[k]);w[k]=(dm[k]*w1[k]+dt*(pp[k+1]-pp[k])-aa[k]*w[k-1])/bet[k];}
+  const int kb=km-1;p1[kb]=t1g*(moist_cappa?gm2[kb]:T(1))/dz[kb]*(pem[km]+pp[km]);
+  gam[kb]=aa[kb]/bet[kb-1];bet[kb]=dm[kb]-(aa[kb]+p1[kb]+aa[kb]*gam[kb]);
+  w[kb]=(dm[kb]*w1[kb]+dt*(pp[km]-pp[kb])-p1[kb]*ws-aa[kb]*w[kb-1])/bet[kb];
+  for(int k=km-2;k>=0;--k)w[k]-=gam[k+1]*w[k+1];
+  pe[0]=T(0);for(int k=0;k<km;++k)pe[k+1]=pe[k]+dm[k]*(w[k]-w1[k])*rdt;
+  p1[kb]=(pe[kb]+T(2)*pe[km])/T(3);
+  for(int k=kb;k>=0;--k){
+    if(k<kb)p1[k]=(pe[k]+bb[k]*pe[k+1]+g_rat[k]*pe[k+2])/T(3)-g_rat[k]*p1[k+1];
+    const T pg=p_fac*pm[k]>p1[k]+pm[k]?p_fac*pm[k]:p1[k]+pm[k];
+    dz[k]=-dm[k]*rgas*pt[k]*std::exp((moist_cappa?cp2[k]-T(1):capa1)*std::log(pg));
+  }
 }
 
 } // namespace fv3::gpu::vertical

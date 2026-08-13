@@ -1,5 +1,6 @@
 #pragma once
 #include "fv3_gpu_types.hpp"
+#include "fv3_gpu_internal.hpp"
 #include <cstddef>
 
 namespace fv3::gpu::vertical {
@@ -17,4 +18,5 @@ int launch_reconstruct_height(fv_real *zh, const fv_real *delz,
 int launch_height_boundary(fv_real *zh, fv_real *delz, fv_real *ws,
                            const fv_real *zs, fv_real rdt, fv_real dz_min,
                            ColumnLaunch layout, void *stream);
+int launch_dgrid_height_v2(const ExecutionContext &, fv3_gpu_error *);
 } // namespace fv3::gpu::vertical
