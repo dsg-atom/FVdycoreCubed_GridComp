@@ -251,3 +251,133 @@ commit); no push or merge was performed.
 7. Emit `H_DSCALAR`, compare `DC40_DSW_OUT`, then integrate WP-C and WP-D.
 
 WP-B BLOCKED
+
+## WP-E V2 Resume
+
+### WP-E v2 consumed
+
+Consumed commit `a2334ed` (`Add FV3 GPU internal contract version 2`) after
+confirming prior WP-B commit `d67626f` and a clean `cuda/wp-b-dgrid` branch.
+The updated internal contract is version 2; the public ABI remains version 1.
+
+### Previous blocker classification
+
+The single previous CONTRACT CHANGE REQUEST is **PARTIALLY RESOLVED**:
+
+- **RESOLVED BY WP-E V2:** stable field IDs and constant-time device views;
+  separation of mutable state, immutable grid, and shared temporaries; checked
+  persistent `WorkspaceId::transport`; borrowed compute submission; named halo
+  dependency state; coarse `dgrid_dynamics` dispatch; and integration-owned
+  `local_corner_fill` dispatch.
+- **STILL BLOCKING:** the registry/config vocabulary does not contain all
+  authoritative `d_sw` inputs. Existence of the v2 mechanisms does not make
+  absent numerical data representable.
+
+### Additional implementation completed
+
+- Added `resolve_contract_v2`, a non-owning WP-B adapter that:
+  - validates the v2 `ExecutionContext`;
+  - requires a borrowed compute submission;
+  - resolves required prognostic, shared face, real64 capacitor, and baseline
+    metric fields solely through WP-E `FieldId`;
+  - borrows the WP-E transport workspace slice;
+  - requires `H_CWIND` and `H_DIVGD` readiness;
+  - performs no allocation, copy, synchronization, event mutation, or launch.
+- Extended the existing descriptor-based `FieldView` minimally to consume a
+  WP-E `DeviceViewBase` while preserving the prior tested indexing path.
+- Translated authoritative relative-vorticity calculation from `d_sw`.
+- Translated the final KE/vorticity momentum application for D-u and D-v.
+- Preserved all prior flux/Courant, capacitor, conservative scalar/mass, and
+  vertically ordered `mix_dp` translations.
+
+### Remaining missing routines
+
+Complete `fv_tp_2d` (`xppm`, `yppm`, `deln_flux`, limiting/corner paths),
+`xtp_u`, `ytp_v`, KE construction/corner correction, divergence damping,
+`smag_corner`, `del6_vt_flux`, damping heat/SKEB accounting, inline tracer
+transport, contravariant edge/corner corrections, and all configured branches
+remain untranslated. A CUDA launch implementation remains absent because no
+CUDA compiler is available here and the remaining numerical inputs cannot yet
+be obtained through v2.
+
+### Compile and validation status
+
+- R8 WP-B kernel component build/test with `-Wall -Wextra -Werror`: PASS.
+- R4 WP-B kernel component build/test with `-Wall -Wextra -Werror`: PASS.
+- R8 v2 contract-adapter build/test: PASS. Warnings emitted are pre-existing in
+  WP-E `fv3_gpu_runtime.cpp`; WP-B sources compile without warnings.
+- WP-E v2 standalone R8 build/tests: PASS, 4/4.
+- WP-E v2 standalone R4 build/tests: PASS, 4/4.
+- GPU execution: NOT RUN (`nvcc` and a GPU allocation are unavailable).
+- Numerical validation: NOT RUN (authoritative Gate A savepoints unavailable).
+- GEOS integration: NOT RUN.
+
+### New CONTRACT CHANGE REQUEST
+
+Affected Gate A/WP-E contract: Gate A.1 internal contract v2 immutable field
+registry and `NumericalConfig` for WP-B D-grid dynamics.
+
+Current definition: `FieldId` provides `area/rarea`, `dx/dy/dxc/dyc`, inverse
+face metrics, `cosa_u/cosa_v`, `sina_u/sina_v`, `rsin_u/rsin_v`, `sin_sg`,
+`f0`, and `del6_u/del6_v`. `NumericalConfig` provides only one `hord`, one
+`nord`, and broad branch flags. Opaque edge/corner byte fields have no
+versioned typed schema or accessor.
+
+Observed numerical requirement: authoritative `d_sw` requires distinct
+`hord_tr/hord_mt/hord_vt/hord_tm/hord_dp`, `nord/nord_v/nord_w/nord_t`,
+per-level `d2_bg/d4_bg/damp_v/damp_w/damp_t/kgb`, scalars
+`dddmp/d_con/lim_fac/zvir`, metrics `rdxa/rdya`, `cosa`, `rsina`, `rsin2`,
+`divg_u/divg_v`, `da_min/da_min_c`, and explicit panel corner/topology flags.
+These values select formulas, stencil radii, limiter behavior, damping order,
+and heat accumulation; they cannot be inferred from the existing v2 fields.
+
+Fortran evidence: pinned `sw_core.F90:d_sw` arguments and pointer binding at
+lines 520-635 consume all distinct orders/damping inputs and metrics. Flux prep
+at lines 858-925 uses `rdxa/rdya`; KE at lines 1055-1210 uses `cosa/rsina`;
+divergence damping at lines 1280-1435 uses `divg_u/divg_v` and
+`da_min/da_min_c`; heat accounting at lines 1490-1525 uses `rsin2`, `cosa_s`,
+and `d_con`. `tp_core.F90:fv_tp_2d` uses `lim_fac` and order-specific damping.
+
+PACE reference evidence, if applicable: pinned `d_sw.py` constructs four
+separate `FiniteVolumeTransport` objects with `hord_dp`, `hord_tm`, and
+`hord_vt`; uses column arrays `nord_v/nord_w/nord_t`, `damp_vt/damp_w/damp_t`,
+and consumes `cosa`, `rsina`, `rsin2`, damping coefficients, and grid indexing.
+PACE constructor assertions omit unsupported branches rather than eliminating
+their Fortran configuration requirements.
+
+Proposed minimum change: extend internal contract version 3 (without changing
+the public ABI) with stable typed IDs for `rdxa`, `rdya`, `cosa`, `rsina`,
+`rsin2`, `cosa_s`, `divg_u`, and `divg_v`; typed topology flags or a versioned
+corner-geometry accessor; immutable scalars `da_min`, `da_min_c`, `dddmp`,
+`d_con`, `lim_fac`, and `zvir`; distinct transport/damping orders; and
+descriptor-backed vertical damping/profile views for the per-level values.
+Only values already frozen in Gate A state/config are requested.
+
+Affected work packages: WP-B and WP-E/integration owner; WP-A/WP-D may consume
+some added metric/topology identities.
+
+Blocking: **yes**, for complete `d_sw` translation and dispatch registration.
+
+### Files added or modified during resume
+
+- `cuda/dyn_core/dgrid/README.md`
+- `cuda/dyn_core/dgrid/wp_b_kernels.hpp`
+- `cuda/dyn_core/dgrid/wp_b_contract.hpp`
+- `cuda/dyn_core/dgrid/wp_b_contract.cpp`
+- `cuda/dyn_core/tests/dgrid/test_wp_b_kernels.cpp`
+- `cuda/dyn_core/tests/dgrid/test_wp_b_contract.cpp`
+- `docs/agent_handoff/wp-b.md`
+
+Translation: **BLOCKED**
+
+Package compilation: **PASS**
+
+GPU execution: **NOT RUN**
+
+Numerical validation: **NOT RUN**
+
+GEOS integration: **NOT RUN**
+
+Contract changes: **REQUESTED**
+
+WP-B BLOCKED
