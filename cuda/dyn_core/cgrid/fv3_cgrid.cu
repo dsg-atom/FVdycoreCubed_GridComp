@@ -75,7 +75,7 @@ fv3_gpu_status launch_pressure_gradient_c(const PressureGradientCArgs &a,
                                               : FV3_GPU_CUDA_ERROR;
 }
 
-int launch_cgrid_pressure_v2(const ExecutionContext &context,
+int launch_cgrid_pressure_v3(const ExecutionContext &context,
                              fv3_gpu_error *error) {
   int rc = validate_execution_context(context, error);
   if (rc != FV3_GPU_SUCCESS)
@@ -107,8 +107,7 @@ int launch_cgrid_pressure_v2(const ExecutionContext &context,
   const auto &b = context.immutable->bounds;
   PressureGradientCArgs args{};
   args.bounds = {b.is, b.ie, b.js, b.je, b.npz};
-  args.dt2 = static_cast<fv_real>(0.5 * context.immutable->config.bdt /
-                                  context.immutable->config.n_split);
+  args.dt2 = static_cast<fv_real>(context.dispatch_params->dt2);
   args.delpc = make_view<const fv_real, 3>(*delpc);
   args.pkc = make_view<const fv_real, 3>(*pkc);
   args.gz = make_view<const fv_real, 3>(*gz);
