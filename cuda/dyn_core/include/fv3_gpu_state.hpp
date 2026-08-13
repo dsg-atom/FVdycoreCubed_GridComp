@@ -1,5 +1,6 @@
 #pragma once
 #include "fv3_gpu_api.h"
+#include "fv3_gpu_internal.hpp"
 #include <cstdint>
 #include <vector>
 
@@ -10,6 +11,6 @@ struct DeviceField {
   uint64_t host_epoch = 0;
   uint64_t device_epoch = 0;
 };
-struct State { std::vector<DeviceField> fields; };
-struct Workspace { void *transport = nullptr; void *vertical = nullptr; };
+struct State { std::vector<DeviceField> fields; FieldRegistry registry; };
+struct Workspace { void *allocation = nullptr; WorkspaceLayout layout{}; };
 }
