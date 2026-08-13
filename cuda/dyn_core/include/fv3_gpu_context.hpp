@@ -9,6 +9,8 @@ struct ContextData {
   State state;
   Workspace workspace;
   ImmutableViews immutable;
+  TopologyView topology;
+  DispatchParams dispatch_params;
   DependencyState dependencies;
   void *compute_stream = nullptr;
   void *transfer_stream = nullptr;
