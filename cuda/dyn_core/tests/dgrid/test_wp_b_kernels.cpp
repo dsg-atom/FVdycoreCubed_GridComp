@@ -54,5 +54,15 @@ int main() {
   assert(delp[1] == T(10));
   assert(pt[0] == T(5));
   assert(w[0] == T(7));
+
+  std::vector<T> uu(9, T(0)), vv(9, T(0)), vort(9, T(0));
+  uu[1] = T(4); uu[4] = T(1); vv[3] = T(2); vv[4] = T(5);
+  auto duu = desc(uu, 3, 3); auto dvv = desc(vv, 3, 3);
+  auto dvo = desc(vort, 3, 3); auto dm3 = desc(metric, 4, 3);
+  fv3::gpu::dgrid::compute_relative_vorticity<T>(
+      {1, 1, 1, 1}, 0, FieldView<const T>(duu), FieldView<const T>(dvv),
+      FieldView<const T>(dm3), FieldView<const T>(dm3),
+      FieldView<const T>(dm3), FieldView<T>(dvo));
+  assert(vort[4] == T(-4));
   return 0;
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "fv3_gpu_api.h"
+#include "fv3_gpu_internal.hpp"
 #include "fv3_gpu_types.hpp"
 
 #include <cstdint>
@@ -14,13 +15,19 @@ public:
   explicit FieldView(const fv3_gpu_field_desc &desc)
       : data_(static_cast<T *>(desc.base)), desc_(&desc) {}
 
+  explicit FieldView(const DeviceViewBase &view)
+      : data_(static_cast<T *>(view.data)), desc_(nullptr), view_(&view) {}
+
   T &operator()(int64_t i, int64_t j, int64_t k = 0,
                 int64_t q = 0) const {
     const int64_t logical[4] = {i, j, k, q};
     int64_t offset = 0;
-    for (uint32_t axis = 0; axis < desc_->rank; ++axis) {
-      offset += (logical[axis] - desc_->lower[axis]) *
-                desc_->stride_elements[axis];
+    const uint32_t rank = desc_ ? desc_->rank : view_->rank;
+    for (uint32_t axis = 0; axis < rank; ++axis) {
+      offset += desc_ ? (logical[axis] - desc_->lower[axis]) *
+                            desc_->stride_elements[axis]
+                      : (logical[axis] - view_->lower[axis]) *
+                            view_->stride[axis];
     }
     return data_[offset];
   }
@@ -28,6 +35,7 @@ public:
 private:
   T *data_;
   const fv3_gpu_field_desc *desc_;
+  const DeviceViewBase *view_ = nullptr;
 };
 
 struct HorizontalBounds {
@@ -107,6 +115,41 @@ inline void apply_mass_and_scalar_flux(
       dpx(i, j, k) += static_cast<accumulator_real>(mass_div);
     }
   }
+}
+
+template <class T>
+inline void compute_relative_vorticity(const HorizontalBounds &b, int64_t k,
+                                       FieldView<const T> u,
+                                       FieldView<const T> v,
+                                       FieldView<const T> dx,
+                                       FieldView<const T> dy,
+                                       FieldView<const T> rarea,
+                                       FieldView<T> vort) {
+  for (int64_t j = b.js; j <= b.je; ++j) {
+    for (int64_t i = b.is; i <= b.ie; ++i) {
+      vort(i, j, k) = rarea(i, j) *
+          (u(i, j, k) * dx(i, j) - u(i, j + 1, k) * dx(i, j + 1) -
+           v(i, j, k) * dy(i, j) + v(i + 1, j, k) * dy(i + 1, j));
+    }
+  }
+}
+
+template <class T>
+inline void apply_ke_vorticity_momentum(const HorizontalBounds &b, int64_t k,
+                                        FieldView<const T> ut,
+                                        FieldView<const T> vt,
+                                        FieldView<const T> ke,
+                                        FieldView<const T> vort_fx,
+                                        FieldView<const T> vort_fy,
+                                        FieldView<T> u, FieldView<T> v) {
+  for (int64_t j = b.js; j <= b.je + 1; ++j)
+    for (int64_t i = b.is; i <= b.ie; ++i)
+      u(i, j, k) = vt(i, j, k) + ke(i, j, k) - ke(i + 1, j, k) +
+                   vort_fy(i, j, k);
+  for (int64_t j = b.js; j <= b.je; ++j)
+    for (int64_t i = b.is; i <= b.ie + 1; ++i)
+      v(i, j, k) = ut(i, j, k) + ke(i, j, k) - ke(i, j + 1, k) -
+                   vort_fx(i, j, k);
 }
 
 // dyn_core.F90:mix_dp.  Vertical order is intentionally serial within each
