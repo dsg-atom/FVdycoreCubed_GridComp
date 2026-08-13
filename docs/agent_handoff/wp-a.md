@@ -338,3 +338,93 @@ Blocking: yes, for completing `d2a2c_vect/c_sw` faithfully.
 - Contract changes: **REQUESTED**
 
 WP-A BLOCKED
+
+## WP-E V3 / Gate A.2 Resume
+
+### Contract consumed and inventory verification
+
+Consumed WP-E v3 commit `6013df2`. Reviewed the complete Gate A.2 Markdown and
+JSON inventories and verified each remaining milestone-one WP-A item against
+the actual v3 declarations:
+
+| Remaining requirement | V3 facility | Verification |
+|---|---|---|
+| C/D/A/B state and metric views | distinct stable `FieldId` entries and registries | AVAILABLE |
+| `cosa_s`, `rsin2`, `dxa/dya`, `rarea_c`, `f_c` | distinct immutable field specifications | AVAILABLE |
+| global tile/corner ownership and orientation | `TopologyView` | AVAILABLE |
+| `nord`, `grid_type`, solver constants/selectors | `NumericalConfig` | AVAILABLE |
+| exact `dt`, `dt2`, `rdt`, `vertical_ms` | `DispatchParams` | AVAILABLE |
+| persistent C and vertical work | `WorkspaceId::cgrid/vertical` | AVAILABLE |
+| WP-C C-column solver | `NumericalDispatch::cgrid_vertical_solver` | AVAILABLE to integration |
+| parameterized corner operations | `CornerServiceRequest` and `CornerServiceFn` | DEFINED, but not callable from WP-A (see below) |
+
+The previous geometry portion of CONTRACT CHANGE REQUEST 3 is **RESOLVED BY
+WP-E V3**. The parameterized request type also resolves the shape of the former
+corner-service request, but the service is not reachable at the numerical call
+site.
+
+### Preserved and corrected completed translation
+
+The existing nonhydrostatic `p_grad_c` kernels were not rewritten. Its adapter
+was minimally updated from the v2 name to `launch_cgrid_pressure_v3` and now
+uses the authoritative per-dispatch `DispatchParams::dt2`. V3 intentionally
+removed the inferred `NumericalConfig::bdt/n_split` path.
+
+### Gate A.2 audit omission: new contract request
+
+#### CONTRACT CHANGE REQUEST 4
+
+Affected Gate A/WP-E contract: Gate A.2 cross-package corner/edge service
+access from coarse numerical dispatch functions.
+
+Current definition: `NumericalDispatch` owns `CornerServiceFn
+corner_edge_service`. Every numerical package entry has type `LaunchFn(const
+ExecutionContext&, fv3_gpu_error*)`. `ExecutionContext` contains fields,
+immutable views, dispatch parameters, workspace, stream submission, and
+dependencies, but no callable corner/edge service. Thus a WP-A launch function
+cannot issue a `CornerServiceRequest`. The JSON marks the service available but
+audits its request vocabulary, not reachability from the required call sites.
+
+Observed numerical requirement: the coarse WP-A predictor must interleave
+directional corner service operations with dependent numerical kernels. A
+single integration call before or after `cgrid_predictor` changes the dataflow;
+splitting every phase into integration dispatch slots would contradict the
+accepted subsystem-scale package boundary.
+
+Fortran evidence: authoritative `model/sw_core.F90:103-512` calls
+`fill2_4corners(delp,pt,1)` before x flux construction, then
+`fill_4corners(w,1)`, then repeats the pair and scalar fills with direction 2
+before y flux construction. Authoritative `model/nh_utils.F90:70-207` copies
+each `gz(:,:,k)` to `gz2`, calls `fill_4corners(gz2,1)` before x fluxes and
+`fill_4corners(gz2,2)` before y fluxes for every interface. These operations
+are ordered inside the routines, not entry/exit halo events.
+
+PACE reference evidence, if applicable: pinned PACE
+`CGridShallowWaterDynamics` and `UpdateGeopotentialHeightOnCGrid` similarly
+invoke distinct directional corner stencils between their grouped compute
+stencils.
+
+Proposed minimum change: expose the integration-owned `CornerServiceFn` to
+numerical launchers through a non-owning callable service member in
+`ExecutionContext` (or an equivalent restricted services table). Preserve the
+existing `CornerServiceRequest`, borrowed stream, validation, ownership, and
+public ABI. Do not expose the full `NumericalDispatch` and do not add leaf
+micro-kernel slots.
+
+Affected work packages: WP-A, WP-B, WP-D, WP-E/integration.
+
+Blocking: yes. Completing `c_sw` and `update_dz_c` without this would require a
+package-private corner implementation, prohibited by Gate A.2, or incorrect
+reordering around the coarse dispatch.
+
+### Additional implementation and test status
+
+- Translation: existing `p_grad_c` complete; overall WP-A remains PARTIAL and
+  blocked before the ordered corner-dependent routines.
+- R4/R8 CPU-visible WP-A indexing tests: PASS.
+- R4/R8 WP-E package build and runtime tests: PASS.
+- CUDA compilation/GPU execution: NOT RUN (`nvcc` unavailable).
+- Numerical validation: NOT RUN (no authoritative WP-A savepoints available).
+- GEOS integration: NOT RUN.
+
+WP-A BLOCKED
