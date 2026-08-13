@@ -236,6 +236,76 @@ Recorded by the local commit containing this handoff; run `git rev-parse HEAD`.
 
 WP-C BLOCKED
 
+## WP-E V3 / Gate A.2 Resume
+
+Consumed WP-E v3 commit `28e4bc3` and audited the WP-C entries in both
+`dyn_core_numerical_contract_inventory.md` and its JSON companion against the
+actual version-3 C++ interfaces.
+
+### Contract closure verification
+
+Every contract requirement for `update_dz_d`, `Riem_Solver3`, `RIM_2D`, the
+SIM family, and the shared C-grid column solver is marked available and is
+present in the implementation:
+
+- state/grid/profile identities and arbitrary strides: `FieldRegistry`;
+- vertical constants, selectors, height order, limiter, and branch flags:
+  `NumericalConfig`;
+- exact `dt`, `rdt`, `vertical_ms`, `last_call`, `fp_out`, and remap state:
+  `DispatchParams`;
+- persistent storage: aligned `WorkspaceId::vertical` slice;
+- sequencing: `H_DSCALAR`, borrowed compute submission, separate D-height
+  transport/height/vertical dispatch entries, and C-grid vertical entry.
+
+The v2 contract request is therefore **RESOLVED BY WP-E V3**. No new contract
+change is requested.
+
+### Additional work completed
+
+- Corrected the existing v2 D-height adapter to consume
+  `DispatchParams::rdt`; it no longer attempts to infer an acoustic timestep
+  from immutable configuration.
+- Added direct Fortran-order column translations for `Riem_Solver3`
+  precomputation and finalization, including hydrostatic and gas-only interface
+  pressure scans, condensate and moist-cappa branches, unusual pressure output
+  semantics, `last_call`, `fp_out`, `use_logp`, and bottom-up height recovery.
+- Preserved the previously translated height recurrences, spline solver, and
+  SIM1 column solver unchanged except for v3 contract use.
+
+### Remaining numerical implementation
+
+Translation remains incomplete: CUDA/arena orchestration for the column
+solver, `RIM_2D`, `SIM`, `SIM3`, `SIM3p0`, and the complete cross-WP
+`update_dz_d` sequence are still missing. This is an implementation deficit,
+not a shared-contract deficiency.
+
+### Tests and status
+
+- Strict (`-Wall -Wextra -Werror`) R8 WP-C column compile/run: PASS.
+- Strict R4 WP-C column compile/run: PASS.
+- Added tests cover condensate/moist-cappa Riemann precompute, hydrostatic
+  pressure recurrence, final pressure modes, and height recovery.
+- CUDA compilation/execution: NOT RUN; `nvcc` is unavailable.
+- Savepoint validation: NOT RUN; no authoritative DC50/DC60 data found.
+- WP-E standalone reconfigure succeeded, but the follow-on build was NOT
+  COMPLETED because the environment failed to materialize the generated
+  Makefile/archive in both scratch and worktree build attempts. The direct
+  WP-C compilation was unaffected.
+
+Translation: PARTIAL
+
+Package compilation: PASS (WP-C CPU column package); CUDA NOT RUN
+
+GPU execution: NOT RUN
+
+Numerical validation: NOT RUN
+
+GEOS integration: NOT RUN
+
+Contract changes: NONE
+
+WP-C BLOCKED
+
 ## WP-E V2 Resume
 
 ### WP-E v2 commit consumed
