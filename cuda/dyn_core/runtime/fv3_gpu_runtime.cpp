@@ -85,6 +85,7 @@ extern "C" int fv3_gpu_create(const fv3_gpu_create_desc *d, fv3_gpu_context **ou
   auto *ctx=new(std::nothrow) fv3_gpu_context; if(!ctx) return fail(e,FV3_GPU_OUT_OF_MEMORY,__func__,"context allocation failed");
   ctx->data.create=*d; ctx->data.create.device_ordinal=device;
   ctx->data.immutable.bounds={d->is,d->ie,d->js,d->je,d->npz,d->halo_width};
+  ctx->data.immutable.topology=&ctx->data.topology;
   cudaStream_t compute{}, transfer{};
   rc=cudaStreamCreateWithFlags(&compute,cudaStreamNonBlocking); if(rc==cudaSuccess) rc=cudaStreamCreateWithFlags(&transfer,cudaStreamNonBlocking);
   if(rc!=cudaSuccess){ if(compute) cudaStreamDestroy(compute); delete ctx; return cuda_fail(rc,e,__func__); }
