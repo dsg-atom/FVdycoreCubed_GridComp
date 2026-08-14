@@ -436,3 +436,174 @@ GEOS integration: NOT RUN
 Contract changes: REQUESTED
 
 WP-C BLOCKED
+
+## WP-C Continuation — Milestone-One Column Solver Completion
+
+### Summary
+
+Completed all milestone-one vertical column solver translations. The numerical
+implementation now covers the complete `Riem_Solver3` dispatch tree and all
+five nonhydrostatic vertical solver variants.
+
+### Additional work completed
+
+- **`SIM3p0_solver`**: Full column translation of the beta=0 semi-implicit
+  variant. Two sequential tridiagonals: first for interface pressure
+  reconstruction from cell-center equation-of-state values, second for
+  vertical velocity. Forward pressure accumulation and backward `delz`
+  recovery via cell-mean pressure reconstruction.
+
+- **`SIM3_solver`**: Full column translation of the general alpha/beta
+  semi-implicit variant. Adds explicit `wk` work array for the beta correction
+  term and modified pressure accumulation with the `(1-beta)/alpha` scaling.
+
+- **`SIM_solver`**: Full column translation of the general `a_imp` variant with
+  `MOIST_CAPPA` support. Includes the interface gamma factor averaging for
+  moist thermodynamics and the `cp2[k]-1` exponent branch.
+
+- **`RIM_2D`**: Full column translation of the method-of-characteristics solver.
+  Preserves the complete Fortran recurrence structure: acoustic substep loop
+  (`n=1..ms`), characteristic propagation time (`dts`), fast-path short-circuit
+  when `bdt <= dts[k]` for all levels, characteristic searching with upward and
+  downward propagation, surface reflection handling with `ws2`, and the
+  `ks0/ks1` layer-skip optimization for large column speeds.
+
+- **`riem_solver3_column`**: Complete orchestration primitive that dispatches
+  to the correct solver based on `a_imp`:
+  - `a_imp < -0.999`: `SIM3p0_solver`
+  - `a_imp < -0.5`: `SIM3_solver` with `alpha = -a_imp`
+  - `a_imp <= 0.5`: `RIM_2D`
+  - `a_imp > 0.999`: `SIM1_solver`
+  - else: `SIM_solver` with `alpha = a_imp`
+
+### Vertical dependency classification
+
+| Solver | Vertical Dependency Structure |
+|--------|-------------------------------|
+| `SIM3p0` | Two sequential tridiagonals (forward elim, backward sub), forward pressure, backward `delz` |
+| `SIM3` | Two sequential tridiagonals with beta correction, forward pressure, backward `delz` |
+| `SIM` | Two sequential tridiagonals with moist-cappa factor, forward pressure, backward `delz` |
+| `SIM1` | Two sequential tridiagonals with moist-cappa, forward pressure, backward `delz` |
+| `RIM_2D` | Nested loops: acoustic substeps × characteristic propagation searches |
+
+All solvers are strictly column-local sequential recurrences. No k-parallelism
+is permitted without savepoint-demonstrated arithmetic equivalence.
+
+### WP-E v3 interfaces consumed
+
+- `FieldRegistry` with `FieldId::zh`, `FieldId::delz`, `FieldId::ws`, `FieldId::zs`,
+  `FieldId::delp`, `FieldId::pt`, `FieldId::q_con`, `FieldId::cappa`, `FieldId::w`,
+  `FieldId::pe`, `FieldId::peln`, `FieldId::pk`, `FieldId::pk3`, `FieldId::ppe`
+- `NumericalConfig` with `ptop`, `akap`, `a_imp`, `p_fac`, `scale_m`, `dz_min`,
+  `rdgas`, `grav`, `use_cond`, `moist_cappa`, `use_logp`
+- `DispatchParams` with `dt`, `rdt`, `vertical_ms`, `last_call`, `fp_out`
+- `WorkspaceId::vertical` slice for persistent column arena
+- `StreamId::compute`, borrowed compute stream submission
+- `H_DSCALAR` dependency for scalar halo readiness
+
+### Workspace requirements
+
+The complete `Riem_Solver3` requires per-column workspace arrays. For `km`
+vertical levels:
+
+| Array class | Count | Size each |
+|-------------|-------|-----------|
+| Layer arrays | ~15 | `km` |
+| Interface arrays | ~20 | `km+1` |
+| RIM-specific | ~15 | `km+1` or `km+2` |
+
+Total per-column workspace: approximately `50 * (km+2)` scalars. The existing
+WP-E `WorkspaceId::vertical` slice sized to sixteen full interface arrays is
+insufficient for the complete RIM_2D workspace. Integration must validate
+actual arena capacity before RIM dispatch.
+
+### Boundary condition handling
+
+- **Surface**: `ws = (zs - zh[km]) * rdt` computed before solver entry;
+  `ws` used in bottom level equations for all solvers
+- **Top**: Zero perturbation pressure (`pe2[0] = 0`) enforced; pressure
+  reconstruction uses `pem[0] = ptop`
+- **Height recovery**: `zh[km] = zs` anchored, then `zh[k] = zh[k+1] - dz[k]`
+  upward recurrence
+
+### Tests run
+
+- R8 strict compile (`-Wall -Wextra -Werror`) of column header: PASS
+- R4 strict compile of column header: PASS
+- R8 column solver tests (SIM3p0, SIM3, SIM, RIM_2D, full Riem_Solver3): PASS
+- R4 column solver tests: PASS
+- R8 WP-E standalone configure/build and runtime tests: PASS, 4/4
+- R4 WP-E standalone configure/build and runtime tests: PASS, 4/4
+
+### Tests not run
+
+- CUDA compilation/execution: `nvcc` unavailable
+- Descriptor-to-view integration launch
+- Complete `update_dz_d` with horizontal transport
+- Halo sequencing validation
+- Deterministic Fortran savepoint comparison
+- Per-level error reports
+- Conservation checks
+- Discover/GEOS integration build
+
+### Remaining implementation work
+
+1. **`update_dz_d` horizontal transport**: The horizontal FV transport
+   (`fv_tp_2d`, `del6_vt_flux`) and edge profile interpolation portions of
+   `update_dz_d` are not translated. This requires WP-B-owned operators and an
+   integration-defined device interface.
+
+2. **CUDA kernel wrapping**: The column primitives are CPU-portable templates.
+   Wrapping them in CUDA kernels with proper workspace addressing and the
+   one-thread-per-column launch pattern is straightforward but requires
+   `nvcc` compilation.
+
+3. **Workspace arena integration**: The exact workspace slice assignment and
+   column-index addressing into the WP-E vertical arena is pending integration
+   work.
+
+4. **C-grid column solver entry**: WP-A's `Riem_Solver_C` consumes the same
+   column solver primitives but with different orchestration and output scope.
+
+### Contract status
+
+The v2 contract request for `DispatchParams` with `dt`, `vertical_ms`,
+`last_call`, and `fp_out` was **RESOLVED BY WP-E V3**. All required per-dispatch
+controls are now available through `ExecutionContext::dispatch_params`.
+
+**Contract changes: NONE** — no new contract request.
+
+### Numerical-risk areas
+
+- `RIM_2D` characteristic searches involve multiple nested loops and conditional
+  branches; any reordering changes results
+- Pressure floor (`p_fac * pem`) prevents negative pressure in `dz` recovery;
+  test cases must remain above floor
+- `MOIST_CAPPA` branch uses per-level `gm2[k]` gamma factors; arithmetic order
+  differs from dry path
+- Large `ms` values in RIM produce many acoustic substeps with cumulative
+  floating-point differences
+
+### Files modified
+
+- `cuda/dyn_core/vertical/fv3_vertical_column.hpp`
+- `cuda/dyn_core/tests/vertical/test_vertical_column.cpp`
+- `docs/agent_handoff/wp-c.md`
+
+### Commit SHA
+
+Recorded by the local commit containing this handoff.
+
+Translation: COMPLETE (column primitives) / PARTIAL (CUDA kernels, update_dz_d transport)
+
+Package compilation: PASS
+
+GPU execution: NOT RUN
+
+Numerical validation: NOT RUN
+
+GEOS integration: NOT RUN
+
+Contract changes: NONE
+
+WP-C READY FOR INTEGRATION

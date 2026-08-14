@@ -178,6 +178,544 @@ inline void riem3_finalize_column(const T *pem, const T *peln2,
   zh[km]=zs;for(int k=km-1;k>=0;--k)zh[k]=zh[k+1]-dz[k];
 }
 
+// Exact translation of nh_utils.F90:SIM3p0_solver for one horizontal column.
+// Beta=0 variant of SIM3. All work arrays are caller-provided from persistent arena.
+template <class T>
+inline void sim3p0_column(T dt, T rgas, T gama, T kappa, T p_fac, T scale_m,
+                          const T *dm, const T *pt, const T *pem, T *w,
+                          T *dz, T ws, T *pe2, T *aa, T *bb, T *dd, T *w1,
+                          T *g_rat, T *gam, T *pp, T *bet, T *p1, int km) {
+  const T t1g = T(2) * gama * dt * dt;
+  const T rdt = T(1) / dt;
+  const T capa1 = kappa - T(1);
+  const T r2g = T(9.8) / T(2);
+  const T r6g = T(9.8) / T(6);
+  const T r3 = T(1) / T(3);
+
+  for (int k = 0; k < km; ++k) {
+    w1[k] = w[k];
+    aa[k] = std::exp(gama * std::log(-dm[k] / dz[k] * rgas * pt[k]));
+  }
+
+  for (int k = 0; k < km - 1; ++k) {
+    g_rat[k] = dm[k] / dm[k + 1];
+    bb[k] = T(2) * (T(1) + g_rat[k]);
+    dd[k] = T(3) * (aa[k] + g_rat[k] * aa[k + 1]);
+  }
+
+  bet[0] = bb[0];
+  pe2[0] = pem[0];
+  pe2[1] = (dd[0] - pem[0]) / bet[0];
+  bb[km - 1] = T(2);
+  dd[km - 1] = T(3) * aa[km - 1] + r2g * dm[km - 1];
+
+  for (int k = 1; k < km; ++k) {
+    gam[k] = g_rat[k - 1] / bet[k - 1];
+    bet[k] = bb[k] - gam[k];
+    pe2[k + 1] = (dd[k] - pe2[k]) / bet[k];
+  }
+
+  for (int k = km - 1; k >= 1; --k) {
+    pe2[k] = pe2[k] - gam[k] * pe2[k + 1];
+  }
+
+  for (int k = 0; k <= km; ++k) {
+    pp[k] = pe2[k] - pem[k];
+  }
+
+  for (int k = 1; k < km; ++k) {
+    aa[k] = t1g / (dz[k - 1] + dz[k]) * pe2[k] - scale_m * dm[0];
+  }
+
+  bet[0] = dm[0] - aa[1];
+  w[0] = (dm[0] * w1[0] + dt * pp[1]) / bet[0];
+
+  for (int k = 1; k < km - 1; ++k) {
+    gam[k] = aa[k] / bet[k - 1];
+    bet[k] = dm[k] - (aa[k] + aa[k + 1] + aa[k] * gam[k]);
+    w[k] = (dm[k] * w1[k] + dt * (pp[k + 1] - pp[k]) - aa[k] * w[k - 1]) / bet[k];
+  }
+
+  const T wk1 = t1g / dz[km - 1] * pe2[km];
+  gam[km - 1] = aa[km - 1] / bet[km - 2];
+  bet[km - 1] = dm[km - 1] - (aa[km - 1] + wk1 + aa[km - 1] * gam[km - 1]);
+  w[km - 1] = (dm[km - 1] * w1[km - 1] + dt * (pp[km] - pp[km - 1]) -
+               wk1 * ws - aa[km - 1] * w[km - 2]) / bet[km - 1];
+
+  for (int k = km - 2; k >= 0; --k) {
+    w[k] = w[k] - gam[k + 1] * w[k + 1];
+  }
+
+  pe2[0] = T(0);
+  for (int k = 0; k < km; ++k) {
+    pe2[k + 1] = pe2[k] + dm[k] * (w[k] - w1[k]) * rdt;
+  }
+
+  pe2[0] = pem[0];
+  for (int k = 1; k <= km; ++k) {
+    pe2[k] = std::max(p_fac * pem[k], pe2[k] + pem[k]);
+  }
+
+  p1[km - 1] = (pe2[km - 1] + T(2) * pe2[km]) * r3 - r6g * dm[km - 1];
+  dz[km - 1] = -dm[km - 1] * rgas * pt[km - 1] *
+               std::exp(capa1 * std::log(p1[km - 1]));
+
+  for (int k = km - 2; k >= 0; --k) {
+    p1[k] = (pe2[k] + bb[k] * pe2[k + 1] + g_rat[k] * pe2[k + 2]) * r3 -
+            g_rat[k] * p1[k + 1];
+    dz[k] = -dm[k] * rgas * pt[k] * std::exp(capa1 * std::log(p1[k]));
+  }
+
+  for (int k = 0; k <= km; ++k) {
+    pe2[k] = pe2[k] - pem[k];
+  }
+}
+
+// Exact translation of nh_utils.F90:SIM3_solver for one horizontal column.
+// General alpha/beta variant. All work arrays are caller-provided from persistent arena.
+template <class T>
+inline void sim3_column(T dt, T rgas, T gama, T kappa, T alpha, T p_fac,
+                        T scale_m, const T *dm, const T *pt, const T *pem,
+                        T *w, T *dz, T ws, T *pe2, T *aa, T *bb, T *dd,
+                        T *w1, T *wk, T *g_rat, T *gam, T *pp, T *bet, T *p1,
+                        int km) {
+  const T beta = T(1) - alpha;
+  const T ra = T(1) / alpha;
+  const T t2 = beta / alpha;
+  const T t1g = gama * T(2) * (alpha * dt) * (alpha * dt);
+  const T rdt = T(1) / dt;
+  const T capa1 = kappa - T(1);
+  const T r2g = T(9.8) / T(2);
+  const T r6g = T(9.8) / T(6);
+  const T r3 = T(1) / T(3);
+
+  for (int k = 0; k < km; ++k) {
+    w1[k] = w[k];
+    aa[k] = std::exp(gama * std::log(-dm[k] / dz[k] * rgas * pt[k]));
+  }
+
+  for (int k = 0; k < km - 1; ++k) {
+    g_rat[k] = dm[k] / dm[k + 1];
+    bb[k] = T(2) * (T(1) + g_rat[k]);
+    dd[k] = T(3) * (aa[k] + g_rat[k] * aa[k + 1]);
+  }
+
+  bet[0] = bb[0];
+  pe2[0] = pem[0];
+  pe2[1] = (dd[0] - pem[0]) / bet[0];
+  bb[km - 1] = T(2);
+  dd[km - 1] = T(3) * aa[km - 1] + r2g * dm[km - 1];
+
+  for (int k = 1; k < km; ++k) {
+    gam[k] = g_rat[k - 1] / bet[k - 1];
+    bet[k] = bb[k] - gam[k];
+    pe2[k + 1] = (dd[k] - pe2[k]) / bet[k];
+  }
+
+  for (int k = km - 1; k >= 1; --k) {
+    pe2[k] = pe2[k] - gam[k] * pe2[k + 1];
+  }
+
+  for (int k = 0; k <= km; ++k) {
+    pp[k] = pe2[k] - pem[k];
+  }
+
+  for (int k = 1; k < km; ++k) {
+    aa[k] = t1g / (dz[k - 1] + dz[k]) * pe2[k];
+    wk[k] = t2 * aa[k] * (w1[k - 1] - w1[k]);
+    aa[k] = aa[k] - scale_m * dm[0];
+  }
+
+  bet[0] = dm[0] - aa[1];
+  w[0] = (dm[0] * w1[0] + dt * pp[1] + wk[1]) / bet[0];
+
+  for (int k = 1; k < km - 1; ++k) {
+    gam[k] = aa[k] / bet[k - 1];
+    bet[k] = dm[k] - (aa[k] + aa[k + 1] + aa[k] * gam[k]);
+    w[k] = (dm[k] * w1[k] + dt * (pp[k + 1] - pp[k]) + wk[k + 1] - wk[k] -
+            aa[k] * w[k - 1]) / bet[k];
+  }
+
+  const T wk1 = t1g / dz[km - 1] * pe2[km];
+  gam[km - 1] = aa[km - 1] / bet[km - 2];
+  bet[km - 1] = dm[km - 1] - (aa[km - 1] + wk1 + aa[km - 1] * gam[km - 1]);
+  w[km - 1] = (dm[km - 1] * w1[km - 1] + dt * (pp[km] - pp[km - 1]) -
+               wk[km - 1] + wk1 * (t2 * w1[km - 1] - ra * ws) -
+               aa[km - 1] * w[km - 2]) / bet[km - 1];
+
+  for (int k = km - 2; k >= 0; --k) {
+    w[k] = w[k] - gam[k + 1] * w[k + 1];
+  }
+
+  pe2[0] = T(0);
+  for (int k = 0; k < km; ++k) {
+    pe2[k + 1] = pe2[k] + (dm[k] * (w[k] - w1[k]) * rdt - beta * (pp[k + 1] - pp[k])) * ra;
+  }
+
+  pe2[0] = pem[0];
+  for (int k = 1; k <= km; ++k) {
+    pe2[k] = std::max(p_fac * pem[k], pe2[k] + pem[k]);
+  }
+
+  p1[km - 1] = (pe2[km - 1] + T(2) * pe2[km]) * r3 - r6g * dm[km - 1];
+  dz[km - 1] = -dm[km - 1] * rgas * pt[km - 1] *
+               std::exp(capa1 * std::log(std::max(p1[km - 1], T(1))));
+
+  for (int k = km - 2; k >= 0; --k) {
+    p1[k] = (pe2[k] + bb[k] * pe2[k + 1] + g_rat[k] * pe2[k + 2]) * r3 -
+            g_rat[k] * p1[k + 1];
+    dz[k] = -dm[k] * rgas * pt[k] * std::exp(capa1 * std::log(std::max(p1[k], T(1))));
+  }
+
+  for (int k = 0; k <= km; ++k) {
+    pe2[k] = pe2[k] - pem[k];
+    pe2[k] = pe2[k] + beta * (pp[k] - pe2[k]);
+  }
+}
+
+// Exact translation of nh_utils.F90:SIM_solver for one horizontal column.
+// General a_imp variant with moist_cappa support. All work arrays are caller-provided.
+template <class T>
+inline void sim_column(T dt, T rgas, T gama, T kappa, T alpha, T p_fac,
+                       T scale_m, bool moist_cappa, const T *gm2, const T *cp2,
+                       const T *dm, const T *pm, const T *pt, const T *pem,
+                       T *w, T *dz, T ws, T *pe2, T *aa, T *bb, T *dd,
+                       T *w1, T *wk, T *g_rat, T *gam, T *pp, T *bet, T *p1,
+                       int km) {
+  const T beta = T(1) - alpha;
+  const T ra = T(1) / alpha;
+  const T t2 = beta / alpha;
+  const T t1g = moist_cappa ? T(2) * (alpha * dt) * (alpha * dt)
+                            : T(2) * gama * (alpha * dt) * (alpha * dt);
+  const T rdt = T(1) / dt;
+  const T capa1 = kappa - T(1);
+  const T r3 = T(1) / T(3);
+
+  for (int k = 0; k < km; ++k) {
+    w1[k] = w[k];
+    pe2[k] = std::exp((moist_cappa ? gm2[k] : gama) *
+                      std::log(-dm[k] / dz[k] * rgas * pt[k])) - pm[k];
+  }
+
+  for (int k = 0; k < km - 1; ++k) {
+    g_rat[k] = dm[k] / dm[k + 1];
+    bb[k] = T(2) * (T(1) + g_rat[k]);
+    dd[k] = T(3) * (pe2[k] + g_rat[k] * pe2[k + 1]);
+  }
+
+  bet[0] = bb[0];
+  pp[0] = T(0);
+  pp[1] = dd[0] / bet[0];
+  bb[km - 1] = T(2);
+  dd[km - 1] = T(3) * pe2[km - 1];
+
+  for (int k = 1; k < km; ++k) {
+    gam[k] = g_rat[k - 1] / bet[k - 1];
+    bet[k] = bb[k] - gam[k];
+    pp[k + 1] = (dd[k] - pp[k]) / bet[k];
+  }
+
+  for (int k = km - 1; k >= 1; --k) {
+    pp[k] = pp[k] - gam[k] * pp[k + 1];
+  }
+
+  for (int k = 0; k <= km; ++k) {
+    pe2[k] = pem[k] + pp[k];
+  }
+
+  for (int k = 1; k < km; ++k) {
+    const T gf = moist_cappa ? T(0.5) * (gm2[k - 1] + gm2[k]) : T(1);
+    aa[k] = t1g * gf / (dz[k - 1] + dz[k]) * pe2[k];
+    wk[k] = t2 * aa[k] * (w1[k - 1] - w1[k]);
+    aa[k] = aa[k] - scale_m * dm[0];
+  }
+
+  bet[0] = dm[0] - aa[1];
+  w[0] = (dm[0] * w1[0] + dt * pp[1] + wk[1]) / bet[0];
+
+  for (int k = 1; k < km - 1; ++k) {
+    gam[k] = aa[k] / bet[k - 1];
+    bet[k] = dm[k] - (aa[k] + aa[k + 1] + aa[k] * gam[k]);
+    w[k] = (dm[k] * w1[k] + dt * (pp[k + 1] - pp[k]) + wk[k + 1] - wk[k] -
+            aa[k] * w[k - 1]) / bet[k];
+  }
+
+  const T wk1 = (moist_cappa ? t1g * gm2[km - 1] : t1g) / dz[km - 1] * pe2[km];
+  gam[km - 1] = aa[km - 1] / bet[km - 2];
+  bet[km - 1] = dm[km - 1] - (aa[km - 1] + wk1 + aa[km - 1] * gam[km - 1]);
+  w[km - 1] = (dm[km - 1] * w1[km - 1] + dt * (pp[km] - pp[km - 1]) -
+               wk[km - 1] + wk1 * (t2 * w1[km - 1] - ra * ws) -
+               aa[km - 1] * w[km - 2]) / bet[km - 1];
+
+  for (int k = km - 2; k >= 0; --k) {
+    w[k] = w[k] - gam[k + 1] * w[k + 1];
+  }
+
+  pe2[0] = T(0);
+  for (int k = 0; k < km; ++k) {
+    pe2[k + 1] = pe2[k] + (dm[k] * (w[k] - w1[k]) * rdt - beta * (pp[k + 1] - pp[k])) * ra;
+  }
+
+  p1[km - 1] = (pe2[km - 1] + T(2) * pe2[km]) * r3;
+  const T pg_km = std::max(p_fac * pm[km - 1], p1[km - 1] + pm[km - 1]);
+  dz[km - 1] = -dm[km - 1] * rgas * pt[km - 1] *
+               std::exp((moist_cappa ? cp2[km - 1] - T(1) : capa1) * std::log(pg_km));
+
+  for (int k = km - 2; k >= 0; --k) {
+    p1[k] = (pe2[k] + bb[k] * pe2[k + 1] + g_rat[k] * pe2[k + 2]) * r3 -
+            g_rat[k] * p1[k + 1];
+    const T pg = std::max(p_fac * pm[k], p1[k] + pm[k]);
+    dz[k] = -dm[k] * rgas * pt[k] *
+            std::exp((moist_cappa ? cp2[k] - T(1) : capa1) * std::log(pg));
+  }
+
+  for (int k = 0; k <= km; ++k) {
+    pe2[k] = pe2[k] + beta * (pp[k] - pe2[k]);
+  }
+}
+
+// Exact translation of nh_utils.F90:RIM_2D for one horizontal column.
+// Method of characteristics with acoustic substeps. All work arrays are caller-provided.
+template <class T>
+inline void rim_2d_column(int ms, T bdt, T rgas, T gama, bool moist_cappa,
+                          const T *gm2, const T *dm2, const T *pm2, const T *pt2,
+                          T ws, T *dz2, T *w2, T *pe2, T *dts, T *pf1,
+                          T *r_lo, T *r_hi, T *m_bot, T *m_top, T *r_bot,
+                          T *r_top, T *wbar, T *pbar, T *cm, T *wc, T *pp,
+                          T *dm_tmp, T *wm, T *dz_tmp, int km) {
+  const T grg = gama * rgas;
+  const T rdt = T(1) / bdt;
+  const T dt = bdt / T(ms);
+  const T ws2 = T(2) * ws;
+
+  for (int k = 0; k <= km; ++k) {
+    pbar[k] = T(0);
+    wbar[k] = T(0);
+  }
+  wbar[km] = ws;
+
+  for (int k = 0; k < km; ++k) {
+    dz_tmp[k] = dz2[k];
+    dm_tmp[k] = dm2[k];
+    wm[k] = w2[k] * dm2[k];
+  }
+
+  for (int k = 0; k <= km; ++k) pe2[k] = T(0);
+
+  int ks0 = 0;
+  if (ms > 1 && ms < 8) {
+    for (int k = 0; k < km; ++k) {
+      const T rden = -rgas * dm_tmp[k] / dz_tmp[k];
+      pf1[k] = std::exp((moist_cappa ? gm2[k] : gama) * std::log(rden * pt2[k]));
+      dts[k] = -dz_tmp[k] / std::sqrt(grg * pf1[k] / rden);
+      if (bdt > dts[k]) {
+        ks0 = k;
+        goto fast_path_check;
+      }
+    }
+    ks0 = km;
+  fast_path_check:
+    if (ks0 == 0) goto slow_path;
+
+    for (int k = 0; k < ks0; ++k) {
+      cm[k] = dm_tmp[k] / dts[k];
+      wc[k] = wm[k] / dts[k];
+      pp[k] = pf1[k] - pm2[k];
+    }
+
+    wbar[0] = (wc[0] + pp[0]) / cm[0];
+    for (int k = 1; k < ks0; ++k) {
+      wbar[k] = (wc[k - 1] + wc[k] + pp[k] - pp[k - 1]) / (cm[k - 1] + cm[k]);
+      pbar[k] = bdt * (cm[k - 1] * wbar[k] - wc[k - 1] + pp[k - 1]);
+      pe2[k] = pbar[k];
+    }
+
+    if (ks0 == km) {
+      pbar[km] = bdt * (cm[km - 1] * wbar[km] - wc[km - 1] + pp[km - 1]);
+      for (int k = 0; k < km; ++k) {
+        dz2[k] = dz_tmp[k] + bdt * (wbar[k + 1] - wbar[k]);
+        w2[k] = (wm[k] + pbar[k + 1] - pbar[k]) / dm_tmp[k];
+      }
+      pe2[0] = T(0);
+      for (int k = 1; k <= km; ++k) pe2[k] = pbar[k] * rdt;
+      return;
+    } else {
+      for (int k = 0; k < ks0 - 1; ++k) {
+        dz2[k] = dz_tmp[k] + bdt * (wbar[k + 1] - wbar[k]);
+        w2[k] = (wm[k] + pbar[k + 1] - pbar[k]) / dm_tmp[k];
+      }
+      pbar[ks0 - 1] = pbar[ks0 - 1] / T(ms);
+    }
+  }
+slow_path:
+  int ks1 = ks0;
+
+  for (int n = 0; n < ms; ++n) {
+    for (int k = ks1; k < km; ++k) {
+      const T rden = -rgas * dm_tmp[k] / dz_tmp[k];
+      const T pf = std::exp((moist_cappa ? gm2[k] : gama) * std::log(rden * pt2[k]));
+      dts[k] = -dz_tmp[k] / std::sqrt(grg * pf / rden);
+      const T ptmp1 = dts[k] * (pf - pm2[k]);
+      r_lo[k] = wm[k] + ptmp1;
+      r_hi[k] = wm[k] - ptmp1;
+    }
+
+    int ktop = ks1;
+    for (int k = ks1; k < km; ++k) {
+      if (dt > dts[k]) {
+        ktop = k;
+        goto found_ktop;
+      }
+    }
+    ktop = km;
+  found_ktop:
+
+    int kt1 = ks1 > 0 ? ks1 : 0;
+
+    if (ktop >= ks1) {
+      for (int k = ks1; k < ktop; ++k) {
+        const T z_frac = dt / dts[k];
+        r_bot[k] = z_frac * r_lo[k];
+        r_top[k + 1] = z_frac * r_hi[k];
+        m_bot[k] = z_frac * dm_tmp[k];
+        m_top[k + 1] = m_bot[k];
+      }
+      if (ktop == km) goto finalize_wbar;
+    }
+
+    for (int k = ktop + 1; k <= km; ++k) {
+      m_top[k] = T(0);
+      r_top[k] = T(0);
+    }
+    for (int ke = km; ke >= ktop + 1; --ke) {
+      T time_left = dt;
+      for (int k = ke - 1; k >= kt1; --k) {
+        if (time_left > dts[k]) {
+          time_left = time_left - dts[k];
+          m_top[ke] = m_top[ke] + dm_tmp[k];
+          r_top[ke] = r_top[ke] + r_hi[k];
+        } else {
+          const T z_frac = time_left / dts[k];
+          m_top[ke] = m_top[ke] + z_frac * dm_tmp[k];
+          r_top[ke] = r_top[ke] + z_frac * r_hi[k];
+          break;
+        }
+      }
+    }
+
+    for (int k = ktop; k < km; ++k) {
+      m_bot[k] = T(0);
+      r_bot[k] = T(0);
+    }
+
+    for (int ke = ktop; ke < km; ++ke) {
+      T time_left = dt;
+      T m_surf = T(0);
+      for (int k = ke; k < km; ++k) {
+        if (time_left > dts[k]) {
+          time_left = time_left - dts[k];
+          m_bot[ke] = m_bot[ke] + dm_tmp[k];
+          r_bot[ke] = r_bot[ke] + r_lo[k];
+        } else {
+          const T z_frac = time_left / dts[k];
+          m_bot[ke] = m_bot[ke] + z_frac * dm_tmp[k];
+          r_bot[ke] = r_bot[ke] + z_frac * r_lo[k];
+          goto next_ke;
+        }
+      }
+      m_surf = m_bot[ke];
+      for (int k = km - 1; k >= kt1; --k) {
+        if (time_left > dts[k]) {
+          time_left = time_left - dts[k];
+          m_bot[ke] = m_bot[ke] + dm_tmp[k];
+          r_bot[ke] = r_bot[ke] - r_hi[k];
+        } else {
+          const T z_frac = time_left / dts[k];
+          m_bot[ke] = m_bot[ke] + z_frac * dm_tmp[k];
+          r_bot[ke] = r_bot[ke] - z_frac * r_hi[k] + (m_bot[ke] - m_surf) * ws2;
+          break;
+        }
+      }
+    next_ke:;
+    }
+
+  finalize_wbar:
+    if (ks1 == 0) wbar[0] = r_bot[0] / m_bot[0];
+    for (int k = ks1; k < km; ++k) {
+      wbar[k + 1] = (r_bot[k + 1] + r_top[k + 1]) / (m_top[k + 1] + m_bot[k + 1]);
+    }
+    for (int k = ks1; k <= km; ++k) {
+      pbar[k] = m_top[k] * wbar[k] - r_top[k];
+      pe2[k] = pe2[k] + pbar[k];
+    }
+
+    if (n == ms - 1) {
+      for (int k = ks1; k < km; ++k) {
+        dz2[k] = dz_tmp[k] + dt * (wbar[k + 1] - wbar[k]);
+        w2[k] = (wm[k] + pbar[k + 1] - pbar[k]) / dm_tmp[k];
+      }
+    } else {
+      for (int k = ks1; k < km; ++k) {
+        dz_tmp[k] = dz_tmp[k] + dt * (wbar[k + 1] - wbar[k]);
+        wm[k] = wm[k] + pbar[k + 1] - pbar[k];
+      }
+    }
+  }
+
+  pe2[0] = T(0);
+  for (int k = 1; k <= km; ++k) pe2[k] = pe2[k] * rdt;
+}
+
+// Complete Riem_Solver3 column orchestration with a_imp dispatch.
+// Callers provide all workspace arrays from persistent arena.
+template <class T>
+inline void riem_solver3_column(int ms, T dt, T rgas, T gama, T kappa,
+                                T ptop, T p_fac, T a_imp, T scale_m,
+                                bool use_cond, bool moist_cappa,
+                                bool last_call, bool fp_out, bool use_logp,
+                                const T *delp, const T *pt, const T *q_con,
+                                const T *cappa_in, const T *zh_in, const T *w_in,
+                                T zs, T ws, T *w_out, T *dz_out, T *zh_out,
+                                T *pe_out, T *peln_out, T *pk_out, T *pk3_out,
+                                T *ppe_out,
+                                T *dm, T *pm, T *pem, T *peln2, T *pk3_tmp,
+                                T *gm, T *cp, T *dz, T *w2, T *peg, T *pelng,
+                                T *pe2, T *aa, T *bb, T *dd, T *w1, T *wk,
+                                T *g_rat, T *gam, T *pp, T *bet, T *p1,
+                                T *dts, T *pf1, T *r_lo, T *r_hi, T *m_bot,
+                                T *m_top, T *r_bot, T *r_top, T *wbar, T *pbar,
+                                T *cm, T *wc, T *dm_tmp, T *wm, T *dz_tmp,
+                                int km) {
+  riem3_precompute_column(delp, pt, q_con, cappa_in, zh_in, w_in, ptop, kappa,
+                          T(9.8), use_cond, moist_cappa, dm, pm, pem, peln2,
+                          pk3_tmp, gm, cp, dz, w2, peg, pelng, km);
+
+  if (a_imp < T(-0.999)) {
+    sim3p0_column(dt, rgas, gama, kappa, p_fac, scale_m, dm, pt, pem, w2, dz,
+                  ws, pe2, aa, bb, dd, w1, g_rat, gam, pp, bet, p1, km);
+  } else if (a_imp < T(-0.5)) {
+    sim3_column(dt, rgas, gama, kappa, -a_imp, p_fac, scale_m, dm, pt, pem, w2,
+                dz, ws, pe2, aa, bb, dd, w1, wk, g_rat, gam, pp, bet, p1, km);
+  } else if (a_imp <= T(0.5)) {
+    rim_2d_column(ms, dt, rgas, gama, moist_cappa, gm, dm, pm, pt, ws, dz, w2,
+                  pe2, dts, pf1, r_lo, r_hi, m_bot, m_top, r_bot, r_top, wbar,
+                  pbar, cm, wc, pp, dm_tmp, wm, dz_tmp, km);
+  } else if (a_imp > T(0.999)) {
+    sim1_column(dt, rgas, gama, kappa, p_fac, moist_cappa, gm, cp, dm, pm, pem,
+                w2, dz, pt, ws, pe2, aa, bb, dd, w1, g_rat, gam, pp, bet, p1, km);
+  } else {
+    sim_column(dt, rgas, gama, kappa, a_imp, p_fac, scale_m, moist_cappa, gm,
+               cp, dm, pm, pt, pem, w2, dz, ws, pe2, aa, bb, dd, w1, wk, g_rat,
+               gam, pp, bet, p1, km);
+  }
+
+  riem3_finalize_column(pem, peln2, pe2, dz, w_out, w2, dz_out, zh_out, zs,
+                        pe_out, peln_out, pk_out, pk3_tmp, last_call, fp_out,
+                        use_logp, ppe_out, km);
+
+  for (int k = 0; k <= km; ++k) pk3_out[k] = pk3_tmp[k];
+}
+
 } // namespace fv3::gpu::vertical
 
 #undef FV3_VERTICAL_HD
