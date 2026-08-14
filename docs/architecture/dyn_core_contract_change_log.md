@@ -142,3 +142,51 @@ No Gate A.2 request was rejected. CUDA-aware MPI, GPU implementation of the
 corner service, and optimization through workspace aliasing remain deferred;
 the contract required to implement them without another numerical metadata
 revision is present.
+
+## Gate A.2.1 / WP-E internal contract version 3.1
+
+This targeted hotfix closes the remaining WP-A and WP-D shared-contract
+blockers without restructuring existing APIs.
+
+| Origin | Issue | Solution | API impact |
+|---|---|---|---|
+| WP-D | `edge_w/e/s/n` descriptors declared as rank-2 `fv_real` but authoritative `fv_arrays.F90` declares rank-1 `R_GRID` (real64) | Corrected specs to rank-1 `accumulator_real` with appropriate staggering | Internal contract spec change; no public ABI change |
+| WP-A | `CornerServiceFn` defined in `NumericalDispatch` but unreachable from `LaunchFn` through `ExecutionContext` | Added `corner_service` member to `ExecutionContext`; validation requires non-null | Internal header change; numerical packages can invoke service |
+| WP-D | A-to-B operations require replace vs non-replace semantics with distinct source/destination | Added `destination` field and `replace` flag to `CornerServiceRequest` | Extended request struct; validation enforces destination when replace=0 |
+| WP-D | `del2_cubed` requires interleaved x-copy/flux/y-copy/flux/update phases within each pass | Added `DiffusionPhase` enum and `diffusion_phase` member to `CornerServiceRequest` | Extended request struct; phase values derive from authoritative Fortran |
+
+### Edge descriptor correction
+
+Authoritative evidence from `model/fv_arrays.F90` lines 37, 150-153, 1629-1632:
+- `R_GRID = r8_kind` (real64)
+- `edge_s(:)`, `edge_n(:)`, `edge_w(:)`, `edge_e(:)` are rank-1 `real(kind=R_GRID)`
+- `edge_s/n` are indexed by `i` (X_FACE), `edge_w/e` are indexed by `j` (Y_FACE)
+
+The v3 declaration (`fv_real`, rank 2) was incorrect and prevented WP-D from
+binding authoritative geometry in R4 builds.
+
+### ExecutionContext corner service access
+
+WP-A predictor (`c_sw`, `update_dz_c`) requires interleaved directional corner
+fills between dependent kernels. The service was defined but not reachable from
+the `LaunchFn` signature. Adding `CornerServiceFn corner_service` to
+`ExecutionContext` provides the minimum legal access without exposing runtime
+internals.
+
+### CornerServiceRequest extensions
+
+WP-D pressure requires both `replace=true` (pp/pk/gz A-to-B in-place) and
+`replace=false` (delp → wk1 A-to-B to operator arena). The `destination` field
+and `replace` flag express this distinction. Validation enforces that
+non-replace operations specify a valid registered destination field.
+
+WP-D diffusion (`del2_cubed`) requires x corner copy → x flux → y corner copy →
+y flux → update ordering within each pass. `DiffusionPhase` enum values
+(`x_corner_copy`, `x_flux`, `y_corner_copy`, `y_flux`, `update`) derive from
+authoritative `model/sw_core.F90` lines 2295-2354.
+
+### Compatibility
+
+No public C ABI changed. Existing numerical packages must update to set
+`corner_service` in their `ExecutionContext` and may use the new request fields.
+Validation will reject contexts missing the corner service pointer.

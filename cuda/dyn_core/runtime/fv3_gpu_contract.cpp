@@ -51,8 +51,8 @@ constexpr FieldSpec specs[] = {
  S(cosa,immutable_grid,fv_real,2,A,INPUT), S(rsina,immutable_grid,fv_real,2,A,INPUT),
  S(divg_u,immutable_grid,fv_real,2,D_U,INPUT), S(divg_v,immutable_grid,fv_real,2,D_V,INPUT),
  S(grid_lonlat,immutable_grid,fv_real,3,A,INPUT), S(agrid_lonlat,immutable_grid,fv_real,3,A,INPUT),
- S(edge_w,immutable_grid,fv_real,2,A,INPUT), S(edge_e,immutable_grid,fv_real,2,A,INPUT),
- S(edge_s,immutable_grid,fv_real,2,A,INPUT), S(edge_n,immutable_grid,fv_real,2,A,INPUT),
+ S(edge_w,immutable_grid,accumulator_real,1,Y_FACE,INPUT), S(edge_e,immutable_grid,accumulator_real,1,Y_FACE,INPUT),
+ S(edge_s,immutable_grid,accumulator_real,1,X_FACE,INPUT), S(edge_n,immutable_grid,accumulator_real,1,X_FACE,INPUT),
  S(damping_d2_bg,immutable_grid,fv_real,1,A,INPUT), S(damping_d4_bg,immutable_grid,fv_real,1,A,INPUT),
  S(damping_v,immutable_grid,fv_real,1,A,INPUT), S(damping_w,immutable_grid,fv_real,1,A,INPUT),
  S(damping_t,immutable_grid,fv_real,1,A,INPUT), S(damping_kgb,immutable_grid,fv_real,1,A,INPUT),
@@ -94,7 +94,15 @@ int DependencyState::require(fv3_gpu_halo_group g,fv3_gpu_event *ev) const noexc
 int DependencyState::mark_stale(fv3_gpu_halo_group g) noexcept {if(!valid_group(g))return FV3_GPU_INVALID_ARGUMENT;halo[(size_t)g]=HaloState::stale;ready_event[(size_t)g]=0;return 0;}
 int DependencyState::mark_pending(fv3_gpu_halo_group g,fv3_gpu_event ev) noexcept {if(!valid_group(g)||!ev)return FV3_GPU_INVALID_ARGUMENT;halo[(size_t)g]=HaloState::exchange_pending;ready_event[(size_t)g]=ev;return 0;}
 int DependencyState::mark_ready(fv3_gpu_halo_group g,fv3_gpu_event ev) noexcept {if(!valid_group(g)||!ev)return FV3_GPU_INVALID_ARGUMENT;halo[(size_t)g]=HaloState::ready;ready_event[(size_t)g]=ev;return 0;}
-int validate_execution_context(const ExecutionContext &x,fv3_gpu_error *e) noexcept {if(x.contract_version!=internal_contract_version||!x.fields||!x.immutable||!x.immutable->grid||!x.immutable->topology||!x.dispatch_params||x.dispatch_params->contract_version!=internal_contract_version||!x.workspace||!x.submission.stream||!x.dependencies)return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"incomplete or wrong-version execution context");return 0;}
-int validate_corner_request(const ExecutionContext &x,const CornerServiceRequest &r,fv3_gpu_error *e) noexcept {int rc=validate_execution_context(x,e);if(rc)return rc;if(r.contract_version!=internal_contract_version||r.first==FieldId::invalid||!x.fields->find(r.first)||!r.halo_width||r.halo_width>x.immutable->bounds.halo_width)return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"invalid corner request field, version, or width");if((r.operation==CornerOperation::fill_pair||r.operation==CornerOperation::vector_transform)&& (r.second==FieldId::invalid||!x.fields->find(r.second)))return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"paired corner operation requires second field");if(r.interpolation_order<0||r.interpolation_order>4||(r.sign_x!=1&&r.sign_x!=-1)||(r.sign_y!=1&&r.sign_y!=-1))return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"invalid corner interpolation/sign parameters");return 0;}
+int validate_execution_context(const ExecutionContext &x,fv3_gpu_error *e) noexcept {if(x.contract_version!=internal_contract_version||!x.fields||!x.immutable||!x.immutable->grid||!x.immutable->topology||!x.dispatch_params||x.dispatch_params->contract_version!=internal_contract_version||!x.workspace||!x.submission.stream||!x.dependencies||!x.corner_service)return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"incomplete or wrong-version execution context");return 0;}
+int validate_corner_request(const ExecutionContext &x,const CornerServiceRequest &r,fv3_gpu_error *e) noexcept {
+  int rc=validate_execution_context(x,e);if(rc)return rc;
+  if(r.contract_version!=internal_contract_version||r.first==FieldId::invalid||!x.fields->find(r.first)||!r.halo_width||r.halo_width>x.immutable->bounds.halo_width)return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"invalid corner request field, version, or width");
+  if((r.operation==CornerOperation::fill_pair||r.operation==CornerOperation::vector_transform)&&(r.second==FieldId::invalid||!x.fields->find(r.second)))return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"paired corner operation requires second field");
+  if(r.operation==CornerOperation::a_to_b_edge&&!r.replace&&(r.destination==FieldId::invalid||!x.fields->find(r.destination)))return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"A-to-B non-replace operation requires valid destination field");
+  if(r.interpolation_order<0||r.interpolation_order>4||(r.sign_x!=1&&r.sign_x!=-1)||(r.sign_y!=1&&r.sign_y!=-1))return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"invalid corner interpolation/sign parameters");
+  if(r.replace!=0&&r.replace!=1)return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"invalid replace flag");
+  return 0;
+}
 int validate_dispatch(const NumericalDispatch &d,fv3_gpu_error *e) noexcept {if(d.contract_version!=internal_contract_version)return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"wrong dispatch version");if(!d.cgrid_predictor||!d.cgrid_vertical_solver||!d.cgrid_pressure||!d.dgrid_dynamics||!d.dgrid_height_transport||!d.dgrid_height||!d.vertical_solver||!d.nh_pressure||!d.post_loop_heating||!d.corner_edge_service)return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,"numerical dispatch table is incomplete");return 0;}
 }
