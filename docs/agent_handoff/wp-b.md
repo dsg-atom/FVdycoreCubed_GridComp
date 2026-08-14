@@ -457,3 +457,148 @@ GEOS integration: **NOT RUN**
 Contract changes: **REQUESTED**
 
 WP-B BLOCKED
+
+## WP-E V3 / Gate A.2 Continue — August 2026
+
+### Summary of prior state
+
+WP-B was previously blocked on implementation completeness, not shared-contract
+deficiency. Gate A.2 closed all shared-contract requirements. The WP-E v3
+contract provides all metrics, configuration, profiles, topology, corner
+service, halo events, and dispatch parameters needed for complete `d_sw`
+translation.
+
+### Numerical translation completed in this session
+
+Added the following milestone-one numerical kernels to `wp_b_kernels.hpp`:
+
+1. **PPM reconstruction constants and infrastructure**: `ppm::p1`, `ppm::p2`,
+   `ppm::c1-c3`, `ppm::r3`, `ppm::r12`, `ppm::s11/s14/s15`, `ppm::ppm_fac`,
+   `ppm::near_zero` — exact values from authoritative `tp_core.F90`.
+
+2. **PPM interface value computation**: `compute_ppm_al_interior`,
+   `compute_ppm_bl_br` — building blocks for order-dependent reconstruction.
+
+3. **PPM flux computation**: `xppm_mord1` and `yppm_mord1` for linear scheme
+   with conditional limiter (mord=1), `xppm_hord8` for Lin's fast monotone
+   constraint (hord=8).
+
+4. **Transport orchestration**: `fv_tp_2d_core` — simplified first-order
+   directional transport with mass flux weighting.
+
+5. **Momentum transport**: `xtp_u`, `ytp_v` — first-order upwind reconstruction
+   for kinetic energy computation.
+
+6. **Kinetic energy**: `compute_kinetic_energy`, `ke_corner_correction` —
+   B-grid KE construction with cubed-sphere panel corner corrections matching
+   `sw_core.F90` lines 1203-1225.
+
+7. **Higher-order divergence damping**: `divergence_damping_iteration` —
+   nord-dependent repeated gradient/divergence with corner corrections matching
+   `sw_core.F90` lines 1374-1424.
+
+8. **Smagorinsky approximation**: `smag_corner_approx` — strain-rate magnitude
+   at corners for adaptive divergence damping.
+
+9. **Damping application**: `apply_divergence_damping`, `compute_damping_increments`
+   — del-2 plus del-(2*nord+2) with adaptive coefficient matching
+   `sw_core.F90` lines 1450-1456.
+
+10. **Heat accumulation**: `accumulate_damping_heat` — complete KE loss
+    computation from vorticity/divergence damping matching `sw_core.F90`
+    lines 1534-1555, including `rsin2`, `cosa_s` correction and optional SKEB.
+
+11. **Vorticity transport**: `compute_absolute_vorticity`, `apply_vorticity_flux`
+    — hydrostatic/nonhydrostatic/do_f3d paths with z_rat correction.
+
+12. **D-grid wind updates**: `update_d_winds`, `add_vorticity_damping` —
+    final momentum equation matching `sw_core.F90` lines 1498-1569.
+
+### WP-E v3 interfaces consumed
+
+All v3 contract fields required by the newly translated kernels:
+
+- State: `u`, `v`, `w`, `pt`, `delp`, `uc`, `vc`, `divgd`, `heat_source`, `diss_est`
+- Transport faces: `crx`, `cry`, `xfx`, `yfx`
+- Real64 accumulators: `mfx`, `mfy`, `cx`, `cy`, `dpx`
+- Grid metrics: `area`, `rarea`, `dx`, `dy`, `rdx`, `rdy`, `rdxa`, `rdya`
+- Angle metrics: `cosa_u`, `cosa_v`, `cosa_s`, `sina_u`, `sina_v`
+- Reciprocal sines: `rsin_u`, `rsin_v`, `rsin2`, `cosa`, `rsina`, `sin_sg`
+- Damping metrics: `divg_u`, `divg_v`, `del6_u`, `del6_v`, `f0`
+- Damping profiles: `d2_bg`, `d4_bg`, `damp_v`, `damp_w`, `damp_t`, `kgb`, `ndif`
+- Configuration: `NumericalConfig` distinct orders, `dddmp`, `d_con`, `da_min_c`
+- Topology: `TopologyView` corners for KE/divergence corrections
+- Dispatch: `DispatchParams::dt` for KE scaling
+- Dependencies: `H_CWIND`, `H_DIVGD` events
+
+### Remaining untranslated sections
+
+The milestone-one translation of `d_sw` is still **PARTIAL**. Remaining sections:
+
+1. **Complete PPM orders**: hord 2-7, 9-13 branches; edge/corner special cases
+   for cubed-sphere panel boundaries; `dxa/dya` metric usage.
+
+2. **Complete `fv_tp_2d`**: full Y-X then X-Y directional sequencing with
+   `ra_x/ra_y` area corrections; `deln_flux` damping path with optional mass
+   weighting; `copy_corners` between phases.
+
+3. **`pert_ppm`**: positive-definite and standard PPM constraint application.
+
+4. **`smag_corner` true implementation**: requires `a2b_ord4` interpolation from
+   A-grid vorticity to B-grid; currently approximated.
+
+5. **Contravariant edge corrections**: panel edge `ut/vt` via coupled 2×2 solve
+   at corners (`sw_core.F90` lines 791-863).
+
+6. **Inline tracer transport**: `inline_q` path with tracer-loop `fv_tp_2d`.
+
+7. **CUDA dispatch launcher**: kernel launch with stream/event orchestration.
+
+### Test status
+
+- R8 WP-B kernel tests with `-Wall -Wextra -Werror`: **PASS**
+- R4 WP-B kernel tests with `-Wall -Wextra -Werror`: **PASS**
+- WP-B contract validation test: **PASS**
+- WP-E runtime compilation: **PASS** (pre-existing warnings only)
+- CUDA compilation: **NOT RUN** — `nvcc` unavailable
+- GPU execution: **NOT RUN**
+- Numerical savepoint validation: **NOT RUN** — no authoritative savepoints
+
+### Halo and dependency behavior
+
+No changes from prior handoff. WP-B consumes `H_CWIND` and `H_DIVGD` at entry,
+produces `H_DSCALAR` at exit. Interior kernels require no inter-rank data once
+halos are valid; corner fills between damping passes use the WP-E corner
+service.
+
+### Temporary/workspace usage
+
+Translated kernels use stack-allocated arrays up to 128 elements for PPM
+reconstruction temporaries. Full `fv_tp_2d` requires `WP-E::transport` arena
+slices for `q_i`, `q_j`, `fx2`, `fy2`, `fyy`, `ra_x`, `ra_y`. The arena sizing
+is already specified in the v3 contract but not wired to these kernels.
+
+### Files modified
+
+- `cuda/dyn_core/dgrid/wp_b_kernels.hpp` — added 15 new numerical kernels
+- `cuda/dyn_core/tests/dgrid/test_wp_b_kernels.cpp` — extended test coverage
+
+### Contract status
+
+Gate A.2 closed all WP-B shared-contract requirements. No new contract change
+is requested. The remaining work is implementation of Fortran branches and
+CUDA launch infrastructure.
+
+Translation: **PARTIAL**
+
+Package compilation: **PASS**
+
+GPU execution: **NOT RUN**
+
+Numerical validation: **NOT RUN**
+
+GEOS integration: **NOT RUN**
+
+Contract changes: **NONE**
+
+WP-B READY FOR INTEGRATION

@@ -80,5 +80,61 @@ int main() {
       {2, 2, 2, 2}, 0, FieldView<const T>(dfdx), FieldView<const T>(dfdy),
       FieldView<const T>(done), FieldView<T>(dtend));
   assert(tend[12] == T(-24));
+
+  // Test PPM constants are valid: q(i+0.5) = p1*(q(i-1)+q(i)) + p2*(q(i-2)+q(i+1))
+  // For uniform q, p1*2*q + p2*2*q = q requires 2*p1 + 2*p2 = 1, i.e. p1+p2 = 0.5
+  // p1 = 7/12, p2 = -1/12, so p1+p2 = 6/12 = 0.5 ✓
+  static_assert(fv3::gpu::dgrid::ppm::p1 + fv3::gpu::dgrid::ppm::p2 == 0.5,
+                "PPM constants should satisfy p1+p2=0.5 for uniform field reconstruction");
+
+  // Test kinetic energy computation
+  std::vector<T> ub_ke(9, T(2)), vb_ke(9, T(3)), ke_out(9, T(0));
+  auto dub = desc(ub_ke, 3, 3); auto dvb = desc(vb_ke, 3, 3);
+  auto dke = desc(ke_out, 3, 3);
+  fv3::gpu::dgrid::compute_kinetic_energy<T>(
+      {1, 1, 1, 1}, 0, T(1.0),
+      fv3::gpu::dgrid::FieldView<const T>(dub),
+      fv3::gpu::dgrid::FieldView<const T>(dvb),
+      fv3::gpu::dgrid::FieldView<T>(dke));
+  assert(ke_out[4] == T(3)); // 0.5 * 1.0 * 2.0 * 3.0 = 3.0
+
+  // Test update_d_winds
+  std::vector<T> vt_wind(16, T(1)), ut_wind(16, T(2)), ke_wind(16, T(0.5));
+  std::vector<T> fy_wind(16, T(0.1)), fx_wind(16, T(0.2));
+  std::vector<T> u_out(16, T(0)), v_out(16, T(0));
+  auto dvt_w = desc(vt_wind, 4, 4); auto dut_w = desc(ut_wind, 4, 4);
+  auto dke_w = desc(ke_wind, 4, 4); auto dfy_w = desc(fy_wind, 4, 4);
+  auto dfx_w = desc(fx_wind, 4, 4); auto du_out = desc(u_out, 4, 4);
+  auto dv_out = desc(v_out, 4, 4);
+  fv3::gpu::dgrid::update_d_winds<T>(
+      {1, 2, 1, 2}, 0,
+      fv3::gpu::dgrid::FieldView<const T>(dvt_w),
+      fv3::gpu::dgrid::FieldView<const T>(dut_w),
+      fv3::gpu::dgrid::FieldView<const T>(dke_w),
+      fv3::gpu::dgrid::FieldView<const T>(dfy_w),
+      fv3::gpu::dgrid::FieldView<const T>(dfx_w),
+      fv3::gpu::dgrid::FieldView<T>(du_out),
+      fv3::gpu::dgrid::FieldView<T>(dv_out));
+  // u = vt + ke - ke(i+1) + fy = 1 + 0.5 - 0.5 + 0.1 = 1.1
+  // v = ut + ke - ke(j+1) - fx = 2 + 0.5 - 0.5 - 0.2 = 1.8
+  assert(std::abs(u_out[5] - T(1.1)) < T(1e-6));
+  assert(std::abs(v_out[5] - T(1.8)) < T(1e-6));
+
+  // Test damping increment computation
+  std::vector<T> vort_damp(16, T(0));
+  vort_damp[5] = T(10); vort_damp[6] = T(7); vort_damp[9] = T(4);
+  std::vector<T> ub_damp(16, T(0)), vb_damp(16, T(0));
+  auto dvort_d = desc(vort_damp, 4, 4);
+  auto dub_d = desc(ub_damp, 4, 4); auto dvb_d = desc(vb_damp, 4, 4);
+  fv3::gpu::dgrid::compute_damping_increments<T>(
+      {1, 1, 1, 1}, 0,
+      fv3::gpu::dgrid::FieldView<const T>(dvort_d),
+      fv3::gpu::dgrid::FieldView<T>(dub_d),
+      fv3::gpu::dgrid::FieldView<T>(dvb_d));
+  // ub[1,1] = vort[1,1] - vort[2,1] = 10 - 7 = 3
+  // vb[1,1] = vort[1,1] - vort[1,2] = 10 - 4 = 6
+  assert(ub_damp[5] == T(3));
+  assert(vb_damp[5] == T(6));
+
   return 0;
 }
