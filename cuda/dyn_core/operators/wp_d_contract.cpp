@@ -80,6 +80,10 @@ int bind_wp_d(const ExecutionContext &x, WpDViews &v, OperatorArena &arena,
   REQUIRED_GRID(dxa,dxa,const fv_real); REQUIRED_GRID(dya,dya,const fv_real);
   REQUIRED_GRID(grid_lonlat,grid_lonlat,const fv_real);
   REQUIRED_GRID(agrid_lonlat,agrid_lonlat,const fv_real);
+  REQUIRED_GRID(edge_w,edge_w,const accumulator_real);
+  REQUIRED_GRID(edge_e,edge_e,const accumulator_real);
+  REQUIRED_GRID(edge_s,edge_s,const accumulator_real);
+  REQUIRED_GRID(edge_n,edge_n,const accumulator_real);
 #undef REQUIRED_STATE
 #undef REQUIRED_GRID
   const auto &b=x.immutable->bounds;
@@ -169,6 +173,9 @@ int bind_wp_d(const ExecutionContext &x, WpDViews &v, OperatorArena &arena,
 int launch_nh_pressure(const ExecutionContext &x, fv3_gpu_error *e) noexcept {
   int rc = validate_execution_context(x, e);
   if (rc) return rc;
+  if (!x.corner_service)
+    return fail(e, FV3_GPU_INVALID_ARGUMENT, __func__,
+                "corner_service is required for WP-D pressure operations");
   if (x.submission.stream_id != StreamId::compute)
     return fail(e, FV3_GPU_INVALID_ARGUMENT, __func__,
                 "WP-D requires the borrowed compute stream");
@@ -188,8 +195,62 @@ int launch_nh_pressure(const ExecutionContext &x, fv3_gpu_error *e) noexcept {
   WpDViews views; OperatorArena arena;
   rc = bind_wp_d(x, views, arena, e);
   if (rc) return rc;
-  return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,
-              "Gate A.2 cannot bind authoritative global A-to-B edge geometry");
+  const auto &b = x.immutable->bounds;
+  const auto topology = *x.immutable->topology;
+  const auto edges = physical_edges(topology);
+  const auto corners = physical_corners(topology);
+  const fv_real grav = static_cast<fv_real>(x.immutable->config.grav);
+  const fv_real dt = static_cast<fv_real>(x.dispatch_params->dt);
+  HorizontalBounds hb{b.is, b.ie, b.js, b.je, b.npz};
+  geopotential_from_height(hb, 2, grav, view3_const(views.zh), view3<fv_real>(views.gz));
+  A2BGeometry geom{view2<const fv_real>(views.dxa), view2<const fv_real>(views.dya),
+                   view3<const fv_real>(views.grid_lonlat), view3<const fv_real>(views.agrid_lonlat),
+                   view1<const accumulator_real>(views.edge_w), view1<const accumulator_real>(views.edge_e),
+                   view1<const accumulator_real>(views.edge_s), view1<const accumulator_real>(views.edge_n)};
+  auto *qx = static_cast<fv_real*>(arena.arrays[0]);
+  auto *qy = static_cast<fv_real*>(arena.arrays[1]);
+  auto *qxx = static_cast<fv_real*>(arena.arrays[2]);
+  auto *qyy = static_cast<fv_real*>(arena.arrays[3]);
+  auto *pk_b = static_cast<fv_real*>(arena.arrays[5]);
+  auto *gz_b = static_cast<fv_real*>(arena.arrays[6]);
+  auto *delp_b = static_cast<fv_real*>(arena.arrays[7]);
+  const uint64_t ni = static_cast<uint64_t>(b.ie - b.is + 1) + 2 * b.halo_width;
+  const uint64_t nj = static_cast<uint64_t>(b.je - b.js + 1) + 2 * b.halo_width;
+  const int64_t lo_i = b.is - static_cast<int64_t>(b.halo_width);
+  const int64_t lo_j = b.js - static_cast<int64_t>(b.halo_width);
+  auto slice2 = [&](void *p) -> View2<fv_real> {
+    return {static_cast<fv_real*>(p), lo_i, lo_j, 1, static_cast<int64_t>(ni)};
+  };
+  auto slice3 = [&](void *p) -> View3<fv_real> {
+    return {static_cast<fv_real*>(p), lo_i, lo_j, 0, 1, static_cast<int64_t>(ni), static_cast<int64_t>(ni * nj)};
+  };
+  View2<fv_real> qx_v = slice2(qx), qy_v = slice2(qy);
+  View2<fv_real> qxx_v = slice2(qxx), qyy_v = slice2(qyy);
+  View3<fv_real> pk_v = slice3(pk_b);
+  View3<fv_real> gz_v = slice3(gz_b);
+  View3<fv_real> delp_v = slice3(delp_b);
+  for (int64_t k = 0; k <= b.npz; ++k) {
+    View2<fv_real> pkc_slice{views.pkc.base() + views.pkc.offset(lo_i, lo_j, k),
+                             lo_i, lo_j, views.pkc.stride[0], views.pkc.stride[1]};
+    View2<fv_real> gz_slice{views.gz.base() + views.gz.offset(lo_i, lo_j, k),
+                            lo_i, lo_j, views.gz.stride[0], views.gz.stride[1]};
+    View2<fv_real> pk_out{pk_v.data + k * static_cast<int64_t>(ni * nj), lo_i, lo_j, 1, static_cast<int64_t>(ni)};
+    View2<fv_real> gz_out{gz_v.data + k * static_cast<int64_t>(ni * nj), lo_i, lo_j, 1, static_cast<int64_t>(ni)};
+    a2b_ord4_global(hb, edges, corners, pkc_slice, pk_out, geom, qx_v, qy_v, qxx_v, qyy_v, true);
+    a2b_ord4_global(hb, edges, corners, gz_slice, gz_out, geom, qx_v, qy_v, qxx_v, qyy_v, true);
+  }
+  for (int64_t k = 0; k < b.npz; ++k) {
+    View2<fv_real> delp_slice{views.delp.base() + views.delp.offset(lo_i, lo_j, k),
+                              lo_i, lo_j, views.delp.stride[0], views.delp.stride[1]};
+    View2<fv_real> delp_out{delp_v.data + k * static_cast<int64_t>(ni * nj), lo_i, lo_j, 1, static_cast<int64_t>(ni)};
+    a2b_ord4_global(hb, edges, corners, delp_slice, delp_out, geom, qx_v, qy_v, qxx_v, qyy_v, false);
+  }
+  PressureInputs pin{pk_v, gz_v, delp_v, pk_v, view2<const fv_real>(views.rdx), view2<const fv_real>(views.rdy)};
+  PressureOutputs pout{view3<fv_real>(views.u), view3<fv_real>(views.v),
+                       view3<fv_real>(views.du), view3<fv_real>(views.dv)};
+  PressureConfig pcfg{PressureVariant::normal_nh, dt, 0};
+  pressure_gradient(hb, pin, pout, pcfg);
+  return FV3_GPU_SUCCESS;
 }
 
 int launch_post_loop_heating(const ExecutionContext &x, fv3_gpu_error *e) noexcept {
@@ -197,6 +258,9 @@ int launch_post_loop_heating(const ExecutionContext &x, fv3_gpu_error *e) noexce
   if (rc) return rc;
   if (x.immutable->config.n_con <= 0 || x.immutable->config.d_con <= 1e-5)
     return FV3_GPU_SUCCESS;
+  if (!x.corner_service)
+    return fail(e, FV3_GPU_INVALID_ARGUMENT, __func__,
+                "corner_service is required for WP-D diffusion operations");
   if (x.submission.stream_id != StreamId::compute)
     return fail(e, FV3_GPU_INVALID_ARGUMENT, __func__,
                 "WP-D requires the borrowed compute stream");
@@ -217,37 +281,102 @@ int launch_post_loop_heating(const ExecutionContext &x, fv3_gpu_error *e) noexce
   WpDViews views; OperatorArena arena;
   rc = bind_wp_d(x, views, arena, e);
   if (rc) return rc;
-  return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,
-              "Gate A.2 cannot express intra-pass x/y corner-service phases");
+  const auto &b = x.immutable->bounds;
+  const auto &cfg = x.immutable->config;
+  const auto corners = physical_corners(*x.immutable->topology);
+  const int32_t pass = x.dispatch_params->diffusion_pass;
+  const int32_t ntimes = x.dispatch_params->diffusion_passes;
+  const int32_t nt = ntimes - 1 - pass;
+  const uint32_t halo_band = static_cast<uint32_t>(nt);
+  HorizontalBounds hb{b.is, b.ie, b.js, b.je, b.npz};
+  const fv_real dt = static_cast<fv_real>(x.dispatch_params->dt);
+  const accumulator_real cd = static_cast<accumulator_real>(cfg.d_con) * dt;
+  auto *fx = static_cast<fv_real*>(arena.arrays[8]);
+  auto *fy = static_cast<fv_real*>(arena.arrays[9]);
+  const uint64_t ni = static_cast<uint64_t>(b.ie - b.is + 1) + 2 * b.halo_width;
+  const uint64_t nj = static_cast<uint64_t>(b.je - b.js + 1) + 2 * b.halo_width;
+  const int64_t lo_i = b.is - static_cast<int64_t>(b.halo_width);
+  const int64_t lo_j = b.js - static_cast<int64_t>(b.halo_width);
+  View3<fv_real> fx_v{fx, lo_i, lo_j, 0, 1, static_cast<int64_t>(ni), static_cast<int64_t>(ni * nj)};
+  View3<fv_real> fy_v{fy, lo_i, lo_j, 0, 1, static_cast<int64_t>(ni), static_cast<int64_t>(ni * nj)};
+  average_del2_corners(hb, corners, view3<fv_real>(views.heat_source));
+  if (nt > 0) {
+    CornerServiceRequest req_x = diffusion_corner_request(Axis::x, halo_band, pass,
+                                                          DiffusionPhase::x_corner_copy, 0);
+    rc = x.corner_service(x, req_x, e);
+    if (rc) return rc;
+  }
+  if (cfg.use_sg) {
+    Del2SgMetrics sg{view2<const fv_real>(views.dx), view2<const fv_real>(views.dy),
+                     view2<const fv_real>(views.sina_u), view2<const fv_real>(views.sina_v),
+                     view2<const fv_real>(views.rdxc), view2<const fv_real>(views.rdyc),
+                     view2<const fv_real>(views.rarea)};
+    del2_pass_sg(hb, static_cast<int>(nt), cd, view3<fv_real>(views.heat_source), sg, fx_v, fy_v);
+  } else {
+    Del2Metrics m{view2<const fv_real>(views.del6_u), view2<const fv_real>(views.del6_v),
+                  view2<const fv_real>(views.rarea)};
+    del2_pass(hb, static_cast<int>(nt), cd, view3<fv_real>(views.heat_source), m, fx_v, fy_v);
+  }
+  if (pass == ntimes - 1) {
+    const fv_real bdt = static_cast<fv_real>(x.dispatch_params->dt);
+    const fv_real delt_max = static_cast<fv_real>(cfg.delt_max);
+    const fv_real cv_air = static_cast<fv_real>(cfg.rdgas / cfg.akap);
+    const fv_real rdg = static_cast<fv_real>(-cfg.rdgas / cfg.grav);
+    const fv_real akap = static_cast<fv_real>(cfg.akap);
+    const int64_t n_con = cfg.n_con;
+    if (cfg.hydrostatic) {
+      const fv_real cp_air = cv_air + static_cast<fv_real>(cfg.rdgas);
+      apply_diffusive_heating_hydrostatic(hb, bdt, delt_max, cp_air, n_con,
+                                          view3_const(views.heat_source),
+                                          view3_const(views.delp),
+                                          view3_const(views.pkz),
+                                          view3<fv_real>(views.pt));
+    } else {
+      apply_diffusive_heating_nh(hb, bdt, delt_max, cv_air, rdg, akap,
+                                 cfg.moist_cappa != 0, n_con,
+                                 view3<fv_real>(views.heat_source),
+                                 view3_const(views.delp),
+                                 view3_const(views.delz),
+                                 view3_const(views.cappa),
+                                 view3<fv_real>(views.pkz),
+                                 view3<fv_real>(views.pt));
+    }
+  }
+  return FV3_GPU_SUCCESS;
 }
 
 CornerServiceRequest diffusion_corner_request(Axis axis, uint32_t width,
-                                               int32_t pass,
+                                               int32_t pass, DiffusionPhase phase,
                                                fv3_gpu_event dependency) noexcept {
   CornerServiceRequest r{};
-  if((axis!=Axis::x && axis!=Axis::y) || !width || pass<0) {
+  if((axis!=Axis::x && axis!=Axis::y) || !width || pass<0 ||
+     phase==DiffusionPhase::none) {
     r.first=FieldId::invalid;
     return r;
   }
   r.operation=CornerOperation::copy;r.first=FieldId::heat_source;
   r.stagger=FV3_GPU_STAGGER_A;r.axis=axis;
-  r.orientation=ComponentOrientation::scalar;r.halo_width=width;
-  r.pass_index=pass;r.dependency=dependency;
+  r.orientation=ComponentOrientation::scalar;
+  r.diffusion_phase=phase;r.halo_width=width;
+  r.pass_index=pass;r.replace=1;r.dependency=dependency;
   return r;
 }
 
-CornerServiceRequest a2b_edge_request(FieldId field, int32_t order,
+CornerServiceRequest a2b_edge_request(FieldId source, FieldId destination,
+                                      int32_t order, bool replace,
                                       fv3_gpu_event dependency) noexcept {
   CornerServiceRequest r{};
   if(order!=2 && order!=4) {
     r.first=FieldId::invalid;
     return r;
   }
-  r.operation=CornerOperation::a_to_b_edge;r.first=field;
+  r.operation=CornerOperation::a_to_b_edge;r.first=source;
+  r.destination=destination;
   r.stagger=FV3_GPU_STAGGER_A;r.axis=Axis::both;
   r.orientation=ComponentOrientation::scalar;
   r.halo_width=order==2?1u:2u;
-  r.interpolation_order=order;r.dependency=dependency;
+  r.interpolation_order=order;
+  r.replace=replace?1:0;r.dependency=dependency;
   return r;
 }
 

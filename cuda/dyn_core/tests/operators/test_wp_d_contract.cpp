@@ -50,9 +50,11 @@ int main() {
   dependencies.mark_ready(FV3_GPU_H_ZH,1);
   dependencies.mark_ready(FV3_GPU_H_PKC2,2);
   dependencies.mark_ready(FV3_GPU_H_HEAT,3);
+  auto dummy_corner_service=[](const ExecutionContext&,const CornerServiceRequest&,fv3_gpu_error*) noexcept -> int { return FV3_GPU_SUCCESS; };
   ExecutionContext x{}; x.fields=&state;x.immutable=&immutable;
   x.dispatch_params=&params;x.workspace=&layout;
   x.submission.stream=reinterpret_cast<void *>(1);x.dependencies=&dependencies;
+  x.corner_service=dummy_corner_service;
   WpDViews views;OperatorArena arena;
   assert(bind_wp_d(x,views,arena,&error)==FV3_GPU_SUCCESS);
   assert(arena.values_per_array==10u*10u*4u);
@@ -61,15 +63,20 @@ int main() {
   assert(physical.west&&!physical.east&&!physical.south&&!physical.north);
   const auto corners=physical_corners(topology);
   assert(corners.sw&&!corners.se&&!corners.ne&&!corners.nw);
-  assert(launch_nh_pressure(x,&error)==FV3_GPU_UNSUPPORTED_CONFIGURATION);
-  auto edge=a2b_edge_request(FieldId::pkc,4,2);
-  assert(validate_corner_request(x,edge,&error)==FV3_GPU_SUCCESS);
-  auto invalid_edge=a2b_edge_request(FieldId::pkc,3,2);
+  immutable.config.grav=9.8;immutable.config.rdgas=287;immutable.config.akap=0.286;
+  assert(launch_nh_pressure(x,&error)==FV3_GPU_SUCCESS);
+  auto edge_replace=a2b_edge_request(FieldId::pkc,FieldId::pkc,4,true,2);
+  assert(validate_corner_request(x,edge_replace,&error)==FV3_GPU_SUCCESS);
+  auto edge_nonreplace=a2b_edge_request(FieldId::delp,FieldId::heat_source,4,false,2);
+  assert(validate_corner_request(x,edge_nonreplace,&error)==FV3_GPU_SUCCESS);
+  auto invalid_edge=a2b_edge_request(FieldId::pkc,FieldId::pkc,3,true,2);
   assert(validate_corner_request(x,invalid_edge,&error)==FV3_GPU_INVALID_ARGUMENT);
-  auto copy=diffusion_corner_request(Axis::x,2,0,3);
+  auto copy=diffusion_corner_request(Axis::x,2,0,DiffusionPhase::x_corner_copy,3);
   assert(validate_corner_request(x,copy,&error)==FV3_GPU_SUCCESS);
-  auto invalid_copy=diffusion_corner_request(Axis::both,2,-1,3);
+  auto invalid_copy=diffusion_corner_request(Axis::both,2,-1,DiffusionPhase::x_corner_copy,3);
   assert(validate_corner_request(x,invalid_copy,&error)==FV3_GPU_INVALID_ARGUMENT);
+  auto no_phase=diffusion_corner_request(Axis::x,2,0,DiffusionPhase::none,3);
+  assert(no_phase.first==FieldId::invalid);
 
   FieldRegistry undersized=state;
   auto &delp=undersized.views[static_cast<size_t>(FieldId::delp)];
@@ -81,10 +88,13 @@ int main() {
   dependencies.mark_stale(FV3_GPU_H_ZH);
   assert(launch_nh_pressure(x,&error)==FV3_GPU_STATE_CONFLICT);
   dependencies.mark_ready(FV3_GPU_H_ZH,1);
-  assert(launch_post_loop_heating(x,&error)==FV3_GPU_UNSUPPORTED_CONFIGURATION);
+  assert(launch_post_loop_heating(x,&error)==FV3_GPU_SUCCESS);
 
-  FieldRegistry empty;
-  x.fields=&empty;
   immutable.config.n_con=0;
   assert(launch_post_loop_heating(x,&error)==FV3_GPU_SUCCESS);
+  immutable.config.n_con=3;
+
+  ExecutionContext no_service=x;no_service.corner_service=nullptr;
+  assert(launch_nh_pressure(no_service,&error)==FV3_GPU_INVALID_ARGUMENT);
+  assert(launch_post_loop_heating(no_service,&error)==FV3_GPU_INVALID_ARGUMENT);
 }
