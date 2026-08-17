@@ -23,8 +23,8 @@ int validate_mask(const fv3_gpu_field_mask *m, fv3_gpu_error *e, const char *api
     return fail(e, FV3_GPU_INVALID_ARGUMENT, api, "invalid field-mask ABI");
   return FV3_GPU_SUCCESS;
 }
-uint64_t issue_event(ContextData &d) { d.last_event = d.next_event++; return d.last_event; }
-bool mul_overflow(uint64_t a,uint64_t b,uint64_t &out){if(a&&b>std::numeric_limits<uint64_t>::max()/a)return true;out=a*b;return false;}
+[[maybe_unused]] uint64_t issue_event(ContextData &d) { d.last_event = d.next_event++; return d.last_event; }
+[[maybe_unused]] bool mul_overflow(uint64_t a,uint64_t b,uint64_t &out){if(a&&b>std::numeric_limits<uint64_t>::max()/a)return true;out=a*b;return false;}
 #ifdef FV3_GPU_ENABLE_CUDA
 int cuda_fail(cudaError_t rc, fv3_gpu_error *e, const char *api, ContextData *d = nullptr) {
   if (rc == cudaSuccess) return FV3_GPU_SUCCESS;
@@ -70,7 +70,8 @@ extern "C" int fv3_gpu_validate_field(const fv3_gpu_field_desc *f, fv3_gpu_error
 
 extern "C" int fv3_gpu_create(const fv3_gpu_create_desc *d, fv3_gpu_context **out, fv3_gpu_error *e) {
   using namespace fv3::gpu; clear_error(e);
-  if (!out) return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"context output is null"); *out=nullptr;
+  if (!out) return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"context output is null");
+  *out=nullptr;
   if (!d || !header_ok(d->abi_version,d->struct_bytes,sizeof(*d)) || d->mpi_size<1 || d->mpi_rank<0 || d->mpi_rank>=d->mpi_size || d->is>d->ie || d->js>d->je || d->npz<1)
     return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"invalid create descriptor");
   if ((uint32_t)active_precision != d->precision) return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,"requested precision differs from compiled FV precision");

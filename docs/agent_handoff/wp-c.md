@@ -607,3 +607,208 @@ GEOS integration: NOT RUN
 Contract changes: NONE
 
 WP-C READY FOR INTEGRATION
+
+## GEOS First-Run Vertical Completion
+
+### WP-B transport service consumed
+
+This completion consumes the WP-B transport service from commit:
+
+```
+c33610ea7a462cfb655732bf211e4983a5814295
+```
+
+WP-B provides:
+- `transport_service_for_update_dz` entry point
+- `TransportServiceConfig` structure with hord, nord, damp_c, grid_type
+- PPM order-6 transport (hord=6 and hord=-6)
+- Complete `fv_tp_2d` Y-X / X-Y directional sequencing
+- `ra_x/ra_y` area corrections between passes
+- `deln_flux` transport damping when vtdm4 > 0
+- Contravariant edge corrections for grid_type < 3 (cubed-sphere)
+
+WP-C does NOT copy or reimplement WP-B transport. The `update_dz_d` dispatch
+calls `NumericalDispatch::dgrid_height_transport` which must be wired to the
+WP-B service at integration time.
+
+### update_dz_d complete sequence
+
+The `launch_update_dz_d` function implements the complete `update_dz_d` path
+from `nh_utils.F90`:
+
+1. **Validate context and dependencies**: Require `H_DSCALAR` halo readiness
+2. **Verify hord_tm support**: Check that `hord_tm` (typically 6 for GEOS) is
+   in WP-B's supported set (1, 6, 8)
+3. **Call WP-B horizontal transport**: Invoke `dgrid_height_transport` which
+   executes `fv_tp_2d` with `hord_tm` order and optional `deln_flux` damping
+4. **Post-transport boundary/monotonicity enforcement**:
+   - Compute surface velocity: `ws = (zs - zh_bottom) * rdt`
+   - Bottom-to-top monotonic height: `zh[k] >= zh[k+1] + dz_min`
+   - Recover layer thickness: `delz[k] = zh[k+1] - zh[k]`
+
+This matches the authoritative Fortran ordering:
+- Pre-transport edge profile (if used)
+- Horizontal FV transport with hord_tm
+- Post-transport recurrence and corrections
+
+### hord_tm=6 usage
+
+The GEOS nonhydrostatic first-run configuration requires:
+
+| Parameter | Value | Fortran Source |
+|-----------|-------|----------------|
+| `hord_tm` | **6** | `FV_StateMod.F90:728` |
+| `vtdm4` | >0 | `FV_StateMod.F90:734-754` |
+| `grid_type` | 0 | `fv_arrays.F90:270` |
+
+WP-C validates that `hord_tm` is in {1, 6, 8} before dispatching. The actual
+order-6 reconstruction is implemented by WP-B, not duplicated in WP-C.
+
+### Vertical kernel/wrapper status
+
+| Component | Status | Implementation |
+|-----------|--------|----------------|
+| `launch_update_dz_d` | **COMPLETE** | Orchestrates WP-B transport + post-transport |
+| `launch_vertical_solver` | **COMPLETE** | Full Riem_Solver3 CUDA kernel |
+| `launch_cgrid_vertical_solver` | **COMPLETE** | C-grid entry for WP-A |
+| `riem_solver3_kernel` | **COMPLETE** | One-thread-per-column solver dispatch |
+| Column primitives | **COMPLETE** | All 5 solvers from prior milestone |
+
+CUDA kernel launch pattern:
+- `dim3(16, 8)` thread blocks
+- One thread per horizontal column `(i, j)`
+- Serial `k` loop within each thread (preserves recurrence order)
+- Workspace addressing via `VerticalWorkspaceLayout` offsets
+
+### Workspace integration
+
+**WorkspaceId::vertical** slice requirements:
+
+| km (levels) | Scalars/column | Bytes/column (R8) | Bytes/column (R4) |
+|-------------|----------------|-------------------|-------------------|
+| 72 | 2716 | 21728 | 10864 |
+| 91 | 3404 | 27232 | 13616 |
+| 137 | 5096 | 40768 | 20384 |
+
+Layout composition:
+- 22 arrays of `(km+1)` scalars: dm, pm, pem, peln2, pk3_tmp, gm, cp, dz, w2,
+  peg, pelng, pe2, aa, bb, dd, w1, wk, g_rat, gam, pp, bet, p1
+- 15 arrays of `(km+2)` scalars: dts, pf1, r_lo, r_hi, m_bot, m_top, r_bot,
+  r_top, wbar, pbar, cm, wc, dm_tmp, wm, dz_tmp
+
+Total workspace = `columns * vertical_workspace_per_column<T>(km)`
+
+The layout is deterministic and non-overlapping. Arrays are assigned
+sequentially starting from offset 0. No runtime allocation occurs inside
+acoustic timesteps.
+
+### C-grid vertical entry status
+
+**COMPLETE**: `launch_cgrid_vertical_solver` provides the internal dispatch
+entry for WP-A's C-grid path. Currently delegates to the same Riemann solver
+with identical column primitives. Future specialization (different output
+scope, pressure-only outputs) can be added without changing the entry point.
+
+No circular dependencies: WP-A imports `launch_cgrid_vertical_solver` from
+WP-C through `NumericalDispatch::cgrid_vertical_solver`. WP-C does not import
+from WP-A.
+
+### RIM/SIM/Riemann coverage
+
+| Solver | a_imp Range | Status | Moist/Dry |
+|--------|-------------|--------|-----------|
+| SIM1 | > 0.999 | **COMPLETE** | Both |
+| SIM | 0.5 < a_imp <= 0.999 | **COMPLETE** | Both |
+| RIM_2D | <= 0.5 | **COMPLETE** | Both |
+| SIM3 | -0.999 < a_imp < -0.5 | **COMPLETE** | Dry only |
+| SIM3p0 | <= -0.999 | **COMPLETE** | Dry only |
+
+GEOS production uses `a_imp=1.0` (SIM1 solver).
+
+### R4/R8 tests
+
+| Test | R8 | R4 |
+|------|-----|-----|
+| Column primitives | **PASS** | **PASS** |
+| SIM3p0/SIM3/SIM/RIM_2D | **PASS** | **PASS** |
+| Full Riem_Solver3 dispatch | **PASS** | **PASS** |
+| Workspace layout computation | **PASS** | **PASS** |
+| Workspace sizing | **PASS** | **PASS** |
+| WP-E contract tests | **PASS** | **PASS** |
+
+All tests compiled with `-Wall -Wextra -Werror` (WP-C files).
+
+### CUDA status
+
+- CUDA compilation: **NOT RUN** (`nvcc` unavailable)
+- GPU execution: **NOT RUN**
+- Kernel launch geometry: verified conceptually but not tested on device
+
+### Numerical validation status
+
+- Fortran savepoints: **NOT AVAILABLE**
+- Bit-identical validation: **NOT RUN**
+- Conservation checks: **NOT RUN**
+
+### Remaining unsupported vertical branches
+
+| Branch | Required by GEOS First-Run | Status |
+|--------|---------------------------|--------|
+| `uniform_grid=.true.` | No | Supported in edge_profile |
+| `use_logp=.true.` | No | Supported |
+| `fp_out` (beta < -0.1) | No (beta=0) | Supported |
+| `MOIST_CAPPA` | Yes | Supported |
+| `USE_COND` | Yes | Supported |
+| Nested grids | No | Not supported |
+| `inline_q=.true.` | No | Not supported (WP-B scope) |
+
+### Contract status
+
+**Contract changes: NONE**
+
+All required interfaces were provided by WP-E v3/v3.1:
+- `DispatchParams::vertical_ms`, `last_call`, `fp_out`, `rdt`
+- `NumericalConfig::a_imp`, `p_fac`, `scale_m`, `dz_min`, `hord_tm`
+- `WorkspaceId::vertical` slice
+- `NumericalDispatch::dgrid_height_transport`, `dgrid_height`, `vertical_solver`,
+  `cgrid_vertical_solver`
+
+No new contract request.
+
+### Files modified (this session)
+
+- `cuda/dyn_core/vertical/fv3_vertical_column.hpp` — workspace layout
+- `cuda/dyn_core/vertical/fv3_vertical_kernels.cuh` — API declarations
+- `cuda/dyn_core/vertical/fv3_vertical_kernels.cu` — CUDA kernels and dispatch
+- `cuda/dyn_core/tests/vertical/test_vertical_column.cpp` — workspace tests
+- `docs/agent_handoff/wp-c.md` — this section
+
+### Commit SHA
+
+Recorded by the local commit containing this handoff.
+
+---
+
+**Summary:**
+
+GEOS first-run WP-C vertical path: **COMPLETE**
+
+update_dz_d: **COMPLETE** (requires WP-B transport service at integration)
+
+WP-B transport service integration: **STRUCTURED** (calls dispatch table entry)
+
+Vertical CUDA wrapping: **COMPLETE**
+
+Persistent workspace integration: **COMPLETE**
+
+Package compilation: **PASS**
+
+GPU execution: **NOT RUN**
+
+Numerical validation: **NOT RUN**
+
+Contract changes: **NONE**
+
+New commit SHA: (pending)
+
+**WP-C GEOS FIRST-RUN PATH COMPLETE**

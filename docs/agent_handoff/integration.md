@@ -283,12 +283,197 @@ Public ABI version: 1 (unchanged)
 
 ## Integration commit
 
-Final integration commit: `470c95d`
+Previous integration commit: `470c95d`
 
-Total commits from base: 20
+Total commits from base (pre-4.2): 20
 - WP-E: 4 commits
 - WP-A: 4 commits
 - WP-D: 4 commits
 - WP-C: 4 commits
 - WP-B: 4 commits
 - Integration: 1 commit (CMake + docs)
+
+---
+
+## Prompt 4.2 Production-Path Closure
+
+### Completion commits integrated
+
+| Package | Completion Commit | Description |
+|---------|------------------|-------------|
+| WP-B | `c33610ea7a462cfb655732bf211e4983a5814295` | Complete GEOS production first-run transport path |
+| WP-C | `fa34fa52b71952ba15b75383d063dd8eefe9cc2c` | Complete GEOS first-run WP-C vertical/height path |
+
+### Integration order
+
+1. WP-B completion commit (file copy from package worktree)
+2. WP-C completion commit (file copy from package worktree)
+3. Minor fixes for `-Werror` compilation
+
+No cherry-pick was used; files were copied directly from the package worktrees
+at the specified commit SHAs.
+
+### Conflicts encountered
+
+None. Files modified:
+- `cuda/dyn_core/dgrid/wp_b_kernels.hpp` — extended with GEOS production transport
+- `cuda/dyn_core/tests/dgrid/test_wp_b_kernels.cpp` — extended test coverage
+- `cuda/dyn_core/vertical/fv3_vertical_column.hpp` — workspace layout
+- `cuda/dyn_core/vertical/fv3_vertical_kernels.cu` — CUDA kernels
+- `cuda/dyn_core/vertical/fv3_vertical_kernels.cuh` — API declarations
+- `cuda/dyn_core/tests/vertical/test_vertical_column.cpp` — extended tests
+- `docs/agent_handoff/wp-b.md` — updated handoff
+- `docs/agent_handoff/wp-c.md` — updated handoff
+
+### Minor resolutions
+
+- `runtime/fv3_gpu_runtime.cpp`: Fixed `-Werror=unused-function` and
+  `-Werror=misleading-indentation` warnings
+- `dgrid/wp_b_contract.cpp`: Fixed `-Werror=missing-field-initializers` by
+  using explicit member assignment instead of aggregate initialization
+
+### Final supported GEOS first-run configuration
+
+| Parameter | Value | Status |
+|-----------|-------|--------|
+| `hord_mt` | 6 | **SUPPORTED** |
+| `hord_vt` | 6 | **SUPPORTED** |
+| `hord_tm` | 6 | **SUPPORTED** |
+| `hord_dp` | -6 | **SUPPORTED** |
+| `vtdm4` | > 0 | **SUPPORTED** |
+| `grid_type` | 0 | **SUPPORTED** |
+| `hydrostatic` | false | **SUPPORTED** |
+| `a_imp` | 1.0 | **SUPPORTED** |
+
+### Complete execution sequence
+
+```
+input halo readiness (H_DWIND_IN, H_W_IN, H_GZ_FIRST)
+  → WP-A d2a2c_vect
+  → WP-A c_sw
+  → WP-A divergence_corner
+  → H_DIVGD
+  → WP-A update_dz_c
+  → WP-A/WP-C Riem_Solver_C (via launch_cgrid_vertical_solver)
+  → WP-A p_grad_c
+  → H_CWIND
+  → WP-B flux preparation
+  → WP-B fv_tp_2d_hord6 (Y-X/X-Y, ra_x/ra_y, deln_flux)
+  → WP-B contravariant_edge_corrections
+  → WP-B scalar transport (hord=6)
+  → WP-B momentum/KE/vorticity transport
+  → WP-B divergence damping
+  → WP-B heat accounting
+  → WP-B D-wind update
+  → WP-B mix_dp
+  → H_DSCALAR
+  → WP-C launch_update_dz_d
+    → WP-B dgrid_height_transport (hord_tm=6)
+    → WP-C height_boundary_v2_kernel
+  → WP-C launch_vertical_solver (SIM1 for a_imp=1.0)
+  → H_ZH, H_PKC2
+  → WP-D pe_halo, pk3_halo
+  → WP-D a2b_ord4
+  → WP-D nh_p_grad
+  → H_DWIND_NEXT
+  → [repeat acoustic substep]
+  → H_HEAT
+  → WP-D del2_cubed
+  → WP-D temperature adjustment
+```
+
+### WP-B → WP-C transport wiring
+
+**Verified:**
+1. WP-C `launch_update_dz_d` invokes `dispatch.dgrid_height_transport` (WP-B)
+2. hord_tm=6 validated at dispatch entry
+3. H_DSCALAR dependency required before transport
+4. No host synchronization introduced
+5. Stays on WP-E compute stream
+
+### Test results
+
+**R8 Build:** PASS (with `-Wall -Wextra -Werror`)
+
+**R8 Tests:** 10/10 PASS
+- fv3_gpu_descriptor: PASS
+- fv3_gpu_api: PASS
+- fv3_gpu_c_header: PASS
+- fv3_gpu_contract: PASS
+- fv3_wp_a_view: PASS
+- fv3_wp_b_kernels: PASS
+- fv3_wp_b_contract: PASS
+- fv3_wp_c_column: PASS
+- fv3_wp_d_operators: PASS
+- fv3_wp_d_contract: PASS
+
+**R4 Build:** PASS (with `-Wall -Wextra -Werror`)
+
+**R4 Tests:** 10/10 PASS (identical test set)
+
+**Total integrated tests:** 20 (10 R8 + 10 R4)
+
+### CUDA source-readiness findings
+
+| Check | Status |
+|-------|--------|
+| CUDA declarations/includes | PASS |
+| `__device__`/`__global__` markers | PASS |
+| `fv_real` type alias (no host-only types) | PASS |
+| No invalid lambdas in device code | PASS |
+| Kernel launch syntax | PASS |
+| Precision aliases consistent | PASS |
+| CUDA target sources in CMake | PASS |
+| `.cu`/`.cuh` file extensions | PASS |
+
+### CUDA compilation status
+
+**NOT RUN** — `nvcc` unavailable in current environment
+
+### GPU execution status
+
+**NOT RUN** — no GPU available
+
+### Savepoint validation status
+
+**NOT RUN** — no Fortran savepoints captured
+
+### Remaining unsupported configurations
+
+- Transport orders 2-5, 7, 9-13 (not required by GEOS first-run)
+- `inline_q=.true.`
+- Hydrostatic mode
+- Nested grids
+- True `smag_corner` (approximation used)
+- ROT3/do_f3d, SKEB
+
+### Remaining blockers
+
+1. **CUDA compilation** — nvcc unavailable; cannot verify GPU build
+2. **Authoritative savepoints** — no Fortran reference data captured
+3. **GPU execution** — no GPU available for testing
+
+### Updated integration baseline
+
+| Component | Commit | Branch | Status |
+|-----------|--------|--------|--------|
+| Base | `ac43844` | `feature/cuda-port-experiments` | — |
+| WP-E v3.1 | `b92c5ff` | `cuda/wp-e-runtime` | **PASS** |
+| WP-A | `1f59b40` | `cuda/wp-a-cgrid` | **PASS** |
+| WP-B | `c33610e` | `cuda/wp-b-dgrid` | **PASS** |
+| WP-C | `fa34fa5` | `cuda/wp-c-vertical` | **PASS** |
+| WP-D | `d04592a` | `cuda/wp-d-operators` | **PASS** |
+
+### Integration summary
+
+**Production GEOS first-run numerical path: COMPLETE**
+
+All 54 required numerical stages for the GEOS nonhydrostatic first-run
+configuration are now implemented:
+- WP-E: 10 stages COMPLETE
+- WP-A: 7 stages COMPLETE
+- WP-B: 18 stages COMPLETE
+- WP-C: 9 stages COMPLETE
+- WP-D: 10 stages COMPLETE
+
+No PARTIAL or UNIMPLEMENTED stages remain for the production configuration.

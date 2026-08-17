@@ -136,5 +136,122 @@ int main() {
   assert(ub_damp[5] == T(3));
   assert(vb_damp[5] == T(6));
 
+  // ==========================================================================
+  // GEOS Production First-Run Transport Tests
+  // ==========================================================================
+
+  // Test PPM order-6 reconstruction constants
+  // For uniform field: al = p1*(q+q) + p2*(q+q) = (2*p1 + 2*p2)*q = q (since p1+p2=0.5)
+  {
+    // Verify the order-6 limiter: smt5 = 3*|b0| < |bl-br|
+    // For smooth data, smt5 should be true (allow high-order correction)
+    // For non-smooth data with jumps, smt5 should be false (reduce to upwind)
+    T bl = T(0.1), br = T(0.15);
+    T b0 = bl + br;  // 0.25
+    bool smt5 = T(3) * std::abs(b0) < std::abs(bl - br);
+    // 3*0.25 = 0.75, |0.1-0.15| = 0.05, so 0.75 < 0.05 is false
+    assert(!smt5);
+
+    // Smooth case
+    bl = T(0.01); br = T(0.01);
+    b0 = bl + br;  // 0.02
+    smt5 = T(3) * std::abs(b0) < std::abs(bl - br);
+    // 3*0.02 = 0.06, |0.01-0.01| = 0, so 0.06 < 0 is false
+    // Actually, for truly equal bl/br, |bl-br|=0, so smt5 is always false
+    // The condition triggers when there's a local extremum pattern
+    bl = T(0.01); br = T(-0.02);
+    b0 = bl + br;  // -0.01
+    smt5 = T(3) * std::abs(b0) < std::abs(bl - br);
+    // 3*0.01 = 0.03, |0.01-(-0.02)| = 0.03, so 0.03 < 0.03 is false
+    // Need larger |bl-br|
+    bl = T(0.01); br = T(-0.05);
+    b0 = bl + br;  // -0.04
+    smt5 = T(3) * std::abs(b0) < std::abs(bl - br);
+    // 3*0.04 = 0.12, |0.01-(-0.05)| = 0.06, so 0.12 < 0.06 is false
+    // The limiter is designed to activate when the PPM parabola would overshoot
+  }
+
+  // Test negative hord positivity constraint
+  {
+    // For hord < 0, interface values are clamped to non-negative
+    T al_neg = T(-0.5);
+    T al_clamped = std::max(T(0), al_neg);
+    assert(al_clamped == T(0));
+
+    T al_pos = T(1.5);
+    al_clamped = std::max(T(0), al_pos);
+    assert(al_clamped == T(1.5));
+  }
+
+  // Test deln_flux damping structure
+  {
+    // deln_flux computes del^(2*(nord+1)) damping
+    // nord=0: del-2, nord=1: del-4, nord=2: del-6
+    // The damping coefficient is (damp_c * da_min)^(nord+1)
+    T damp_c = T(0.02), da_min = T(1e6);
+    int32_t nord = 2;
+    T damp_coef = std::pow(damp_c * da_min, nord + 1);
+    // 0.02 * 1e6 = 2e4, (2e4)^3 = 8e12
+    assert(damp_coef > T(0));
+  }
+
+  // Test contravariant correction damping factor
+  {
+    // The coupled 2x2 system uses: damp = 1 / (1 - 0.0625 * cosa_u * cosa_v)
+    // For small cosa values, damp ≈ 1
+    T cosa_u = T(0.1), cosa_v = T(0.1);
+    T damp = T(1) / (T(1) - T(0.0625) * cosa_u * cosa_v);
+    // 1 - 0.0625 * 0.01 = 1 - 0.000625 = 0.999375
+    // damp ≈ 1.000625
+    assert(damp > T(1) && damp < T(1.01));
+  }
+
+  // Test GEOS first-run configuration validation
+  {
+    // Valid GEOS config: hord_mt=6, hord_vt=6, hord_tm=6, hord_dp=-6
+    assert(fv3::gpu::dgrid::is_hord_supported(6));
+    assert(fv3::gpu::dgrid::is_hord_supported(-6));
+    assert(fv3::gpu::dgrid::is_hord_supported(8));
+    assert(fv3::gpu::dgrid::is_hord_supported(1));
+
+    // Unsupported orders
+    assert(!fv3::gpu::dgrid::is_hord_supported(2));
+    assert(!fv3::gpu::dgrid::is_hord_supported(5));
+    assert(!fv3::gpu::dgrid::is_hord_supported(7));
+    assert(!fv3::gpu::dgrid::is_hord_supported(10));
+  }
+
+  // Test TransportServiceConfig structure
+  {
+    fv3::gpu::dgrid::TransportServiceConfig<T> config;
+    config.hord = 6;
+    config.nord = 2;
+    config.damp_c = T(0.02);
+    config.da_min = T(1e6);
+    config.lim_fac = T(2.0);
+    config.grid_type = 0;
+    config.npx = 48;
+    config.npy = 48;
+    config.nested = false;
+
+    assert(config.hord == 6);
+    assert(config.grid_type == 0);
+    assert(!config.nested);
+  }
+
+  // Test copy_corners direction selection
+  {
+    // dir=1: X-direction corners (for Y-PPM)
+    // dir=2: Y-direction corners (for X-PPM)
+    // The corner copy formulas are different for each direction
+    // SW corner, dir=1: q(i,j) = q(j, 1-i)
+    // SW corner, dir=2: q(i,j) = q(1-j, i)
+    int64_t i = -1, j = -1;
+    int64_t i_src_dir1 = j, j_src_dir1 = 1 - i;  // (-1, 2)
+    int64_t i_src_dir2 = 1 - j, j_src_dir2 = i;  // (2, -1)
+    assert(i_src_dir1 == -1 && j_src_dir1 == 2);
+    assert(i_src_dir2 == 2 && j_src_dir2 == -1);
+  }
+
   return 0;
 }

@@ -17,13 +17,16 @@ int resolve_contract_v3(const ExecutionContext &x, ContractViews &out,
                 "WP-B requires the borrowed compute submission");
 
   const auto &r = *x.fields;
-  out = {need(r, FieldId::u), need(r, FieldId::v), need(r, FieldId::w),
-         need(r, FieldId::pt), need(r, FieldId::delp), need(r, FieldId::uc),
-         need(r, FieldId::vc), need(r, FieldId::mfx), need(r, FieldId::mfy),
-         need(r, FieldId::cx), need(r, FieldId::cy), need(r, FieldId::dpx),
-         need(r, FieldId::divgd), need(r, FieldId::crx), need(r, FieldId::cry),
-         need(r, FieldId::xfx), need(r, FieldId::yfx),
-         need(r, FieldId::heat_source)};
+  out = ContractViews{};
+  out.u = need(r, FieldId::u); out.v = need(r, FieldId::v);
+  out.w = need(r, FieldId::w); out.pt = need(r, FieldId::pt);
+  out.delp = need(r, FieldId::delp); out.uc = need(r, FieldId::uc);
+  out.vc = need(r, FieldId::vc); out.mfx = need(r, FieldId::mfx);
+  out.mfy = need(r, FieldId::mfy); out.cx = need(r, FieldId::cx);
+  out.cy = need(r, FieldId::cy); out.dpx = need(r, FieldId::dpx);
+  out.divgd = need(r, FieldId::divgd); out.crx = need(r, FieldId::crx);
+  out.cry = need(r, FieldId::cry); out.xfx = need(r, FieldId::xfx);
+  out.yfx = need(r, FieldId::yfx); out.heat_source = need(r, FieldId::heat_source);
   if (x.immutable->grid) {
     const auto &g = *x.immutable->grid;
 #define GRID(NAME) out.NAME = need(g, FieldId::NAME)

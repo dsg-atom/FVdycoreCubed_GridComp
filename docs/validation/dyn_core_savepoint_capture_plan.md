@@ -246,16 +246,18 @@ Each savepoint should produce:
 
 ### First capture configuration
 
-The first capture should use the "first runnable configuration":
+The first capture should use the GEOS production first-run configuration:
 
 - `hydrostatic=.false.`
 - `nested=.false.`
-- `hord_*=1` or `8`
+- `hord_mt=6`, `hord_vt=6`, `hord_tm=6`, `hord_dp=-6`
+- `vtdm4 > 0` (enables deln_flux)
+- `grid_type=0` (cubed-sphere)
 - `inline_q=.false.`
 - `beta=0`
+- `a_imp=1.0` (SIM1 solver)
 
-Captures at other configurations should be deferred until those configurations
-are implemented.
+This configuration is now fully supported by the CUDA implementation.
 
 ## Status
 

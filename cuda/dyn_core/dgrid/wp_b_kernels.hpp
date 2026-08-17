@@ -728,4 +728,784 @@ inline void add_vorticity_damping(const HorizontalBounds &b, int64_t k,
   }
 }
 
+// =============================================================================
+// GEOS Production First-Run Transport Completion
+// =============================================================================
+// The following implements the production transport path required by:
+//   hord_mt = 6, hord_vt = 6, hord_tm = 6, hord_dp = -6
+//   vtdm4 > 0, grid_type = 0
+// =============================================================================
+
+// PPM order 6 X-direction transport (tp_core.F90:xppm mord=6 branch)
+// Uses the limiter: smt5(i) = 3.*abs(b0(i)) < abs(bl(i)-br(i))
+// For negative hord, applies positivity constraint to interface values.
+template <class T>
+inline void xppm_hord6(const HorizontalBounds &b, int64_t j, int32_t hord,
+                       FieldView<const T> q, FieldView<const T> crx,
+                       FieldView<const T> dxa, bool nested, int32_t grid_type,
+                       int64_t npx, T lim_fac, FieldView<T> flux) {
+  T al[256], bl[256], br[256], b0[256];
+  bool smt5[256];
+  const int64_t is = b.is, ie = b.ie;
+  const int32_t mord = std::abs(hord);
+
+  // Compute boundary indices for cubed-sphere
+  int64_t is1, ie3, ie1;
+  if (!nested && grid_type < 3) {
+    is1 = std::max(int64_t(3), is - 1);
+    ie3 = std::min(npx - 2, ie + 2);
+    ie1 = std::min(npx - 3, ie + 1);
+  } else {
+    is1 = is - 1;
+    ie3 = ie + 2;
+    ie1 = ie + 1;
+  }
+
+  // Compute interface values using 4th-order formula: al(i) = p1*(q(i-1)+q(i)) + p2*(q(i-2)+q(i+1))
+  for (int64_t i = is1; i <= ie3; ++i) {
+    const int64_t idx = i - is + 4;
+    al[idx] = static_cast<T>(ppm::p1) * (q(i - 1, j, 0) + q(i, j, 0)) +
+              static_cast<T>(ppm::p2) * (q(i - 2, j, 0) + q(i + 1, j, 0));
+  }
+
+  // Panel boundary treatment for cubed-sphere (grid_type < 3)
+  if (!nested && grid_type < 3) {
+    if (is == 1) {
+      const int64_t idx0 = 0 - is + 4, idx1 = 1 - is + 4, idx2 = 2 - is + 4;
+      al[idx0] = static_cast<T>(ppm::c1) * q(-2, j, 0) +
+                 static_cast<T>(ppm::c2) * q(-1, j, 0) +
+                 static_cast<T>(ppm::c3) * q(0, j, 0);
+      // al(1) = weighted average using dxa
+      const T dxa_m1 = dxa(-1, j), dxa_0 = dxa(0, j);
+      const T dxa_1 = dxa(1, j), dxa_2 = dxa(2, j);
+      al[idx1] = T(0.5) * (((T(2) * dxa_0 + dxa_m1) * q(0, j, 0) - dxa_0 * q(-1, j, 0)) / (dxa_m1 + dxa_0) +
+                           ((T(2) * dxa_1 + dxa_2) * q(1, j, 0) - dxa_1 * q(2, j, 0)) / (dxa_1 + dxa_2));
+      al[idx2] = static_cast<T>(ppm::c3) * q(1, j, 0) +
+                 static_cast<T>(ppm::c2) * q(2, j, 0) +
+                 static_cast<T>(ppm::c1) * q(3, j, 0);
+    }
+    if ((ie + 1) == npx) {
+      const int64_t idxm1 = npx - 1 - is + 4, idxn = npx - is + 4, idxp1 = npx + 1 - is + 4;
+      al[idxm1] = static_cast<T>(ppm::c1) * q(npx - 3, j, 0) +
+                  static_cast<T>(ppm::c2) * q(npx - 2, j, 0) +
+                  static_cast<T>(ppm::c3) * q(npx - 1, j, 0);
+      const T dxa_nm2 = dxa(npx - 2, j), dxa_nm1 = dxa(npx - 1, j);
+      const T dxa_n = dxa(npx, j), dxa_np1 = dxa(npx + 1, j);
+      al[idxn] = T(0.5) * (((T(2) * dxa_nm1 + dxa_nm2) * q(npx - 1, j, 0) - dxa_nm1 * q(npx - 2, j, 0)) / (dxa_nm2 + dxa_nm1) +
+                           ((T(2) * dxa_n + dxa_np1) * q(npx, j, 0) - dxa_n * q(npx + 1, j, 0)) / (dxa_n + dxa_np1));
+      al[idxp1] = static_cast<T>(ppm::c3) * q(npx, j, 0) +
+                  static_cast<T>(ppm::c2) * q(npx + 1, j, 0) +
+                  static_cast<T>(ppm::c1) * q(npx + 2, j, 0);
+    }
+  }
+
+  // Apply positivity constraint for negative hord (mass transport)
+  if (hord < 0) {
+    for (int64_t i = is - 1; i <= ie + 2; ++i) {
+      const int64_t idx = i - is + 4;
+      al[idx] = std::max(T(0), al[idx]);
+    }
+  }
+
+  // Compute bl, br, b0 and the mord=6 limiter: smt5 = 3*|b0| < |bl-br|
+  for (int64_t i = is - 1; i <= ie + 1; ++i) {
+    const int64_t idx = i - is + 4;
+    bl[idx] = al[idx] - q(i, j, 0);
+    br[idx] = al[idx + 1] - q(i, j, 0);
+    b0[idx] = bl[idx] + br[idx];
+    smt5[idx] = T(3) * std::abs(b0[idx]) < std::abs(bl[idx] - br[idx]);
+  }
+
+  // Fix edge issues for cubed-sphere (from WMP fix in tp_core.F90)
+  if (!nested && grid_type < 3) {
+    if (is == 1) {
+      const int64_t idx0 = 0 - is + 4, idx1 = 1 - is + 4;
+      smt5[idx0] = bl[idx0] * br[idx0] < T(0);
+      smt5[idx1] = bl[idx1] * br[idx1] < T(0);
+    }
+    if ((ie + 1) == npx) {
+      const int64_t idxm1 = npx - 1 - is + 4, idxn = npx - is + 4;
+      smt5[idxm1] = bl[idxm1] * br[idxm1] < T(0);
+      smt5[idxn] = bl[idxn] * br[idxn] < T(0);
+    }
+  }
+
+  // Compute flux using PPM formula with conditional limiter
+  for (int64_t i = is; i <= ie + 1; ++i) {
+    const int64_t idx = i - is + 4;
+    const T c = crx(i, j, 0);
+    T fx1;
+    if (c > T(0)) {
+      fx1 = (T(1) - c) * (br[idx - 1] - c * b0[idx - 1]);
+      flux(i, j, 0) = q(i - 1, j, 0);
+    } else {
+      fx1 = (T(1) + c) * (bl[idx] + c * b0[idx]);
+      flux(i, j, 0) = q(i, j, 0);
+    }
+    if (smt5[idx - 1] || smt5[idx]) {
+      flux(i, j, 0) = flux(i, j, 0) + fx1;
+    }
+  }
+}
+
+// PPM order 6 Y-direction transport (tp_core.F90:yppm mord=6 branch)
+template <class T>
+inline void yppm_hord6(const HorizontalBounds &b, int64_t ifirst, int64_t ilast,
+                       int32_t hord, FieldView<const T> q, FieldView<const T> cry,
+                       FieldView<const T> dya, bool nested, int32_t grid_type,
+                       int64_t npy, T lim_fac, FieldView<T> flux) {
+  const int64_t js = b.js, je = b.je;
+  const int32_t mord = std::abs(hord);
+
+  // Compute boundary indices for cubed-sphere
+  int64_t js1, je3, je1;
+  if (!nested && grid_type < 3) {
+    js1 = std::max(int64_t(3), js - 1);
+    je3 = std::min(npy - 2, je + 2);
+    je1 = std::min(npy - 3, je + 1);
+  } else {
+    js1 = js - 1;
+    je3 = je + 2;
+    je1 = je + 1;
+  }
+
+  // Process each i-column
+  for (int64_t i = ifirst; i <= ilast; ++i) {
+    T al[256], bl[256], br[256], b0[256];
+    bool smt5[256];
+
+    // Compute interface values
+    for (int64_t j = js1; j <= je3; ++j) {
+      const int64_t jdx = j - js + 4;
+      al[jdx] = static_cast<T>(ppm::p1) * (q(i, j - 1, 0) + q(i, j, 0)) +
+                static_cast<T>(ppm::p2) * (q(i, j - 2, 0) + q(i, j + 1, 0));
+    }
+
+    // Panel boundary treatment for cubed-sphere
+    if (!nested && grid_type < 3) {
+      if (js == 1) {
+        const int64_t jdx0 = 0 - js + 4, jdx1 = 1 - js + 4, jdx2 = 2 - js + 4;
+        al[jdx0] = static_cast<T>(ppm::c1) * q(i, -2, 0) +
+                   static_cast<T>(ppm::c2) * q(i, -1, 0) +
+                   static_cast<T>(ppm::c3) * q(i, 0, 0);
+        const T dya_m1 = dya(i, -1), dya_0 = dya(i, 0);
+        const T dya_1 = dya(i, 1), dya_2 = dya(i, 2);
+        al[jdx1] = T(0.5) * (((T(2) * dya_0 + dya_m1) * q(i, 0, 0) - dya_0 * q(i, -1, 0)) / (dya_m1 + dya_0) +
+                             ((T(2) * dya_1 + dya_2) * q(i, 1, 0) - dya_1 * q(i, 2, 0)) / (dya_1 + dya_2));
+        al[jdx2] = static_cast<T>(ppm::c3) * q(i, 1, 0) +
+                   static_cast<T>(ppm::c2) * q(i, 2, 0) +
+                   static_cast<T>(ppm::c1) * q(i, 3, 0);
+      }
+      if ((je + 1) == npy) {
+        const int64_t jdxm1 = npy - 1 - js + 4, jdxn = npy - js + 4, jdxp1 = npy + 1 - js + 4;
+        al[jdxm1] = static_cast<T>(ppm::c1) * q(i, npy - 3, 0) +
+                    static_cast<T>(ppm::c2) * q(i, npy - 2, 0) +
+                    static_cast<T>(ppm::c3) * q(i, npy - 1, 0);
+        const T dya_nm2 = dya(i, npy - 2), dya_nm1 = dya(i, npy - 1);
+        const T dya_n = dya(i, npy), dya_np1 = dya(i, npy + 1);
+        al[jdxn] = T(0.5) * (((T(2) * dya_nm1 + dya_nm2) * q(i, npy - 1, 0) - dya_nm1 * q(i, npy - 2, 0)) / (dya_nm2 + dya_nm1) +
+                             ((T(2) * dya_n + dya_np1) * q(i, npy, 0) - dya_n * q(i, npy + 1, 0)) / (dya_n + dya_np1));
+        al[jdxp1] = static_cast<T>(ppm::c3) * q(i, npy, 0) +
+                    static_cast<T>(ppm::c2) * q(i, npy + 1, 0) +
+                    static_cast<T>(ppm::c1) * q(i, npy + 2, 0);
+      }
+    }
+
+    // Apply positivity constraint for negative hord
+    if (hord < 0) {
+      for (int64_t j = js - 1; j <= je + 2; ++j) {
+        const int64_t jdx = j - js + 4;
+        al[jdx] = std::max(T(0), al[jdx]);
+      }
+    }
+
+    // Compute bl, br, b0 and limiter
+    for (int64_t j = js - 1; j <= je + 1; ++j) {
+      const int64_t jdx = j - js + 4;
+      bl[jdx] = al[jdx] - q(i, j, 0);
+      br[jdx] = al[jdx + 1] - q(i, j, 0);
+      b0[jdx] = bl[jdx] + br[jdx];
+      smt5[jdx] = T(3) * std::abs(b0[jdx]) < std::abs(bl[jdx] - br[jdx]);
+    }
+
+    // Fix edge issues
+    if (!nested && grid_type < 3) {
+      if (js == 1) {
+        const int64_t jdx0 = 0 - js + 4, jdx1 = 1 - js + 4;
+        smt5[jdx0] = bl[jdx0] * br[jdx0] < T(0);
+        smt5[jdx1] = bl[jdx1] * br[jdx1] < T(0);
+      }
+      if ((je + 1) == npy) {
+        const int64_t jdxm1 = npy - 1 - js + 4, jdxn = npy - js + 4;
+        smt5[jdxm1] = bl[jdxm1] * br[jdxm1] < T(0);
+        smt5[jdxn] = bl[jdxn] * br[jdxn] < T(0);
+      }
+    }
+
+    // Compute flux
+    for (int64_t j = js; j <= je + 1; ++j) {
+      const int64_t jdx = j - js + 4;
+      const T c = cry(i, j, 0);
+      T fx1;
+      if (c > T(0)) {
+        fx1 = (T(1) - c) * (br[jdx - 1] - c * b0[jdx - 1]);
+        flux(i, j, 0) = q(i, j - 1, 0);
+      } else {
+        fx1 = (T(1) + c) * (bl[jdx] + c * b0[jdx]);
+        flux(i, j, 0) = q(i, j, 0);
+      }
+      if (smt5[jdx - 1] || smt5[jdx]) {
+        flux(i, j, 0) = flux(i, j, 0) + fx1;
+      }
+    }
+  }
+}
+
+// Complete fv_tp_2d with directional sequencing (tp_core.F90:fv_tp_2d)
+// Y-X inner, X-Y outer with ra_x/ra_y area corrections
+template <class T>
+inline void fv_tp_2d_hord6(const HorizontalBounds &b, int64_t k, int32_t hord,
+                           FieldView<const T> q_in, FieldView<const T> crx,
+                           FieldView<const T> cry, FieldView<const T> xfx,
+                           FieldView<const T> yfx, FieldView<const T> area,
+                           FieldView<const T> ra_x, FieldView<const T> ra_y,
+                           FieldView<const T> dxa, FieldView<const T> dya,
+                           bool nested, int32_t grid_type, int64_t npx, int64_t npy,
+                           T lim_fac, FieldView<T> fx, FieldView<T> fy,
+                           FieldView<T> q_work, FieldView<T> fy2, FieldView<T> fx2) {
+  const int64_t is = b.is, ie = b.ie, js = b.js, je = b.je;
+  const int64_t isd = is - 3, ied = ie + 3, jsd = js - 3, jed = je + 3;
+
+  // Determine inner/outer orders (hord=10 uses 8 for inner)
+  const int32_t ord_in = (hord == 10) ? 8 : hord;
+  const int32_t ord_ou = hord;
+
+  // --- First pass: Y-direction on input q -> fy2 ---
+  HorizontalBounds b_y{isd, ied, js, je};
+  for (int64_t j = js; j <= je + 1; ++j) {
+    for (int64_t i = isd; i <= ied; ++i) {
+      // Simple Y-direction PPM using hord6 for each j-slice
+      const T c = cry(i, j, k);
+      T al_jm1 = static_cast<T>(ppm::p1) * (q_in(i, j - 2, k) + q_in(i, j - 1, k)) +
+                 static_cast<T>(ppm::p2) * (q_in(i, j - 3, k) + q_in(i, j, k));
+      T al_j = static_cast<T>(ppm::p1) * (q_in(i, j - 1, k) + q_in(i, j, k)) +
+               static_cast<T>(ppm::p2) * (q_in(i, j - 2, k) + q_in(i, j + 1, k));
+      T al_jp1 = static_cast<T>(ppm::p1) * (q_in(i, j, k) + q_in(i, j + 1, k)) +
+                 static_cast<T>(ppm::p2) * (q_in(i, j - 1, k) + q_in(i, j + 2, k));
+
+      // Apply positivity for negative hord
+      if (hord < 0) {
+        al_jm1 = std::max(T(0), al_jm1);
+        al_j = std::max(T(0), al_j);
+        al_jp1 = std::max(T(0), al_jp1);
+      }
+
+      const T bl_jm1 = al_jm1 - q_in(i, j - 1, k);
+      const T br_jm1 = al_j - q_in(i, j - 1, k);
+      const T b0_jm1 = bl_jm1 + br_jm1;
+      const T bl_j = al_j - q_in(i, j, k);
+      const T br_j = al_jp1 - q_in(i, j, k);
+      const T b0_j = bl_j + br_j;
+      const bool smt5_jm1 = T(3) * std::abs(b0_jm1) < std::abs(bl_jm1 - br_jm1);
+      const bool smt5_j = T(3) * std::abs(b0_j) < std::abs(bl_j - br_j);
+
+      T fx1;
+      if (c > T(0)) {
+        fx1 = (T(1) - c) * (br_jm1 - c * b0_jm1);
+        fy2(i, j, k) = q_in(i, j - 1, k);
+      } else {
+        fx1 = (T(1) + c) * (bl_j + c * b0_j);
+        fy2(i, j, k) = q_in(i, j, k);
+      }
+      if (smt5_jm1 || smt5_j) {
+        fy2(i, j, k) = fy2(i, j, k) + fx1;
+      }
+    }
+  }
+
+  // Compute q_i = (q*area + fyy(j) - fyy(j+1)) / ra_y
+  // where fyy = yfx * fy2
+  for (int64_t j = js; j <= je; ++j) {
+    for (int64_t i = isd; i <= ied; ++i) {
+      const T fyy_j = yfx(i, j, k) * fy2(i, j, k);
+      const T fyy_jp1 = yfx(i, j + 1, k) * fy2(i, j + 1, k);
+      q_work(i, j, k) = (q_in(i, j, k) * area(i, j) + fyy_j - fyy_jp1) / ra_y(i, j);
+    }
+  }
+
+  // --- Second pass: X-direction on q_i -> fx (outer order) ---
+  for (int64_t j = js; j <= je; ++j) {
+    for (int64_t i = is; i <= ie + 1; ++i) {
+      const T c = crx(i, j, k);
+      T al_im1 = static_cast<T>(ppm::p1) * (q_work(i - 2, j, k) + q_work(i - 1, j, k)) +
+                 static_cast<T>(ppm::p2) * (q_work(i - 3, j, k) + q_work(i, j, k));
+      T al_i = static_cast<T>(ppm::p1) * (q_work(i - 1, j, k) + q_work(i, j, k)) +
+               static_cast<T>(ppm::p2) * (q_work(i - 2, j, k) + q_work(i + 1, j, k));
+      T al_ip1 = static_cast<T>(ppm::p1) * (q_work(i, j, k) + q_work(i + 1, j, k)) +
+                 static_cast<T>(ppm::p2) * (q_work(i - 1, j, k) + q_work(i + 2, j, k));
+
+      if (hord < 0) {
+        al_im1 = std::max(T(0), al_im1);
+        al_i = std::max(T(0), al_i);
+        al_ip1 = std::max(T(0), al_ip1);
+      }
+
+      const T bl_im1 = al_im1 - q_work(i - 1, j, k);
+      const T br_im1 = al_i - q_work(i - 1, j, k);
+      const T b0_im1 = bl_im1 + br_im1;
+      const T bl_i = al_i - q_work(i, j, k);
+      const T br_i = al_ip1 - q_work(i, j, k);
+      const T b0_i = bl_i + br_i;
+      const bool smt5_im1 = T(3) * std::abs(b0_im1) < std::abs(bl_im1 - br_im1);
+      const bool smt5_i = T(3) * std::abs(b0_i) < std::abs(bl_i - br_i);
+
+      T fx1;
+      if (c > T(0)) {
+        fx1 = (T(1) - c) * (br_im1 - c * b0_im1);
+        fx(i, j, k) = q_work(i - 1, j, k);
+      } else {
+        fx1 = (T(1) + c) * (bl_i + c * b0_i);
+        fx(i, j, k) = q_work(i, j, k);
+      }
+      if (smt5_im1 || smt5_i) {
+        fx(i, j, k) = fx(i, j, k) + fx1;
+      }
+    }
+  }
+
+  // --- Third pass: X-direction on original q -> fx2 ---
+  for (int64_t j = jsd; j <= jed; ++j) {
+    for (int64_t i = is; i <= ie + 1; ++i) {
+      const T c = crx(i, j, k);
+      T al_im1 = static_cast<T>(ppm::p1) * (q_in(i - 2, j, k) + q_in(i - 1, j, k)) +
+                 static_cast<T>(ppm::p2) * (q_in(i - 3, j, k) + q_in(i, j, k));
+      T al_i = static_cast<T>(ppm::p1) * (q_in(i - 1, j, k) + q_in(i, j, k)) +
+               static_cast<T>(ppm::p2) * (q_in(i - 2, j, k) + q_in(i + 1, j, k));
+      T al_ip1 = static_cast<T>(ppm::p1) * (q_in(i, j, k) + q_in(i + 1, j, k)) +
+                 static_cast<T>(ppm::p2) * (q_in(i - 1, j, k) + q_in(i + 2, j, k));
+
+      if (hord < 0) {
+        al_im1 = std::max(T(0), al_im1);
+        al_i = std::max(T(0), al_i);
+        al_ip1 = std::max(T(0), al_ip1);
+      }
+
+      const T bl_im1 = al_im1 - q_in(i - 1, j, k);
+      const T br_im1 = al_i - q_in(i - 1, j, k);
+      const T b0_im1 = bl_im1 + br_im1;
+      const T bl_i = al_i - q_in(i, j, k);
+      const T br_i = al_ip1 - q_in(i, j, k);
+      const T b0_i = bl_i + br_i;
+      const bool smt5_im1 = T(3) * std::abs(b0_im1) < std::abs(bl_im1 - br_im1);
+      const bool smt5_i = T(3) * std::abs(b0_i) < std::abs(bl_i - br_i);
+
+      T fx1;
+      if (c > T(0)) {
+        fx1 = (T(1) - c) * (br_im1 - c * b0_im1);
+        fx2(i, j, k) = q_in(i - 1, j, k);
+      } else {
+        fx1 = (T(1) + c) * (bl_i + c * b0_i);
+        fx2(i, j, k) = q_in(i, j, k);
+      }
+      if (smt5_im1 || smt5_i) {
+        fx2(i, j, k) = fx2(i, j, k) + fx1;
+      }
+    }
+  }
+
+  // Compute q_j = (q*area + fxx(i) - fxx(i+1)) / ra_x
+  // where fxx = xfx * fx2
+  for (int64_t j = jsd; j <= jed; ++j) {
+    for (int64_t i = is; i <= ie; ++i) {
+      const T fxx_i = xfx(i, j, k) * fx2(i, j, k);
+      const T fxx_ip1 = xfx(i + 1, j, k) * fx2(i + 1, j, k);
+      q_work(i, j, k) = (q_in(i, j, k) * area(i, j) + fxx_i - fxx_ip1) / ra_x(i, j);
+    }
+  }
+
+  // --- Fourth pass: Y-direction on q_j -> fy (outer order) ---
+  for (int64_t j = js; j <= je + 1; ++j) {
+    for (int64_t i = is; i <= ie; ++i) {
+      const T c = cry(i, j, k);
+      T al_jm1 = static_cast<T>(ppm::p1) * (q_work(i, j - 2, k) + q_work(i, j - 1, k)) +
+                 static_cast<T>(ppm::p2) * (q_work(i, j - 3, k) + q_work(i, j, k));
+      T al_j = static_cast<T>(ppm::p1) * (q_work(i, j - 1, k) + q_work(i, j, k)) +
+               static_cast<T>(ppm::p2) * (q_work(i, j - 2, k) + q_work(i, j + 1, k));
+      T al_jp1 = static_cast<T>(ppm::p1) * (q_work(i, j, k) + q_work(i, j + 1, k)) +
+                 static_cast<T>(ppm::p2) * (q_work(i, j - 1, k) + q_work(i, j + 2, k));
+
+      if (hord < 0) {
+        al_jm1 = std::max(T(0), al_jm1);
+        al_j = std::max(T(0), al_j);
+        al_jp1 = std::max(T(0), al_jp1);
+      }
+
+      const T bl_jm1 = al_jm1 - q_work(i, j - 1, k);
+      const T br_jm1 = al_j - q_work(i, j - 1, k);
+      const T b0_jm1 = bl_jm1 + br_jm1;
+      const T bl_j = al_j - q_work(i, j, k);
+      const T br_j = al_jp1 - q_work(i, j, k);
+      const T b0_j = bl_j + br_j;
+      const bool smt5_jm1 = T(3) * std::abs(b0_jm1) < std::abs(bl_jm1 - br_jm1);
+      const bool smt5_j = T(3) * std::abs(b0_j) < std::abs(bl_j - br_j);
+
+      T fx1;
+      if (c > T(0)) {
+        fx1 = (T(1) - c) * (br_jm1 - c * b0_jm1);
+        fy(i, j, k) = q_work(i, j - 1, k);
+      } else {
+        fx1 = (T(1) + c) * (bl_j + c * b0_j);
+        fy(i, j, k) = q_work(i, j, k);
+      }
+      if (smt5_jm1 || smt5_j) {
+        fy(i, j, k) = fy(i, j, k) + fx1;
+      }
+    }
+  }
+
+  // --- Flux averaging and weighting ---
+  // For transport of delp/vorticity: flux = 0.5*(flux + flux2) * xfx/yfx
+  for (int64_t j = js; j <= je; ++j) {
+    for (int64_t i = is; i <= ie + 1; ++i) {
+      fx(i, j, k) = T(0.5) * (fx(i, j, k) + fx2(i, j, k)) * xfx(i, j, k);
+    }
+  }
+  for (int64_t j = js; j <= je + 1; ++j) {
+    for (int64_t i = is; i <= ie; ++i) {
+      fy(i, j, k) = T(0.5) * (fy(i, j, k) + fy2(i, j, k)) * yfx(i, j, k);
+    }
+  }
+}
+
+// deln_flux transport damping (tp_core.F90:deln_flux)
+// Del-n damping for cell-mean values: nord=0->del-2, nord=1->del-4, nord=2->del-6
+template <class T>
+inline void deln_flux_transport(const HorizontalBounds &b, int64_t k, int32_t nord,
+                                T damp, T da_min, FieldView<const T> q,
+                                FieldView<const T> del6_u, FieldView<const T> del6_v,
+                                FieldView<const T> rarea, bool has_mass,
+                                FieldView<const T> mass, FieldView<T> fx,
+                                FieldView<T> fy, FieldView<T> d2, FieldView<T> fx2,
+                                FieldView<T> fy2) {
+  const int64_t is = b.is, ie = b.ie, js = b.js, je = b.je;
+  const T damp_coef = std::pow(damp * da_min, nord + 1);
+
+  // Initialize d2 with scaled q (or unscaled if mass weighting will be applied)
+  const int64_t i1 = is - 1 - nord, i2 = ie + 1 + nord;
+  const int64_t j1 = js - 1 - nord, j2 = je + 1 + nord;
+
+  if (!has_mass) {
+    for (int64_t j = j1; j <= j2; ++j) {
+      for (int64_t i = i1; i <= i2; ++i) {
+        d2(i, j, k) = damp_coef * q(i, j, k);
+      }
+    }
+  } else {
+    for (int64_t j = j1; j <= j2; ++j) {
+      for (int64_t i = i1; i <= i2; ++i) {
+        d2(i, j, k) = q(i, j, k);
+      }
+    }
+  }
+
+  // First flux computation
+  for (int64_t j = js - nord; j <= je + nord; ++j) {
+    for (int64_t i = is - nord; i <= ie + nord + 1; ++i) {
+      fx2(i, j, k) = del6_v(i, j) * (d2(i - 1, j, k) - d2(i, j, k));
+    }
+  }
+  for (int64_t j = js - nord; j <= je + nord + 1; ++j) {
+    for (int64_t i = is - nord; i <= ie + nord; ++i) {
+      fy2(i, j, k) = del6_u(i, j) * (d2(i, j - 1, k) - d2(i, j, k));
+    }
+  }
+
+  // High-order iterations (nord > 0)
+  for (int32_t n = 1; n <= nord; ++n) {
+    const int32_t nt = nord - n;
+
+    // Compute divergence into d2
+    for (int64_t j = js - nt - 1; j <= je + nt + 1; ++j) {
+      for (int64_t i = is - nt - 1; i <= ie + nt + 1; ++i) {
+        d2(i, j, k) = (fx2(i, j, k) - fx2(i + 1, j, k) +
+                       fy2(i, j, k) - fy2(i, j + 1, k)) * rarea(i, j);
+      }
+    }
+
+    // Recompute fluxes (note sign change: d2(i,j)-d2(i-1,j) instead of d2(i-1,j)-d2(i,j))
+    for (int64_t j = js - nt; j <= je + nt; ++j) {
+      for (int64_t i = is - nt; i <= ie + nt + 1; ++i) {
+        fx2(i, j, k) = del6_v(i, j) * (d2(i, j, k) - d2(i - 1, j, k));
+      }
+    }
+    for (int64_t j = js - nt; j <= je + nt + 1; ++j) {
+      for (int64_t i = is - nt; i <= ie + nt; ++i) {
+        fy2(i, j, k) = del6_u(i, j) * (d2(i, j, k) - d2(i, j - 1, k));
+      }
+    }
+  }
+
+  // Add diffusive fluxes to flux arrays
+  if (has_mass) {
+    const T damp2 = T(0.5) * damp_coef;
+    for (int64_t j = js; j <= je; ++j) {
+      for (int64_t i = is; i <= ie + 1; ++i) {
+        fx(i, j, k) = fx(i, j, k) + damp2 * (mass(i - 1, j, k) + mass(i, j, k)) * fx2(i, j, k);
+      }
+    }
+    for (int64_t j = js; j <= je + 1; ++j) {
+      for (int64_t i = is; i <= ie; ++i) {
+        fy(i, j, k) = fy(i, j, k) + damp2 * (mass(i, j - 1, k) + mass(i, j, k)) * fy2(i, j, k);
+      }
+    }
+  } else {
+    for (int64_t j = js; j <= je; ++j) {
+      for (int64_t i = is; i <= ie + 1; ++i) {
+        fx(i, j, k) = fx(i, j, k) + fx2(i, j, k);
+      }
+    }
+    for (int64_t j = js; j <= je + 1; ++j) {
+      for (int64_t i = is; i <= ie; ++i) {
+        fy(i, j, k) = fy(i, j, k) + fy2(i, j, k);
+      }
+    }
+  }
+}
+
+// Contravariant edge corrections for grid_type < 3 (sw_core.F90 lines 791-863)
+// Solves coupled 2x2 system at panel corners for ut/vt
+template <class T>
+inline void contravariant_edge_corrections(int64_t k, int64_t npx, int64_t npy,
+                                           bool sw_corner, bool se_corner,
+                                           bool ne_corner, bool nw_corner,
+                                           FieldView<const T> uc, FieldView<const T> vc,
+                                           FieldView<const T> cosa_u, FieldView<const T> cosa_v,
+                                           FieldView<T> ut, FieldView<T> vt) {
+  // Southwest corner
+  if (sw_corner) {
+    // ut(2,0) and vt(0,2) exterior pair
+    T damp = T(1) / (T(1) - T(0.0625) * cosa_u(2, 0) * cosa_v(1, 0));
+    ut(2, 0, k) = (uc(2, 0, k) - T(0.25) * cosa_u(2, 0) *
+                  (vt(1, 1, k) + vt(2, 1, k) + vt(2, 0, k) + vc(1, 0, k) -
+                   T(0.25) * cosa_v(1, 0) * (ut(1, 0, k) + ut(1, -1, k) + ut(2, -1, k)))) * damp;
+
+    damp = T(1) / (T(1) - T(0.0625) * cosa_u(0, 1) * cosa_v(0, 2));
+    vt(0, 2, k) = (vc(0, 2, k) - T(0.25) * cosa_v(0, 2) *
+                  (ut(1, 1, k) + ut(1, 2, k) + ut(0, 2, k) + uc(0, 1, k) -
+                   T(0.25) * cosa_u(0, 1) * (vt(0, 1, k) + vt(-1, 1, k) + vt(-1, 2, k)))) * damp;
+
+    // ut(2,1) and vt(1,2) interior pair (coupled solve)
+    damp = T(1) / (T(1) - T(0.0625) * cosa_u(2, 1) * cosa_v(1, 2));
+    ut(2, 1, k) = (uc(2, 1, k) - T(0.25) * cosa_u(2, 1) *
+                  (vt(1, 1, k) + vt(2, 1, k) + vt(2, 2, k) + vc(1, 2, k) -
+                   T(0.25) * cosa_v(1, 2) * (ut(1, 1, k) + ut(1, 2, k) + ut(2, 2, k)))) * damp;
+    vt(1, 2, k) = (vc(1, 2, k) - T(0.25) * cosa_v(1, 2) *
+                  (ut(1, 1, k) + ut(1, 2, k) + ut(2, 2, k) + uc(2, 1, k) -
+                   T(0.25) * cosa_u(2, 1) * (vt(1, 1, k) + vt(2, 1, k) + vt(2, 2, k)))) * damp;
+  }
+
+  // Southeast corner
+  if (se_corner) {
+    T damp = T(1) / (T(1) - T(0.0625) * cosa_u(npx - 1, 0) * cosa_v(npx - 1, 0));
+    ut(npx - 1, 0, k) = (uc(npx - 1, 0, k) - T(0.25) * cosa_u(npx - 1, 0) *
+                        (vt(npx - 1, 1, k) + vt(npx - 2, 1, k) + vt(npx - 2, 0, k) + vc(npx - 1, 0, k) -
+                         T(0.25) * cosa_v(npx - 1, 0) * (ut(npx, 0, k) + ut(npx, -1, k) + ut(npx - 1, -1, k)))) * damp;
+
+    damp = T(1) / (T(1) - T(0.0625) * cosa_u(npx + 1, 1) * cosa_v(npx, 2));
+    vt(npx, 2, k) = (vc(npx, 2, k) - T(0.25) * cosa_v(npx, 2) *
+                   (ut(npx, 1, k) + ut(npx, 2, k) + ut(npx + 1, 2, k) + uc(npx + 1, 1, k) -
+                    T(0.25) * cosa_u(npx + 1, 1) * (vt(npx, 1, k) + vt(npx + 1, 1, k) + vt(npx + 1, 2, k)))) * damp;
+
+    damp = T(1) / (T(1) - T(0.0625) * cosa_u(npx - 1, 1) * cosa_v(npx - 1, 2));
+    ut(npx - 1, 1, k) = (uc(npx - 1, 1, k) - T(0.25) * cosa_u(npx - 1, 1) *
+                        (vt(npx - 1, 1, k) + vt(npx - 2, 1, k) + vt(npx - 2, 2, k) + vc(npx - 1, 2, k) -
+                         T(0.25) * cosa_v(npx - 1, 2) * (ut(npx, 1, k) + ut(npx, 2, k) + ut(npx - 1, 2, k)))) * damp;
+    vt(npx - 1, 2, k) = (vc(npx - 1, 2, k) - T(0.25) * cosa_v(npx - 1, 2) *
+                        (ut(npx, 1, k) + ut(npx, 2, k) + ut(npx - 1, 2, k) + uc(npx - 1, 1, k) -
+                         T(0.25) * cosa_u(npx - 1, 1) * (vt(npx - 1, 1, k) + vt(npx - 2, 1, k) + vt(npx - 2, 2, k)))) * damp;
+  }
+
+  // Northeast corner
+  if (ne_corner) {
+    T damp = T(1) / (T(1) - T(0.0625) * cosa_u(npx - 1, npy) * cosa_v(npx - 1, npy + 1));
+    ut(npx - 1, npy, k) = (uc(npx - 1, npy, k) - T(0.25) * cosa_u(npx - 1, npy) *
+                          (vt(npx - 1, npy, k) + vt(npx - 2, npy, k) + vt(npx - 2, npy + 1, k) + vc(npx - 1, npy + 1, k) -
+                           T(0.25) * cosa_v(npx - 1, npy + 1) * (ut(npx, npy, k) + ut(npx, npy + 1, k) + ut(npx - 1, npy + 1, k)))) * damp;
+
+    damp = T(1) / (T(1) - T(0.0625) * cosa_u(npx + 1, npy - 1) * cosa_v(npx, npy - 1));
+    vt(npx, npy - 1, k) = (vc(npx, npy - 1, k) - T(0.25) * cosa_v(npx, npy - 1) *
+                          (ut(npx, npy - 1, k) + ut(npx, npy - 2, k) + ut(npx + 1, npy - 2, k) + uc(npx + 1, npy - 1, k) -
+                           T(0.25) * cosa_u(npx + 1, npy - 1) * (vt(npx, npy, k) + vt(npx + 1, npy, k) + vt(npx + 1, npy - 1, k)))) * damp;
+
+    damp = T(1) / (T(1) - T(0.0625) * cosa_u(npx - 1, npy - 1) * cosa_v(npx - 1, npy - 1));
+    ut(npx - 1, npy - 1, k) = (uc(npx - 1, npy - 1, k) - T(0.25) * cosa_u(npx - 1, npy - 1) *
+                              (vt(npx - 1, npy, k) + vt(npx - 2, npy, k) + vt(npx - 2, npy - 1, k) + vc(npx - 1, npy - 1, k) -
+                               T(0.25) * cosa_v(npx - 1, npy - 1) * (ut(npx, npy - 1, k) + ut(npx, npy - 2, k) + ut(npx - 1, npy - 2, k)))) * damp;
+    vt(npx - 1, npy - 1, k) = (vc(npx - 1, npy - 1, k) - T(0.25) * cosa_v(npx - 1, npy - 1) *
+                              (ut(npx, npy - 1, k) + ut(npx, npy - 2, k) + ut(npx - 1, npy - 2, k) + uc(npx - 1, npy - 1, k) -
+                               T(0.25) * cosa_u(npx - 1, npy - 1) * (vt(npx - 1, npy, k) + vt(npx - 2, npy, k) + vt(npx - 2, npy - 1, k)))) * damp;
+  }
+
+  // Northwest corner
+  if (nw_corner) {
+    T damp = T(1) / (T(1) - T(0.0625) * cosa_u(2, npy) * cosa_v(1, npy + 1));
+    ut(2, npy, k) = (uc(2, npy, k) - T(0.25) * cosa_u(2, npy) *
+                   (vt(1, npy, k) + vt(2, npy, k) + vt(2, npy + 1, k) + vc(1, npy + 1, k) -
+                    T(0.25) * cosa_v(1, npy + 1) * (ut(1, npy, k) + ut(1, npy + 1, k) + ut(2, npy + 1, k)))) * damp;
+
+    damp = T(1) / (T(1) - T(0.0625) * cosa_u(0, npy - 1) * cosa_v(0, npy - 1));
+    vt(0, npy - 1, k) = (vc(0, npy - 1, k) - T(0.25) * cosa_v(0, npy - 1) *
+                        (ut(1, npy - 1, k) + ut(1, npy - 2, k) + ut(0, npy - 2, k) + uc(0, npy - 1, k) -
+                         T(0.25) * cosa_u(0, npy - 1) * (vt(0, npy, k) + vt(-1, npy, k) + vt(-1, npy - 1, k)))) * damp;
+
+    damp = T(1) / (T(1) - T(0.0625) * cosa_u(2, npy - 1) * cosa_v(1, npy - 1));
+    ut(2, npy - 1, k) = (uc(2, npy - 1, k) - T(0.25) * cosa_u(2, npy - 1) *
+                        (vt(1, npy, k) + vt(2, npy, k) + vt(2, npy - 1, k) + vc(1, npy - 1, k) -
+                         T(0.25) * cosa_v(1, npy - 1) * (ut(1, npy - 1, k) + ut(1, npy - 2, k) + ut(2, npy - 2, k)))) * damp;
+    vt(1, npy - 1, k) = (vc(1, npy - 1, k) - T(0.25) * cosa_v(1, npy - 1) *
+                        (ut(1, npy - 1, k) + ut(1, npy - 2, k) + ut(2, npy - 2, k) + uc(2, npy - 1, k) -
+                         T(0.25) * cosa_u(2, npy - 1) * (vt(1, npy, k) + vt(2, npy, k) + vt(2, npy - 1, k)))) * damp;
+  }
+}
+
+// Copy corners for PPM halo (tp_core.F90:copy_corners)
+template <class T>
+inline void copy_corners(const HorizontalBounds &b, int64_t k, int32_t dir,
+                         int64_t npx, int64_t npy, int32_t ng,
+                         bool sw_corner, bool se_corner,
+                         bool ne_corner, bool nw_corner,
+                         FieldView<T> q) {
+  if (dir == 1) {
+    // X-direction: corners for Y-PPM
+    if (sw_corner) {
+      for (int64_t j = 1 - ng; j <= 0; ++j) {
+        for (int64_t i = 1 - ng; i <= 0; ++i) {
+          q(i, j, k) = q(j, 1 - i, k);
+        }
+      }
+    }
+    if (se_corner) {
+      for (int64_t j = 1 - ng; j <= 0; ++j) {
+        for (int64_t i = npx; i <= npx + ng - 1; ++i) {
+          q(i, j, k) = q(npy - j, i - npx + 1, k);
+        }
+      }
+    }
+    if (ne_corner) {
+      for (int64_t j = npy; j <= npy + ng - 1; ++j) {
+        for (int64_t i = npx; i <= npx + ng - 1; ++i) {
+          q(i, j, k) = q(j, 2 * npx - 1 - i, k);
+        }
+      }
+    }
+    if (nw_corner) {
+      for (int64_t j = npy; j <= npy + ng - 1; ++j) {
+        for (int64_t i = 1 - ng; i <= 0; ++i) {
+          q(i, j, k) = q(npy - j, i - 1 + npx, k);
+        }
+      }
+    }
+  } else if (dir == 2) {
+    // Y-direction: corners for X-PPM
+    if (sw_corner) {
+      for (int64_t j = 1 - ng; j <= 0; ++j) {
+        for (int64_t i = 1 - ng; i <= 0; ++i) {
+          q(i, j, k) = q(1 - j, i, k);
+        }
+      }
+    }
+    if (se_corner) {
+      for (int64_t j = 1 - ng; j <= 0; ++j) {
+        for (int64_t i = npx; i <= npx + ng - 1; ++i) {
+          q(i, j, k) = q(npy + j - 1, npx - i, k);
+        }
+      }
+    }
+    if (ne_corner) {
+      for (int64_t j = npy; j <= npy + ng - 1; ++j) {
+        for (int64_t i = npx; i <= npx + ng - 1; ++i) {
+          q(i, j, k) = q(2 * npy - 1 - j, i, k);
+        }
+      }
+    }
+    if (nw_corner) {
+      for (int64_t j = npy; j <= npy + ng - 1; ++j) {
+        for (int64_t i = 1 - ng; i <= 0; ++i) {
+          q(i, j, k) = q(j + 1 - npx, npy - i, k);
+        }
+      }
+    }
+  }
+}
+
+// =============================================================================
+// WP-B Transport Service API for WP-C (update_dz_d)
+// =============================================================================
+
+// Transport service configuration for WP-C consumption
+template <class T>
+struct TransportServiceConfig {
+  int32_t hord;           // Transport order (6 for GEOS production)
+  int32_t nord;           // Damping order
+  T damp_c;               // Damping coefficient (from vtdm4)
+  T da_min;               // Minimum cell area
+  T lim_fac;              // Limiter factor (ppm_limiter)
+  int32_t grid_type;      // Grid type (0 for cubed-sphere)
+  int64_t npx, npy;       // Panel dimensions
+  bool nested;            // Nested grid flag
+};
+
+// Transport service entry point for WP-C update_dz_d
+// Executes fv_tp_2d with hord_tm and optional deln_flux damping
+template <class T>
+inline void transport_service_for_update_dz(
+    const HorizontalBounds &b, int64_t k,
+    const TransportServiceConfig<T> &config,
+    FieldView<const T> q_in, FieldView<const T> crx, FieldView<const T> cry,
+    FieldView<const T> xfx, FieldView<const T> yfx, FieldView<const T> area,
+    FieldView<const T> ra_x, FieldView<const T> ra_y,
+    FieldView<const T> dxa, FieldView<const T> dya,
+    FieldView<const T> del6_u, FieldView<const T> del6_v,
+    FieldView<const T> rarea, FieldView<T> fx, FieldView<T> fy,
+    FieldView<T> q_work, FieldView<T> fx2, FieldView<T> fy2,
+    FieldView<T> d2) {
+
+  // Execute fv_tp_2d with order-6 transport
+  fv_tp_2d_hord6(b, k, config.hord, q_in, crx, cry, xfx, yfx, area,
+                 ra_x, ra_y, dxa, dya, config.nested, config.grid_type,
+                 config.npx, config.npy, config.lim_fac, fx, fy,
+                 q_work, fy2, fx2);
+
+  // Apply deln_flux damping if enabled (vtdm4 > 0 means damp_c > 1e-4)
+  if (config.damp_c > T(1e-4)) {
+    // Note: for update_dz_d, mass weighting is NOT used (has_mass = false)
+    deln_flux_transport(b, k, config.nord, config.damp_c, config.da_min,
+                        q_in, del6_u, del6_v, rarea, false,
+                        q_in, // placeholder, not used when has_mass=false
+                        fx, fy, d2, fx2, fy2);
+  }
+}
+
+// Hord dispatch selector for GEOS production configuration
+// Returns true if hord is supported, false otherwise
+inline bool is_hord_supported(int32_t hord) {
+  const int32_t mord = std::abs(hord);
+  // Supported orders: 1, 6, 8 (GEOS production uses 6 and -6)
+  return mord == 1 || mord == 6 || mord == 8;
+}
+
+// GEOS first-run configuration validator
+inline bool validate_geos_first_run_config(int32_t hord_mt, int32_t hord_vt,
+                                           int32_t hord_tm, int32_t hord_dp,
+                                           double vtdm4, int32_t grid_type) {
+  // GEOS nonhydrostatic default:
+  // hord_mt=6, hord_vt=6, hord_tm=6, hord_dp=-6, vtdm4>0, grid_type=0
+  (void)vtdm4;  // vtdm4 > 0 enables deln_flux but doesn't affect order support
+  return is_hord_supported(hord_mt) &&
+         is_hord_supported(hord_vt) &&
+         is_hord_supported(hord_tm) &&
+         is_hord_supported(hord_dp) &&
+         grid_type < 3;  // cubed-sphere or lower
+}
+
 } // namespace fv3::gpu::dgrid

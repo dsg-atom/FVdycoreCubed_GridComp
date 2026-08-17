@@ -19,4 +19,27 @@ int launch_height_boundary(fv_real *zh, fv_real *delz, fv_real *ws,
                            const fv_real *zs, fv_real rdt, fv_real dz_min,
                            ColumnLaunch layout, void *stream);
 int launch_dgrid_height_v2(const ExecutionContext &, fv3_gpu_error *);
+
+// Complete update_dz_d vertical/height dispatch. Orchestrates:
+// 1. Pre-transport height preparation (edge_profile on zh)
+// 2. WP-B horizontal transport service (hord_tm=6 via dgrid_height_transport)
+// 3. Post-transport height recurrence
+// 4. Boundary/monotonic height corrections
+// 5. Final delz recovery
+// Requires H_DSCALAR dependency satisfied and WP-B transport service wired.
+int launch_update_dz_d(const ExecutionContext &, const NumericalDispatch &,
+                       fv3_gpu_error *);
+
+// Vertical Riemann solver dispatch. Uses a_imp from NumericalConfig to select:
+// a_imp > 0.999: SIM1, a_imp <= 0.5: RIM_2D, etc.
+// Requires WorkspaceId::vertical slice with sufficient capacity.
+int launch_vertical_solver(const ExecutionContext &, fv3_gpu_error *);
+
+// C-grid vertical solver entry for WP-A. Shares column solver primitives
+// but has different orchestration scope (pressure outputs only).
+int launch_cgrid_vertical_solver(const ExecutionContext &, fv3_gpu_error *);
+
+// Workspace sizing and layout from fv3_vertical_column.hpp.
+// See VerticalWorkspaceLayout and compute_workspace_layout() for details.
+
 } // namespace fv3::gpu::vertical
