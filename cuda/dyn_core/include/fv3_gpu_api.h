@@ -1,0 +1,165 @@
+#ifndef FV3_GPU_API_H
+#define FV3_GPU_API_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define FV3_GPU_ABI_VERSION 1u
+#define FV3_GPU_MAX_RANK 4u
+#define FV3_GPU_ERROR_MESSAGE_BYTES 256u
+#define FV3_GPU_FIELD_NAME_BYTES 32u
+
+typedef struct fv3_gpu_context fv3_gpu_context;
+typedef uint64_t fv3_gpu_event;
+
+typedef enum fv3_gpu_status {
+  FV3_GPU_SUCCESS = 0,
+  FV3_GPU_INVALID_ARGUMENT = 1,
+  FV3_GPU_UNSUPPORTED_CONFIGURATION = 2,
+  FV3_GPU_CUDA_ERROR = 3,
+  FV3_GPU_MPI_ERROR = 4,
+  FV3_GPU_OUT_OF_MEMORY = 5,
+  FV3_GPU_STATE_CONFLICT = 6,
+  FV3_GPU_INTERNAL_ERROR = 7
+} fv3_gpu_status;
+
+typedef enum fv3_gpu_element_type {
+  FV3_GPU_ELEMENT_F32 = 1,
+  FV3_GPU_ELEMENT_F64 = 2
+} fv3_gpu_element_type;
+
+typedef enum fv3_gpu_memory_location {
+  FV3_GPU_MEMORY_HOST = 1,
+  FV3_GPU_MEMORY_DEVICE = 2
+} fv3_gpu_memory_location;
+
+typedef enum fv3_gpu_stagger {
+  FV3_GPU_STAGGER_A = 1,
+  FV3_GPU_STAGGER_C_U = 2,
+  FV3_GPU_STAGGER_C_V = 3,
+  FV3_GPU_STAGGER_D_U = 4,
+  FV3_GPU_STAGGER_D_V = 5,
+  FV3_GPU_STAGGER_B = 6,
+  FV3_GPU_STAGGER_INTERFACE = 7,
+  FV3_GPU_STAGGER_X_FACE = 8,
+  FV3_GPU_STAGGER_Y_FACE = 9
+} fv3_gpu_stagger;
+
+typedef enum fv3_gpu_access {
+  FV3_GPU_ACCESS_INPUT = 1,
+  FV3_GPU_ACCESS_OUTPUT = 2,
+  FV3_GPU_ACCESS_INOUT = 3
+} fv3_gpu_access;
+
+typedef enum fv3_gpu_precision {
+  FV3_GPU_PRECISION_R4 = 1,
+  FV3_GPU_PRECISION_R8 = 2
+} fv3_gpu_precision;
+
+typedef struct fv3_gpu_error {
+  uint32_t abi_version;
+  uint32_t struct_bytes;
+  int32_t code;
+  int32_t native_code;
+  int32_t rank;
+  int32_t device;
+  uint64_t sequence;
+  char api[FV3_GPU_FIELD_NAME_BYTES];
+  char message[FV3_GPU_ERROR_MESSAGE_BYTES];
+} fv3_gpu_error;
+
+typedef struct fv3_gpu_field_desc {
+  uint32_t abi_version;
+  uint32_t struct_bytes;
+  uint32_t field_id;
+  char name[FV3_GPU_FIELD_NAME_BYTES];
+  void *base;
+  uint64_t allocation_bytes;
+  uint32_t element_type;
+  uint32_t element_bytes;
+  uint32_t rank;
+  uint32_t memory_location;
+  int64_t lower[FV3_GPU_MAX_RANK];
+  uint64_t extent[FV3_GPU_MAX_RANK];
+  int64_t stride_elements[FV3_GPU_MAX_RANK];
+  int64_t compute_lower[FV3_GPU_MAX_RANK];
+  int64_t compute_upper[FV3_GPU_MAX_RANK];
+  uint32_t halo_lower[FV3_GPU_MAX_RANK];
+  uint32_t halo_upper[FV3_GPU_MAX_RANK];
+  uint32_t stagger;
+  uint32_t access;
+  uint32_t alignment_bytes;
+  uint32_t reserved;
+} fv3_gpu_field_desc;
+
+typedef struct fv3_gpu_create_desc {
+  uint32_t abi_version;
+  uint32_t struct_bytes;
+  int32_t device_ordinal;
+  int32_t mpi_rank;
+  int32_t mpi_size;
+  uint32_t precision;
+  int64_t is, ie, js, je, npz;
+  uint32_t halo_width;
+  uint32_t flags;
+  uintptr_t communicator_token;
+} fv3_gpu_create_desc;
+
+typedef struct fv3_gpu_state_desc {
+  uint32_t abi_version;
+  uint32_t struct_bytes;
+  uint32_t field_count;
+  uint32_t reserved;
+  const fv3_gpu_field_desc *fields;
+} fv3_gpu_state_desc;
+
+typedef struct fv3_gpu_field_mask {
+  uint32_t abi_version;
+  uint32_t struct_bytes;
+  uint64_t words[4];
+} fv3_gpu_field_mask;
+
+typedef struct fv3_gpu_step_desc {
+  uint32_t abi_version;
+  uint32_t struct_bytes;
+  double bdt;
+  int32_t k_split;
+  int32_t n_split;
+  uint8_t init_step;
+  uint8_t end_step;
+  uint16_t reserved0;
+  uint64_t model_step;
+  uint64_t acoustic_sequence;
+  uint64_t validation_mask;
+  uint64_t physics_tail_mask;
+  fv3_gpu_event dependency;
+} fv3_gpu_step_desc;
+
+typedef struct fv3_gpu_capabilities {
+  uint32_t abi_version;
+  uint32_t struct_bytes;
+  uint32_t compiled_with_cuda;
+  uint32_t device_count;
+  uint32_t precision_mask;
+  uint32_t communication_stage;
+  uint64_t feature_mask;
+} fv3_gpu_capabilities;
+
+int fv3_gpu_validate_field(const fv3_gpu_field_desc *, fv3_gpu_error *);
+int fv3_gpu_create(const fv3_gpu_create_desc *, fv3_gpu_context **, fv3_gpu_error *);
+int fv3_gpu_initialize_state(fv3_gpu_context *, const fv3_gpu_state_desc *, fv3_gpu_event *, fv3_gpu_error *);
+int fv3_gpu_sync_from_host(fv3_gpu_context *, const fv3_gpu_field_mask *, fv3_gpu_event *, fv3_gpu_error *);
+int fv3_gpu_dyn_core_step(fv3_gpu_context *, const fv3_gpu_step_desc *, fv3_gpu_event *, fv3_gpu_error *);
+int fv3_gpu_sync_to_host(fv3_gpu_context *, const fv3_gpu_field_mask *, fv3_gpu_event *, fv3_gpu_error *);
+int fv3_gpu_event_wait(fv3_gpu_context *, fv3_gpu_event, fv3_gpu_error *);
+int fv3_gpu_get_capabilities(fv3_gpu_context *, fv3_gpu_capabilities *);
+int fv3_gpu_finalize(fv3_gpu_context **, fv3_gpu_error *);
+
+#ifdef __cplusplus
+}
+#endif
+#endif
