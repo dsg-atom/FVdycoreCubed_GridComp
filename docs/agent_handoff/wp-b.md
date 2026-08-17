@@ -602,3 +602,209 @@ GEOS integration: **NOT RUN**
 Contract changes: **NONE**
 
 WP-B READY FOR INTEGRATION
+
+## GEOS Production First-Run Completion
+
+### First-run configuration consumed
+
+The GEOS nonhydrostatic default configuration requires:
+
+| Parameter | Value | Status |
+|-----------|-------|--------|
+| `hord_mt` | 6 | **SUPPORTED** |
+| `hord_vt` | 6 | **SUPPORTED** |
+| `hord_tm` | 6 | **SUPPORTED** |
+| `hord_dp` | -6 | **SUPPORTED** |
+| `vtdm4` | > 0 | **SUPPORTED** (enables `deln_flux`) |
+| `grid_type` | 0 | **SUPPORTED** (cubed-sphere) |
+
+The previous WP-B implementation supported only `hord=1,8`. This session adds
+complete `hord=6` and `hord=-6` support, satisfying the GEOS production path.
+
+### Order-6 implementation status
+
+Implemented `xppm_hord6` and `yppm_hord6` in `wp_b_kernels.hpp` matching
+authoritative `tp_core.F90` behavior:
+
+- **Interface reconstruction**: 4th-order formula `al(i) = p1*(q(i-1)+q(i)) + p2*(q(i-2)+q(i+1))`
+- **Limiter**: `smt5 = 3*|b0| < |bl-br|` (mord=6 branch)
+- **Panel boundary treatment**: Special coefficients at cubed-sphere edges using `dxa/dya` metrics
+- **Edge issue fix**: WMP fix from `tp_core.F90` for `is=1` and `(ie+1)=npx` boundaries
+- **PPM flux formula**: Standard `flux = q_upwind + (1±c)*(br/bl ∓ c*b0)` with limiter activation
+
+### Negative hord implementation
+
+Negative `hord` (e.g., `hord_dp=-6`) activates the positivity constraint for
+mass transport per `tp_core.F90` lines 388-392:
+
+```cpp
+if (hord < 0) {
+  al[i] = std::max(T(0), al[i]);
+}
+```
+
+The algorithm is identical to positive `hord=6` except interface values are
+clamped to non-negative before computing `bl/br/b0`. This prevents negative
+mass in transport.
+
+### fv_tp_2d sequencing
+
+Implemented complete `fv_tp_2d_hord6` with authoritative Y-X inner / X-Y outer
+directional sequencing:
+
+1. **Y-direction pass 1**: `yppm` on input `q` → `fy2`
+2. **Y-area correction**: `q_i = (q*area + fyy(j) - fyy(j+1)) / ra_y`
+3. **X-direction pass 1**: `xppm` on `q_i` → `fx` (outer order)
+4. **X-direction pass 2**: `xppm` on input `q` → `fx2` (inner order)
+5. **X-area correction**: `q_j = (q*area + fxx(i) - fxx(i+1)) / ra_x`
+6. **Y-direction pass 2**: `yppm` on `q_j` → `fy` (outer order)
+7. **Flux averaging**: `flux = 0.5*(flux + flux2) * xfx/yfx`
+
+### ra_x / ra_y corrections
+
+Area corrections are applied between directional passes:
+
+- `ra_x(i,j) = area(i,j) + xfx(i,j) - xfx(i+1,j)` (X-adjusted area)
+- `ra_y(i,j) = area(i,j) + yfx(i,j) - yfx(i,j+1)` (Y-adjusted area)
+
+These ensure conservative transport when mass flux changes the effective cell
+area during the directional sweep.
+
+### deln_flux implementation
+
+Implemented `deln_flux_transport` for transport flux damping when `damp_c > 1e-4`
+(i.e., `vtdm4 > 0`):
+
+- **Del-2/4/6 damping**: `nord=0→del-2`, `nord=1→del-4`, `nord=2→del-6`
+- **Damping coefficient**: `(damp_c * da_min)^(nord+1)`
+- **Flux computation**: Uses `del6_u/del6_v` metrics
+- **Iterative Laplacian**: Repeated divergence/gradient passes for higher orders
+- **Mass weighting**: Optional `mass(i-1,j)+mass(i,j)` weighting for scalar transport
+
+Corner fills between stages are delegated to WP-E corner service.
+
+### Contravariant edge corrections
+
+Implemented `contravariant_edge_corrections` for `grid_type < 3` cubed-sphere
+panels, matching `sw_core.F90` lines 791-863:
+
+- **Coupled 2×2 solve**: At panel corners, `ut` and `vt` are solved simultaneously
+- **Damping factor**: `damp = 1 / (1 - 0.0625 * cosa_u * cosa_v)`
+- **All four corners**: SW, SE, NE, NW with correct stencil patterns
+- **Interior and exterior pairs**: Both near-corner and boundary points
+
+Also implemented `copy_corners` for PPM halo filling with direction-dependent
+corner rotation formulas.
+
+### Transport service exported for WP-C
+
+Added `TransportServiceConfig<T>` and `transport_service_for_update_dz`:
+
+**Required inputs:**
+- `q_in`: scalar to transport
+- `crx/cry/xfx/yfx`: Courant numbers and face fluxes
+- `area/ra_x/ra_y`: cell and adjusted areas
+- `dxa/dya`: cell widths for boundary treatment
+- `del6_u/del6_v/rarea`: damping metrics
+
+**Outputs:**
+- `fx/fy`: transport fluxes
+
+**Workspace:**
+- `q_work`: intermediate transported field
+- `fx2/fy2`: secondary flux arrays
+- `d2`: damping workspace
+
+**DispatchParams:**
+- `hord`, `nord`, `damp_c`, `da_min`, `lim_fac`, `grid_type`, `npx`, `npy`, `nested`
+
+**Sequencing constraints:**
+- Input halos must be valid before calling
+- Corner fills between passes are internal to the service
+- Output fluxes are ready for divergence computation
+
+### R4/R8 tests
+
+- R8 WP-B kernel tests with `-Wall -Wextra -Werror`: **PASS**
+- R4 WP-B kernel tests with `-Wall -Wextra -Werror`: **PASS**
+- WP-E runtime tests (4/4): **PASS**
+
+Tests cover:
+- PPM order-6 limiter behavior (`smt5` condition)
+- Negative hord positivity constraint
+- deln_flux damping coefficient computation
+- Contravariant correction damping factor
+- GEOS configuration validation
+- TransportServiceConfig structure
+- copy_corners direction selection
+
+### Remaining unsupported orders
+
+Unsupported PPM orders (not required for GEOS first-run):
+
+| Order | Description | Status |
+|-------|-------------|--------|
+| 2 | Perfectly linear | Not implemented |
+| 3 | Moderate limiter | Not implemented |
+| 4 | Strong limiter | Not implemented |
+| 5 | Product limiter | Not implemented |
+| 7 | Positive definite | Not implemented |
+| 9 | PD with pert_ppm | Not implemented |
+| 10 | Huynh 2nd constraint | Not implemented |
+| 11 | van Leer emulation | Not implemented |
+| 12 | Positive definite alt | Not implemented |
+| 13 | PD constraint | Not implemented |
+
+These can be added when required by other GEOS configurations.
+
+### CUDA status
+
+CUDA compilation: **NOT RUN** — `nvcc` unavailable in this environment.
+
+The implemented kernels are CPU-side numerical references. CUDA kernel wrappers
+require:
+- `__global__` function wrappers
+- Thread-block domain decomposition
+- Shared memory optimization for PPM reconstruction
+- Stream/event integration with WP-E dispatch
+
+### Numerical validation status
+
+Numerical validation: **NOT RUN** — no authoritative Fortran savepoints available.
+
+Required validation:
+- `hord=6` reconstruction against Fortran `xppm/yppm`
+- `hord=-6` positivity behavior
+- Complete `fv_tp_2d` flux output comparison
+- `deln_flux` damping flux comparison
+- Contravariant edge correction values at panel corners
+- Full `d_sw` substep comparison at `DC40_DSW_OUT`
+
+### Contract changes
+
+Contract changes: **NONE**
+
+The WP-E v3/Gate A.2 contract provides all required fields and services.
+No new contract request is made.
+
+### Files modified
+
+- `cuda/dyn_core/dgrid/wp_b_kernels.hpp` — added GEOS production transport kernels
+- `cuda/dyn_core/tests/dgrid/test_wp_b_kernels.cpp` — extended test coverage
+- `docs/agent_handoff/wp-b.md` — this handoff section
+
+### Commit SHA
+
+`0a50a852e6a8d617eb520c9050187dee000e0637`
+
+GEOS first-run WP-B transport path: **COMPLETE**
+
+Package compilation: **PASS**
+
+GPU execution: **NOT RUN**
+
+Numerical validation: **NOT RUN**
+
+Contract changes: **NONE**
+
+WP-B GEOS FIRST-RUN PATH COMPLETE
