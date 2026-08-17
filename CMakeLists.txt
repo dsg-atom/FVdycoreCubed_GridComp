@@ -1,6 +1,7 @@
 esma_set_this ()
 
 option(BUILD_GEOS_GTFV3_INTERFACE "Build GEOS-gtFV3 interface" OFF)
+option(BUILD_FV3_CUDA_INTERFACE "Build FV3 CUDA dyn_core interface" OFF)
 
 set (srcs
   sw.f90 jw.f90 testcases_3_4_5_6_stand_alone.f90
@@ -104,7 +105,25 @@ if (BUILD_GEOS_GTFV3_INTERFACE)
 
 endif ()
 
+# FV3 CUDA interface (experimental dyn_core backend)
+if (BUILD_FV3_CUDA_INTERFACE)
+  message(STATUS "Building FV3 CUDA dyn_core interface")
+
+  # Build the CUDA dyn_core library first
+  add_subdirectory(cuda/dyn_core)
+
+  # Add the interface module
+  list(APPEND srcs cuda/interface/fv3_gpu_interface_mod.F90)
+
+  # CUDA compile definitions
+  add_definitions(-DUSE_FV3_CUDA)
+endif ()
+
 set(dependencies MAPL GFTL_SHARED::gftl-shared GMAO_hermes GEOS_Shared esmf OpenMP::OpenMP_Fortran)
+
+if (BUILD_FV3_CUDA_INTERFACE)
+  list(APPEND dependencies fv3_dyn_core_gpu)
+endif ()
 
 if (BUILD_GEOS_GTFV3_INTERFACE)
   esma_add_library (${this}
@@ -112,6 +131,11 @@ if (BUILD_GEOS_GTFV3_INTERFACE)
     SUBCOMPONENTS fvdycore
     DEPENDENCIES ${dependencies}
     DEPENDENCIES geos_gtfv3_interface_py) # Make the main library depend on the Python library
+elseif (BUILD_FV3_CUDA_INTERFACE)
+  esma_add_library (${this}
+    SRCS ${srcs}
+    SUBCOMPONENTS fvdycore
+    DEPENDENCIES ${dependencies})
 else ()
   esma_add_library (${this}
     SRCS ${srcs}

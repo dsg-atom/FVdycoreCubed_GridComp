@@ -43,6 +43,12 @@ module FV_StateMod
    use geos_gtfv3_interface_mod, only: geos_gtfv3_interface_f
    use geos_gtfv3_interface_mod, only: geos_gtfv3_interface_f_init, geos_gtfv3_interface_f_finalize
 #endif
+#ifdef USE_FV3_CUDA
+   use fv3_gpu_interface_mod, only: fv3_gpu_interface_init, fv3_gpu_interface_step
+   use fv3_gpu_interface_mod, only: fv3_gpu_interface_sync, fv3_gpu_interface_finalize
+   use fv3_gpu_interface_mod, only: fv3_gpu_interface_available
+   use fv3_gpu_interface_mod, only: FV3_GPU_SUCCESS
+#endif
 
 implicit none
 private
@@ -76,6 +82,10 @@ private
   integer :: CASE_ID = 11
   integer :: AdvCore_Advection = 0
   character(LEN=ESMF_MAXSTR) :: FV3_CONFIG
+
+  ! CUDA backend selection (0=fortran, 1=cuda)
+  integer, save :: fv3_dyncore_backend = 0
+  logical, save :: fv3_cuda_initialized = .false.
 
   public FV_Atm
   public FV_Setup, FV_InitState, FV_Run, FV_Finalize, FV_DA_Incs
@@ -889,6 +899,13 @@ contains
   integer :: comm
 #endif
 
+#ifdef USE_FV3_CUDA
+  integer :: cuda_rc, mpi_rank, mpi_size
+#ifndef RUN_GTFV3
+  integer :: comm
+#endif
+#endif
+
 ! BEGIN
 
 ! Retrieve the pointer to the state
@@ -1213,6 +1230,25 @@ contains
   end if
 #endif
 
+#ifdef USE_FV3_CUDA
+  ! Initialize CUDA dyn_core backend if enabled
+  if (fv3_dyncore_backend == 1 .and. .not. fv3_cuda_initialized) then
+     call ESMF_VMGet(VM, mpiCommunicator=comm, localPet=mpi_rank, petCount=mpi_size, _RC)
+     call fv3_gpu_interface_init(FV_Atm(1), comm, mpi_rank, mpi_size, cuda_rc)
+     if (cuda_rc /= FV3_GPU_SUCCESS) then
+        if (mpi_rank == 0) then
+           print *, 'FV3 CUDA init failed, falling back to Fortran backend, rc=', cuda_rc
+        endif
+        fv3_dyncore_backend = 0
+     else
+        fv3_cuda_initialized = .true.
+        if (mpi_rank == 0) then
+           print *, 'FV3 CUDA dyn_core backend initialized'
+        endif
+     endif
+  endif
+#endif
+
   RETURN_(ESMF_SUCCESS)
 
 end subroutine FV_InitState
@@ -1311,6 +1347,10 @@ subroutine FV_Run (STATE, EXPORT, CLOCK, GC, PLE0, RC)
   type(ESMF_VM) :: vm
   integer :: comm, rank, mpierr
   real :: start, finish
+#endif
+
+#ifdef USE_FV3_CUDA
+  integer :: cuda_rc
 #endif
 
 ! Begin
@@ -1981,6 +2021,19 @@ subroutine FV_Run (STATE, EXPORT, CLOCK, GC, PLE0, RC)
     t_dt(:,:,:) = 0.0
     w_dt(:,:,:) = 0.0
 
+#ifdef USE_FV3_CUDA
+    ! CUDA dyn_core backend
+    if (fv3_dyncore_backend == 1 .and. fv3_cuda_initialized) then
+       call fv3_gpu_interface_step(FV_Atm(1), myDT, STATE%k_split, STATE%n_split, &
+            fv_first_run, .true., cuda_rc)
+       if (cuda_rc /= FV3_GPU_SUCCESS) then
+          print *, 'FV3 CUDA step failed, rc=', cuda_rc
+       endif
+       ! Sync results back to host for post-processing
+       call fv3_gpu_interface_sync(.true., cuda_rc)
+    else
+#endif
+
 #ifdef RUN_GTFV3
     if (run_gtfv3 == 0) then
        call cpu_time(start)
@@ -2028,6 +2081,10 @@ subroutine FV_Run (STATE, EXPORT, CLOCK, GC, PLE0, RC)
        call cpu_time(finish)
        print *, rank, ', geos_gtfv3_interface_f: time taken = ', finish - start, 's'
     end if
+#endif
+
+#ifdef USE_FV3_CUDA
+    endif  ! end CUDA backend else block
 #endif
 
     allocate ( udt(isc:iec,jsc:jec,npz) )
@@ -2427,6 +2484,9 @@ end subroutine FV_Run
    use fv_control_mod, only : fv_end
 
    type (T_FVDYCORE_STATE),pointer              :: STATE
+#ifdef USE_FV3_CUDA
+   integer :: cuda_rc
+#endif
 
    if (DEBUG) call debug_fv_state('FV_Finalize',STATE)
 
@@ -2439,6 +2499,13 @@ end subroutine FV_Run
 
 #ifdef RUN_GTFV3
    if (run_gtfv3 /= 0) call geos_gtfv3_interface_f_finalize()
+#endif
+
+#ifdef USE_FV3_CUDA
+   if (fv3_cuda_initialized) then
+      call fv3_gpu_interface_finalize(cuda_rc)
+      fv3_cuda_initialized = .false.
+   endif
 #endif
 
  end subroutine FV_Finalize
