@@ -147,6 +147,30 @@ struct DependencyState {
   int mark_ready(fv3_gpu_halo_group, fv3_gpu_event) noexcept;
 };
 
+enum class CornerOperation : uint8_t { fill, copy, fill_pair, vector_transform, a_to_b_edge };
+enum class Axis : uint8_t { x, y, both };
+enum class ComponentOrientation : uint8_t { scalar, x_component, y_component, vector_pair };
+enum class DiffusionPhase : uint8_t { none=0, x_corner_copy, x_flux, y_corner_copy, y_flux, update };
+struct CornerServiceRequest {
+  uint32_t contract_version=internal_contract_version;
+  CornerOperation operation=CornerOperation::fill;
+  FieldId first=FieldId::invalid, second=FieldId::invalid;
+  FieldId destination=FieldId::invalid;  // for A-to-B when destination differs from first
+  fv3_gpu_stagger stagger=FV3_GPU_STAGGER_A;
+  Axis axis=Axis::x;
+  ComponentOrientation orientation=ComponentOrientation::scalar;
+  DiffusionPhase diffusion_phase=DiffusionPhase::none;
+  uint32_t halo_width=1;
+  int32_t interpolation_order=0;
+  int32_t pass_index=0;
+  int8_t sign_x=1, sign_y=1;
+  uint8_t replace=1;  // 1=replace destination in-place; 0=write to separate destination
+  fv3_gpu_event dependency=0;
+};
+
+struct ExecutionContext;
+using CornerServiceFn = int (*)(const ExecutionContext &, const CornerServiceRequest &, fv3_gpu_error *);
+
 struct ExecutionContext {
   uint32_t contract_version=internal_contract_version;
   const FieldRegistry *fields=nullptr;
@@ -155,25 +179,9 @@ struct ExecutionContext {
   const WorkspaceLayout *workspace=nullptr;
   Submission submission{};
   DependencyState *dependencies=nullptr;
+  CornerServiceFn corner_service=nullptr;  // borrowed; integration retains ownership
 };
 
-enum class CornerOperation : uint8_t { fill, copy, fill_pair, vector_transform, a_to_b_edge };
-enum class Axis : uint8_t { x, y, both };
-enum class ComponentOrientation : uint8_t { scalar, x_component, y_component, vector_pair };
-struct CornerServiceRequest {
-  uint32_t contract_version=internal_contract_version;
-  CornerOperation operation=CornerOperation::fill;
-  FieldId first=FieldId::invalid, second=FieldId::invalid;
-  fv3_gpu_stagger stagger=FV3_GPU_STAGGER_A;
-  Axis axis=Axis::x;
-  ComponentOrientation orientation=ComponentOrientation::scalar;
-  uint32_t halo_width=1;
-  int32_t interpolation_order=0;
-  int32_t pass_index=0;
-  int8_t sign_x=1, sign_y=1;
-  fv3_gpu_event dependency=0;
-};
-using CornerServiceFn = int (*)(const ExecutionContext &, const CornerServiceRequest &, fv3_gpu_error *);
 int validate_corner_request(const ExecutionContext &, const CornerServiceRequest &, fv3_gpu_error *) noexcept;
 
 using LaunchFn = int (*)(const ExecutionContext &, fv3_gpu_error *);

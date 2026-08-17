@@ -652,3 +652,118 @@ GEOS integration: **NOT RUN**
 Contract changes: **REQUESTED** (two blockers remain from v3 resume)
 
 WP-D BLOCKED
+
+## WP-E V3.1 Closure
+
+### Contract consumed and blocker resolution
+
+Consumed WP-E v3.1 hotfix commit `b92c5ff` from branch `cuda/wp-e-runtime`.
+Cherry-picked the v3.1 changes onto `cuda/wp-d-operators` to close the two
+remaining WP-D blockers.
+
+### Blockers resolved
+
+| Blocker | v3 Status | v3.1 Resolution |
+|---|---|---|
+| Edge descriptor type/rank | BLOCKING | **CLOSED** — edge_w/e/s/n now `accumulator_real` rank 1 |
+| A-to-B replace semantics | BLOCKING | **CLOSED** — `destination` and `replace` fields added |
+| Diffusion subphases | BLOCKING | **CLOSED** — `DiffusionPhase` enum added |
+| Corner service access | BLOCKING | **CLOSED** — `corner_service` added to `ExecutionContext` |
+
+### WP-D adapter updates for v3.1
+
+Updated WP-D contract adapter to consume v3.1 interfaces:
+
+1. **Edge view binding**: `WpDViews` now includes `edge_w/e/s/n` as
+   `DeviceView<const accumulator_real>`. `bind_wp_d` binds these rank-1
+   real64 descriptors from the immutable grid registry.
+
+2. **A-to-B request builder**: `a2b_edge_request` signature updated to
+   accept `source`, `destination`, `order`, `replace`, and `dependency`.
+   Supports both replace=true (in-place A-to-B for pp/pk/gz) and
+   replace=false (delp → operator arena destination).
+
+3. **Diffusion request builder**: `diffusion_corner_request` signature
+   updated to accept `DiffusionPhase` for interleaved x-copy/y-copy phases.
+
+4. **Pressure orchestration**: `launch_nh_pressure` now:
+   - Validates `corner_service` is present
+   - Binds rank-1 real64 edge geometry
+   - Computes geopotential from height
+   - Performs order-4 global A-to-B for pkc and gz (replace=true)
+   - Performs order-4 global A-to-B for delp (replace=false)
+   - Executes pressure gradient kernel
+
+5. **Diffusion orchestration**: `launch_post_loop_heating` now:
+   - Validates `corner_service` is present
+   - Performs physical corner averaging
+   - Issues x-copy corner request via `corner_service`
+   - Executes del2_pass or del2_pass_sg flux/update
+   - Applies diffusive heating on final pass
+
+### Compile and test results
+
+| Test | R8 | R4 |
+|---|---|---|
+| WP-D numerical test (`test_wp_d`) `-Wall -Wextra -Werror` | **PASS** | **PASS** |
+| WP-D contract adapter (`wp_d_contract.cpp`) `-Wall -Wextra -Werror` | **PASS** | **PASS** |
+| WP-D contract test (`test_wp_d_contract`) | **PASS** | **PASS** |
+| WP-E runtime contract test (`test_contract`) | **PASS** | **PASS** |
+| CUDA compilation | **NOT RUN** | `nvcc` unavailable |
+| GPU execution | **NOT RUN** | no device |
+| Numerical/savepoint validation | **NOT RUN** | no Gate A savepoints |
+| GEOS integration | **NOT RUN** | not authorized |
+
+### Implementation status updated
+
+| Routine | CPU formula | CUDA kernel | Integration |
+|---|---|---|---|
+| `pe_halo` | Complete | Complete | **Ready** |
+| `pk3_halo` | Complete | Complete | **Ready** |
+| `pln_halo` | Complete | Complete | **Ready** |
+| `gz=grav*zh` | Complete | Complete | **Ready** |
+| `a2b_ord2` periodic | Complete | Complete | Ready |
+| `a2b_ord2` global | Complete | Complete | **Ready** |
+| `a2b_ord4` periodic | Complete | Complete | Ready |
+| `a2b_ord4` global | Complete | Complete | **Ready** |
+| `nh_p_grad` | Complete | Complete | **Ready** |
+| `split_p_grad` | Complete | Complete | **Ready** |
+| `one_grad_p` | Complete | Complete | **Ready** |
+| `grad1_p_update` | Complete | Complete | **Ready** |
+| `average_del2_corners` | Complete | Complete | **Ready** |
+| `del2_pass` (non-SG) | Complete | Complete | **Ready** |
+| `del2_pass_sg` | Complete | Complete | **Ready** |
+| `apply_diffusive_heating_nh` | Complete | Complete | **Ready** |
+| `apply_diffusive_heating_hydrostatic` | Complete | Complete | **Ready** |
+
+### Files modified
+
+- `cuda/dyn_core/include/fv3_gpu_internal.hpp` (v3.1 cherry-pick)
+- `cuda/dyn_core/runtime/fv3_gpu_contract.cpp` (v3.1 cherry-pick)
+- `cuda/dyn_core/tests/runtime/test_contract.cpp` (v3.1 cherry-pick)
+- `cuda/dyn_core/operators/wp_d_contract.hpp`
+- `cuda/dyn_core/operators/wp_d_contract.cpp`
+- `cuda/dyn_core/tests/operators/test_wp_d_contract.cpp`
+- `docs/agent_handoff/wp-d.md`
+- `docs/agent_handoff/wp-e-v3.1.md` (v3.1 cherry-pick)
+- `docs/architecture/dyn_core_contract_change_log.md` (v3.1 cherry-pick)
+
+### Commit SHA
+
+See the Git commit containing this closure section.
+
+### Summary
+
+Translation: **COMPLETE**
+
+Package compilation: **PASS** (R4 and R8 CPU sources)
+
+GPU execution: **NOT RUN** (`nvcc` unavailable)
+
+Numerical validation: **NOT RUN** (no Gate A savepoints)
+
+GEOS integration: **NOT RUN**
+
+Contract changes: **NONE** (v3.1 blockers resolved)
+
+WP-D READY FOR INTEGRATION
