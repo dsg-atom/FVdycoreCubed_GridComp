@@ -96,47 +96,100 @@ This order integrates complete packages (WP-A, WP-D) before partial ones
 
 ## Integration status
 
-Status will be updated as integration proceeds.
-
 ### WP-E integration
 
-Status: PENDING
+Status: **PASS**
+
+Commits applied:
+- `a936aef` — WP-E v1 skeleton
+- `7593d92` — WP-E v2 internal contract
+- `7fd72ac` — WP-E v3 Gate A.2
+- `2e2f529` — WP-E v3.1 hotfix
+
+All WP-E runtime tests pass (R4 and R8).
 
 ### WP-A integration
 
-Status: PENDING
+Status: **PASS**
+
+Commits applied:
+- `b85c9dd` — Partial C-grid pressure gradient
+- `c157b5c` — Connect to v2
+- `b3b152a` — Adapt to Gate A.2
+- `5cbbe93` — Complete C-grid predictor
+
+All WP-A view tests pass (R4 and R8).
 
 ### WP-B integration
 
-Status: PENDING
-Note: Translation is PARTIAL per handoff documentation
+Status: **PARTIAL**
+
+Commits applied:
+- `294b20e` — D-grid translation foundation
+- `f3768f5` — Connect to v2
+- `c51ba46` — Consume Gate A.2
+- `8d4c379` — Extend with PPM/damping/heat
+
+Translation is PARTIAL per handoff documentation. Missing:
+- Complete PPM orders 2-7, 9-13
+- Full `fv_tp_2d` directional sequencing
+- `pert_ppm` limiters
+- True `smag_corner`
+- Contravariant edge corrections
+- Inline tracer transport
+- CUDA dispatch launcher
+
+All WP-B kernel/contract tests pass (R4 and R8).
 
 ### WP-C integration
 
-Status: PENDING
-Note: Column primitives complete; CUDA/update_dz_d partial
+Status: **PARTIAL**
+
+Commits applied:
+- `ed6b338` — Vertical column primitives
+- `3bcbdb8` — Resume against v2
+- `71b9c38` — Advance against Gate A.2
+- `bdc2964` — Complete column solvers
+
+Column primitives complete (all 5 solver variants). Missing:
+- CUDA kernel wrapping
+- Workspace arena integration
+- Complete `update_dz_d` horizontal transport
+- C-grid vertical solver dispatch wiring
+
+All WP-C column tests pass (R4 and R8).
 
 ### WP-D integration
 
-Status: PENDING
+Status: **PASS**
+
+Commits applied:
+- `daa05b5` — Pressure/diffusion translations
+- `d780fa3` — Connect to v2
+- `722f1ab` — Complete milestone-one translations
+- `008d7fe` — Close blockers with v3.1
+
+All WP-D operator/contract tests pass (R4 and R8).
 
 ## Build and test status
 
 | Test | Status |
 |------|--------|
-| WP-E R4/R8 tests | PENDING |
-| WP-A R4/R8 tests | PENDING |
-| WP-B R4/R8 tests | PENDING |
-| WP-C R4/R8 tests | PENDING |
-| WP-D R4/R8 tests | PENDING |
-| Integrated CPU compilation | PENDING |
-| CUDA compilation | NOT RUN |
-| GPU execution | NOT RUN |
-| Numerical validation | NOT RUN |
+| WP-E R4/R8 tests | **PASS** (4/4 each) |
+| WP-A R4/R8 tests | **PASS** (1/1 each) |
+| WP-B R4/R8 tests | **PASS** (2/2 each) |
+| WP-C R4/R8 tests | **PASS** (1/1 each) |
+| WP-D R4/R8 tests | **PASS** (2/2 each) |
+| Integrated CPU compilation | **PASS** |
+| Integrated tests | **PASS** (10/10 R8, 10/10 R4) |
+| CUDA compilation | **NOT RUN** |
+| GPU execution | **NOT RUN** |
+| Numerical validation | **NOT RUN** |
 
 ## Conflicts and resolutions
 
-(To be recorded during integration)
+No conflicts encountered. All cherry-picks applied cleanly by separating
+WP-E runtime commits from package-specific commits.
 
 ## Implementation gaps
 
@@ -166,4 +219,76 @@ Resolution documented in dyn_core_cuda_integrated_sequence.md.
 
 ## Remaining blockers
 
-(To be identified during integration)
+### For first runnable configuration
+
+1. **WP-B transport orders 2-7, 9-13**: Only `hord=1,8` implemented. If GEOS
+   milestone-one requires other orders, they must be completed first.
+
+2. **`update_dz_d` horizontal transport**: Cross-WP boundary between WP-C
+   (owns sequence) and WP-B (owns transport operators) is not wired.
+
+3. **Authoritative savepoints**: No Fortran savepoints exist for numerical
+   validation.
+
+4. **CUDA compilation untested**: nvcc unavailable in current environment.
+
+### For production validation
+
+1. Complete PPM order coverage
+2. True `smag_corner` implementation
+3. Inline tracer transport (`inline_q`)
+4. `pert_ppm` limiters
+5. Contravariant edge corrections
+6. Full `fv_tp_2d` directional sequencing
+
+## Source layout
+
+```
+cuda/dyn_core/
+  include/           WP-E public and internal headers
+  runtime/           WP-E runtime implementation
+  cgrid/             WP-A C-grid predictor
+  dgrid/             WP-B D-grid dynamics
+  vertical/          WP-C vertical solvers
+  operators/         WP-D pressure/diffusion
+  tests/
+    runtime/         WP-E tests
+    cgrid/           WP-A tests
+    dgrid/           WP-B tests
+    vertical/        WP-C tests
+    operators/       WP-D tests
+  cmake/             Platform-specific CMake modules
+```
+
+## First runnable configuration
+
+See `docs/architecture/dyn_core_cuda_supported_config.md`.
+
+Summary:
+- `hydrostatic=.false.`
+- `nested=.false.`
+- `hord_*=1` or `8` only
+- `inline_q=.false.`
+- All vertical solvers supported
+- All damping orders supported
+- All pressure variants supported
+
+**WARNING:** If GEOS milestone-one requires transport orders other than 1 or 8,
+the first runnable configuration cannot yet represent it.
+
+## Runtime version
+
+WP-E internal contract version: 3 (with v3.1 extensions)
+Public ABI version: 1 (unchanged)
+
+## Integration commit
+
+Final integration commit: `470c95d`
+
+Total commits from base: 20
+- WP-E: 4 commits
+- WP-A: 4 commits
+- WP-D: 4 commits
+- WP-C: 4 commits
+- WP-B: 4 commits
+- Integration: 1 commit (CMake + docs)
