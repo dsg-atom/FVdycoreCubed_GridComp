@@ -2,6 +2,13 @@
 
 #include "fv3_cgrid_view.hpp"
 
+// Include all C-grid component headers
+#include "fv3_cgrid_d2a2c.hpp"
+#include "fv3_cgrid_csw.hpp"
+#include "fv3_cgrid_divergence.hpp"
+#include "fv3_cgrid_dz.hpp"
+#include "fv3_cgrid_predictor.hpp"
+
 namespace fv3::gpu::cgrid {
 
 // Exact normal-nonhydrostatic p_grad_c inputs. All views are device views
@@ -24,7 +31,7 @@ struct PressureGradientCArgs {
 fv3_gpu_status launch_pressure_gradient_c(const PressureGradientCArgs &args,
                                           void *stream);
 
-// WP-E v2 NumericalDispatch adapter. Integration registers this function in
+// WP-E v3 NumericalDispatch adapter. Integration registers this function in
 // NumericalDispatch::cgrid_pressure.
 int launch_cgrid_pressure_v3(const ExecutionContext &context,
                              fv3_gpu_error *error);
