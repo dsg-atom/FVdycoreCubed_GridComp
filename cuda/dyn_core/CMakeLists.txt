@@ -5,9 +5,32 @@ option(FV3_DYN_CORE_ENABLE_CUDA "Build the CUDA-backed runtime" OFF)
 set(FV3_DYN_CORE_PRECISION "R8" CACHE STRING "FV precision: R4, R4R8, or R8")
 set_property(CACHE FV3_DYN_CORE_PRECISION PROPERTY STRINGS R4 R4R8 R8)
 
+# Core runtime library (WP-E)
 add_library(fv3_dyn_core_gpu runtime/fv3_gpu_runtime.cpp runtime/fv3_gpu_contract.cpp)
-target_include_directories(fv3_dyn_core_gpu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_include_directories(fv3_dyn_core_gpu PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}
+)
 target_compile_features(fv3_dyn_core_gpu PUBLIC cxx_std_17)
+
+# WP-D operators library (CPU-visible formulas)
+add_library(fv3_wp_d_operators STATIC operators/wp_d_operators.cpp operators/wp_d_contract.cpp)
+target_include_directories(fv3_wp_d_operators PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/operators
+)
+target_link_libraries(fv3_wp_d_operators PUBLIC fv3_dyn_core_gpu)
+target_compile_features(fv3_wp_d_operators PUBLIC cxx_std_17)
+
+# WP-B D-grid library (CPU-visible formulas)
+add_library(fv3_wp_b_dgrid STATIC dgrid/wp_b_contract.cpp)
+target_include_directories(fv3_wp_b_dgrid PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/dgrid
+  ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(fv3_wp_b_dgrid PUBLIC fv3_dyn_core_gpu)
+target_compile_features(fv3_wp_b_dgrid PUBLIC cxx_std_17)
 if(FV3_DYN_CORE_PRECISION STREQUAL "R4" OR FV3_DYN_CORE_PRECISION STREQUAL "R4R8")
   target_compile_definitions(fv3_dyn_core_gpu PUBLIC FV3_GPU_FV_REAL_IS_FLOAT=1)
 elseif(FV3_DYN_CORE_PRECISION STREQUAL "R8")
@@ -21,21 +44,91 @@ if(FV3_DYN_CORE_ENABLE_CUDA)
   find_package(CUDAToolkit REQUIRED)
   target_compile_definitions(fv3_dyn_core_gpu PRIVATE FV3_GPU_ENABLE_CUDA=1)
   target_link_libraries(fv3_dyn_core_gpu PRIVATE CUDA::cudart)
+
+  # WP-A C-grid CUDA sources
+  add_library(fv3_wp_a_cgrid STATIC
+    cgrid/fv3_cgrid.cu
+    cgrid/fv3_cgrid_d2a2c.cu
+    cgrid/fv3_cgrid_csw.cu
+    cgrid/fv3_cgrid_divergence.cu
+    cgrid/fv3_cgrid_dz.cu
+    cgrid/fv3_cgrid_predictor.cu
+  )
+  target_include_directories(fv3_wp_a_cgrid PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/cgrid
+  )
+  target_link_libraries(fv3_wp_a_cgrid PUBLIC fv3_dyn_core_gpu CUDA::cudart)
+  set_target_properties(fv3_wp_a_cgrid PROPERTIES CUDA_STANDARD 17)
+
+  # WP-C vertical CUDA sources
+  add_library(fv3_wp_c_vertical STATIC vertical/fv3_vertical_kernels.cu)
+  target_include_directories(fv3_wp_c_vertical PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/vertical
+  )
+  target_link_libraries(fv3_wp_c_vertical PUBLIC fv3_dyn_core_gpu CUDA::cudart)
+  set_target_properties(fv3_wp_c_vertical PROPERTIES CUDA_STANDARD 17)
+
+  # WP-D operators CUDA sources
+  add_library(fv3_wp_d_cuda STATIC operators/wp_d_cuda.cu)
+  target_include_directories(fv3_wp_d_cuda PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/operators
+  )
+  target_link_libraries(fv3_wp_d_cuda PUBLIC fv3_wp_d_operators CUDA::cudart)
+  set_target_properties(fv3_wp_d_cuda PROPERTIES CUDA_STANDARD 17)
 endif()
 
 include(CTest)
 if(BUILD_TESTING)
+  # WP-E runtime tests
   add_executable(fv3_gpu_descriptor_test tests/runtime/test_descriptor.cpp)
   target_link_libraries(fv3_gpu_descriptor_test PRIVATE fv3_dyn_core_gpu)
   add_test(NAME fv3_gpu_descriptor COMMAND fv3_gpu_descriptor_test)
+
   add_executable(fv3_gpu_api_test tests/runtime/test_api.cpp)
   target_link_libraries(fv3_gpu_api_test PRIVATE fv3_dyn_core_gpu)
   add_test(NAME fv3_gpu_api COMMAND fv3_gpu_api_test)
+
   add_executable(fv3_gpu_c_header_test tests/runtime/test_c_header.c)
   target_link_libraries(fv3_gpu_c_header_test PRIVATE fv3_dyn_core_gpu)
   set_target_properties(fv3_gpu_c_header_test PROPERTIES LINKER_LANGUAGE CXX)
   add_test(NAME fv3_gpu_c_header COMMAND fv3_gpu_c_header_test)
+
   add_executable(fv3_gpu_contract_test tests/runtime/test_contract.cpp)
   target_link_libraries(fv3_gpu_contract_test PRIVATE fv3_dyn_core_gpu)
   add_test(NAME fv3_gpu_contract COMMAND fv3_gpu_contract_test)
+
+  # WP-A C-grid tests (CPU-visible indexing)
+  add_executable(fv3_wp_a_view_test tests/cgrid/test_cgrid_view.cpp)
+  target_include_directories(fv3_wp_a_view_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cgrid)
+  target_link_libraries(fv3_wp_a_view_test PRIVATE fv3_dyn_core_gpu)
+  add_test(NAME fv3_wp_a_view COMMAND fv3_wp_a_view_test)
+
+  # WP-B D-grid tests (CPU-visible kernels)
+  add_executable(fv3_wp_b_kernels_test tests/dgrid/test_wp_b_kernels.cpp)
+  target_include_directories(fv3_wp_b_kernels_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(fv3_wp_b_kernels_test PRIVATE fv3_dyn_core_gpu)
+  add_test(NAME fv3_wp_b_kernels COMMAND fv3_wp_b_kernels_test)
+
+  add_executable(fv3_wp_b_contract_test tests/dgrid/test_wp_b_contract.cpp)
+  target_include_directories(fv3_wp_b_contract_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(fv3_wp_b_contract_test PRIVATE fv3_wp_b_dgrid)
+  add_test(NAME fv3_wp_b_contract COMMAND fv3_wp_b_contract_test)
+
+  # WP-C vertical tests (CPU-visible column primitives)
+  add_executable(fv3_wp_c_column_test tests/vertical/test_vertical_column.cpp)
+  target_include_directories(fv3_wp_c_column_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vertical)
+  target_link_libraries(fv3_wp_c_column_test PRIVATE fv3_dyn_core_gpu)
+  add_test(NAME fv3_wp_c_column COMMAND fv3_wp_c_column_test)
+
+  # WP-D operators tests (CPU-visible formulas)
+  add_executable(fv3_wp_d_operators_test tests/operators/test_wp_d.cpp)
+  target_link_libraries(fv3_wp_d_operators_test PRIVATE fv3_wp_d_operators)
+  add_test(NAME fv3_wp_d_operators COMMAND fv3_wp_d_operators_test)
+
+  add_executable(fv3_wp_d_contract_test tests/operators/test_wp_d_contract.cpp)
+  target_link_libraries(fv3_wp_d_contract_test PRIVATE fv3_wp_d_operators)
+  add_test(NAME fv3_wp_d_contract COMMAND fv3_wp_d_contract_test)
 endif()
