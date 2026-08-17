@@ -716,6 +716,85 @@ inline void riem_solver3_column(int ms, T dt, T rgas, T gama, T kappa,
   for (int k = 0; k <= km; ++k) pk3_out[k] = pk3_tmp[k];
 }
 
+// Workspace slot offsets within per-column arena. All offsets are in
+// sizeof(fv_real) units from the column's workspace base.
+struct VerticalWorkspaceLayout {
+  // Riem_Solver3 precompute/finalize arrays (km+1 each)
+  uint32_t dm, pm, pem, peln2, pk3_tmp, gm, cp, dz, w2, peg, pelng;
+  // Solver work arrays (km+1 each)
+  uint32_t pe2, aa, bb, dd, w1, wk, g_rat, gam, pp, bet, p1;
+  // RIM_2D characteristic arrays (km+2 each for surface reflection)
+  uint32_t dts, pf1, r_lo, r_hi, m_bot, m_top, r_bot, r_top;
+  uint32_t wbar, pbar, cm, wc, dm_tmp, wm, dz_tmp;
+  // Total scalars required per column
+  uint32_t total_scalars;
+};
+
+// Workspace layout computation for vertical solvers.
+// Deterministic, non-overlapping assignment for RIM/SIM/Riemann arrays.
+inline VerticalWorkspaceLayout compute_workspace_layout(int km) noexcept {
+  VerticalWorkspaceLayout layout{};
+  const uint32_t km1 = static_cast<uint32_t>(km + 1);
+  const uint32_t km2 = static_cast<uint32_t>(km + 2);
+  uint32_t offset = 0;
+
+  // Riem_Solver3 precompute/finalize arrays (km+1 each)
+  layout.dm = offset; offset += km1;
+  layout.pm = offset; offset += km1;
+  layout.pem = offset; offset += km1;
+  layout.peln2 = offset; offset += km1;
+  layout.pk3_tmp = offset; offset += km1;
+  layout.gm = offset; offset += km1;
+  layout.cp = offset; offset += km1;
+  layout.dz = offset; offset += km1;
+  layout.w2 = offset; offset += km1;
+  layout.peg = offset; offset += km1;
+  layout.pelng = offset; offset += km1;
+
+  // Solver work arrays (km+1 each)
+  layout.pe2 = offset; offset += km1;
+  layout.aa = offset; offset += km1;
+  layout.bb = offset; offset += km1;
+  layout.dd = offset; offset += km1;
+  layout.w1 = offset; offset += km1;
+  layout.wk = offset; offset += km1;
+  layout.g_rat = offset; offset += km1;
+  layout.gam = offset; offset += km1;
+  layout.pp = offset; offset += km1;
+  layout.bet = offset; offset += km1;
+  layout.p1 = offset; offset += km1;
+
+  // RIM_2D characteristic arrays (km+2 each for surface reflection)
+  layout.dts = offset; offset += km2;
+  layout.pf1 = offset; offset += km2;
+  layout.r_lo = offset; offset += km2;
+  layout.r_hi = offset; offset += km2;
+  layout.m_bot = offset; offset += km2;
+  layout.m_top = offset; offset += km2;
+  layout.r_bot = offset; offset += km2;
+  layout.r_top = offset; offset += km2;
+  layout.wbar = offset; offset += km2;
+  layout.pbar = offset; offset += km2;
+  layout.cm = offset; offset += km2;
+  layout.wc = offset; offset += km2;
+  layout.dm_tmp = offset; offset += km2;
+  layout.wm = offset; offset += km2;
+  layout.dz_tmp = offset; offset += km2;
+
+  layout.total_scalars = offset;
+  return layout;
+}
+
+// Workspace sizing query for vertical solvers.
+// Returns required bytes per horizontal column for the complete Riem_Solver3.
+// Total workspace = columns * vertical_workspace_per_column(km).
+// Note: Uses sizeof(double) for R8; for R4 use sizeof(float).
+template <class T>
+inline uint64_t vertical_workspace_per_column(int km) noexcept {
+  const auto layout = compute_workspace_layout(km);
+  return static_cast<uint64_t>(layout.total_scalars) * sizeof(T);
+}
+
 } // namespace fv3::gpu::vertical
 
 #undef FV3_VERTICAL_HD

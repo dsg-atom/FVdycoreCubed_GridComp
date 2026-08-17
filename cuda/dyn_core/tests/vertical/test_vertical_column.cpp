@@ -227,5 +227,37 @@ int main() {
   printf("  Riem_Solver3 full (a_imp=-1.0, SIM3p0): PASS\n");
 
   printf("All vertical column solver tests: PASS\n");
+
+  // Test workspace layout computation
+  printf("\nTesting workspace layout computation...\n");
+  auto layout = fv3::gpu::vertical::compute_workspace_layout(72);
+  printf("  km=72: total_scalars=%u\n", layout.total_scalars);
+  // Verify layout is deterministic and non-overlapping
+  assert(layout.total_scalars > 0);
+  assert(layout.dm == 0);  // First array starts at 0
+  assert(layout.pm > layout.dm);  // Arrays are sequential
+  assert(layout.pem > layout.pm);
+  // Check RIM arrays are at higher offsets
+  assert(layout.dts > layout.p1);
+  assert(layout.dz_tmp > layout.wm);
+  // Verify sizing: 22 arrays of km+1 + 15 arrays of km+2 = 22*73 + 15*74 = 2716
+  // The handoff note said ~50*(km+2) but actual is 22*(km+1) + 15*(km+2) ~= 37*(km+1)
+  const uint32_t expected = 22 * 73 + 15 * 74;  // 1606 + 1110 = 2716
+  assert(layout.total_scalars == expected);
+  printf("  Workspace layout: PASS (total=%u scalars = 22*(km+1) + 15*(km+2))\n",
+         layout.total_scalars);
+
+  // Test workspace bytes computation
+  const uint64_t bytes_r8 = fv3::gpu::vertical::vertical_workspace_per_column<double>(72);
+  printf("  R8 workspace per column: %lu bytes (%.1f KB)\n", bytes_r8, bytes_r8/1024.0);
+  assert(bytes_r8 == layout.total_scalars * sizeof(double));  // R8 = 8 bytes per scalar
+
+  // Test layout for smaller km
+  auto layout_small = fv3::gpu::vertical::compute_workspace_layout(10);
+  assert(layout_small.total_scalars < layout.total_scalars);
+  printf("  km=10: total_scalars=%u\n", layout_small.total_scalars);
+  printf("  Workspace sizing: PASS\n");
+
+  printf("\nAll vertical tests: PASS\n");
   return 0;
 }
