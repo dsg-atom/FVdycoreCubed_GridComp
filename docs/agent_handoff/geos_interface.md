@@ -222,7 +222,7 @@ All 20 tests (10 R4 + 10 R8) continue to pass.
 
 Branch: `cuda/geos-interface`
 Previous commit: `077b729`
-New commit: (see final report)
+New commit: `6baaefb`
 
 Files added: 8
 Files modified: 2
