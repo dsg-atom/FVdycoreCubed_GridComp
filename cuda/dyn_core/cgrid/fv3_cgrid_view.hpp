@@ -16,11 +16,25 @@ template <typename T, int Rank> struct FieldView {
   int64_t lower[Rank]{};
   int64_t stride[Rank]{};
 
+#if defined(__CUDACC__)
+  __host__ __device__
+#endif
+  constexpr int64_t offset(int64_t i) const {
+    static_assert(Rank == 1);
+    return (i - lower[0]) * stride[0];
+  }
+
+#if defined(__CUDACC__)
+  __host__ __device__
+#endif
   constexpr int64_t offset(int64_t i, int64_t j) const {
     static_assert(Rank == 2);
     return (i - lower[0]) * stride[0] + (j - lower[1]) * stride[1];
   }
 
+#if defined(__CUDACC__)
+  __host__ __device__
+#endif
   constexpr int64_t offset(int64_t i, int64_t j, int64_t k) const {
     static_assert(Rank == 3);
     return (i - lower[0]) * stride[0] + (j - lower[1]) * stride[1] +
@@ -28,6 +42,9 @@ template <typename T, int Rank> struct FieldView {
   }
 
 #if defined(__CUDACC__)
+  __device__ __forceinline__ T &operator()(int64_t i) const {
+    return data[offset(i)];
+  }
   __device__ __forceinline__ T &operator()(int64_t i, int64_t j) const {
     return data[offset(i, j)];
   }

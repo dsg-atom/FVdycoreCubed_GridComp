@@ -8,8 +8,21 @@ namespace fv3::gpu::vertical {
 
 #if defined(__CUDACC__)
 #define FV3_VERTICAL_HD __host__ __device__
+// CUDA-compatible math functions that work in both host and device code
+template <typename T> __host__ __device__ inline T fv3_exp(T x) { return exp(x); }
+template <typename T> __host__ __device__ inline T fv3_log(T x) { return log(x); }
+template <typename T> __host__ __device__ inline T fv3_sqrt(T x) { return sqrt(x); }
+template <typename T> __host__ __device__ inline T fv3_fabs(T x) { return fabs(x); }
+template <typename T> __host__ __device__ inline T fv3_copysign(T x, T y) { return copysign(x, y); }
+template <typename T> __host__ __device__ inline T fv3_max(T x, T y) { return x > y ? x : y; }
 #else
 #define FV3_VERTICAL_HD
+template <typename T> inline T fv3_exp(T x) { return std::exp(x); }
+template <typename T> inline T fv3_log(T x) { return std::log(x); }
+template <typename T> inline T fv3_sqrt(T x) { return std::sqrt(x); }
+template <typename T> inline T fv3_fabs(T x) { return std::fabs(x); }
+template <typename T> inline T fv3_copysign(T x, T y) { return std::copysign(x, y); }
+template <typename T> inline T fv3_max(T x, T y) { return std::max(x, y); }
 #endif
 
 // Package-local, zero-based views.  Integration constructs these from the
@@ -102,7 +115,7 @@ FV3_VERTICAL_HD inline void reconstruct_height_column(Column<T> zh, const Column
 // Exact dry/MOIST_CAPPA translation of nh_utils.F90:SIM1_solver for one
 // horizontal column. Callers provide all work arrays from persistent storage.
 template <class T>
-inline void sim1_column(T dt, T rgas, T gama, T kappa, T p_fac,
+FV3_VERTICAL_HD inline void sim1_column(T dt, T rgas, T gama, T kappa, T p_fac,
                         bool moist_cappa, const T *gm2, const T *cp2,
                         const T *dm, const T *pm, const T *pem, T *w, T *dz,
                         const T *pt, T ws, T *pe, T *aa, T *bb, T *dd,
@@ -111,7 +124,7 @@ inline void sim1_column(T dt, T rgas, T gama, T kappa, T p_fac,
   const T t1g = (moist_cappa ? T(1) : gama) * T(2) * dt * dt;
   const T rdt = T(1) / dt, capa1 = kappa - T(1);
   for (int k=0;k<km;++k) {
-    pe[k]=std::exp((moist_cappa?gm2[k]:gama)*std::log(-dm[k]/dz[k]*rgas*pt[k]))-pm[k];
+    pe[k]=fv3_exp((moist_cappa?gm2[k]:gama)*fv3_log(-dm[k]/dz[k]*rgas*pt[k]))-pm[k];
     w1[k]=w[k];
   }
   for(int k=0;k<km-1;++k){g_rat[k]=dm[k]/dm[k+1];bb[k]=T(2)*(T(1)+g_rat[k]);dd[k]=T(3)*(pe[k]+g_rat[k]*pe[k+1]);}
@@ -130,7 +143,7 @@ inline void sim1_column(T dt, T rgas, T gama, T kappa, T p_fac,
   for(int k=kb;k>=0;--k){
     if(k<kb)p1[k]=(pe[k]+bb[k]*pe[k+1]+g_rat[k]*pe[k+2])/T(3)-g_rat[k]*p1[k+1];
     const T pg=p_fac*pm[k]>p1[k]+pm[k]?p_fac*pm[k]:p1[k]+pm[k];
-    dz[k]=-dm[k]*rgas*pt[k]*std::exp((moist_cappa?cp2[k]-T(1):capa1)*std::log(pg));
+    dz[k]=-dm[k]*rgas*pt[k]*fv3_exp((moist_cappa?cp2[k]-T(1):capa1)*fv3_log(pg));
   }
 }
 
@@ -138,21 +151,21 @@ inline void sim1_column(T dt, T rgas, T gama, T kappa, T p_fac,
 // arbitrary strides at the wrapper; these arrays are the contiguous arena
 // representation used by the sequential solver.
 template <class T>
-inline void riem3_precompute_column(const T *delp, const T *pt,
+FV3_VERTICAL_HD inline void riem3_precompute_column(const T *delp, const T *pt,
                                     const T *q_con, const T *cappa,
                                     const T *zh, const T *w, T ptop, T akap,
                                     T grav, bool use_cond, bool moist_cappa,
                                     T *dm, T *pm, T *pem, T *peln2, T *pk3,
                                     T *gm, T *cp, T *dz, T *w2, T *peg,
                                     T *pelng, int km) {
-  const T rgrav=T(1)/grav, peln1=std::log(ptop), ptk=std::exp(akap*peln1);
+  const T rgrav=T(1)/grav, peln1=fv3_log(ptop), ptk=fv3_exp(akap*peln1);
   pem[0]=ptop;peln2[0]=peln1;pk3[0]=ptk;
   peg[0]=ptop;pelng[0]=peln1;
   for(int k=0;k<km;++k){
     dm[k]=delp[k];
-    pem[k+1]=pem[k]+dm[k];peln2[k+1]=std::log(pem[k+1]);
-    pk3[k+1]=std::exp(akap*peln2[k+1]);
-    if(use_cond){peg[k+1]=peg[k]+dm[k]*(T(1)-q_con[k]);pelng[k+1]=std::log(peg[k+1]);}
+    pem[k+1]=pem[k]+dm[k];peln2[k+1]=fv3_log(pem[k+1]);
+    pk3[k+1]=fv3_exp(akap*peln2[k+1]);
+    if(use_cond){peg[k+1]=peg[k]+dm[k]*(T(1)-q_con[k]);pelng[k+1]=fv3_log(peg[k+1]);}
   }
   for(int k=0;k<km;++k){
     const T layer_pm=use_cond?(peg[k+1]-peg[k])/(pelng[k+1]-pelng[k])
@@ -165,7 +178,7 @@ inline void riem3_precompute_column(const T *delp, const T *pt,
 }
 
 template <class T>
-inline void riem3_finalize_column(const T *pem, const T *peln2,
+FV3_VERTICAL_HD inline void riem3_finalize_column(const T *pem, const T *peln2,
                                   const T *pe2, const T *dz, T *w,
                                   const T *w2, T *delz, T *zh, T zs,
                                   T *pe, T *peln, T *pk, T *pk3,
@@ -181,7 +194,7 @@ inline void riem3_finalize_column(const T *pem, const T *peln2,
 // Exact translation of nh_utils.F90:SIM3p0_solver for one horizontal column.
 // Beta=0 variant of SIM3. All work arrays are caller-provided from persistent arena.
 template <class T>
-inline void sim3p0_column(T dt, T rgas, T gama, T kappa, T p_fac, T scale_m,
+FV3_VERTICAL_HD inline void sim3p0_column(T dt, T rgas, T gama, T kappa, T p_fac, T scale_m,
                           const T *dm, const T *pt, const T *pem, T *w,
                           T *dz, T ws, T *pe2, T *aa, T *bb, T *dd, T *w1,
                           T *g_rat, T *gam, T *pp, T *bet, T *p1, int km) {
@@ -194,7 +207,7 @@ inline void sim3p0_column(T dt, T rgas, T gama, T kappa, T p_fac, T scale_m,
 
   for (int k = 0; k < km; ++k) {
     w1[k] = w[k];
-    aa[k] = std::exp(gama * std::log(-dm[k] / dz[k] * rgas * pt[k]));
+    aa[k] = fv3_exp(gama * fv3_log(-dm[k] / dz[k] * rgas * pt[k]));
   }
 
   for (int k = 0; k < km - 1; ++k) {
@@ -253,17 +266,17 @@ inline void sim3p0_column(T dt, T rgas, T gama, T kappa, T p_fac, T scale_m,
 
   pe2[0] = pem[0];
   for (int k = 1; k <= km; ++k) {
-    pe2[k] = std::max(p_fac * pem[k], pe2[k] + pem[k]);
+    pe2[k] = fv3_max(p_fac * pem[k], pe2[k] + pem[k]);
   }
 
   p1[km - 1] = (pe2[km - 1] + T(2) * pe2[km]) * r3 - r6g * dm[km - 1];
   dz[km - 1] = -dm[km - 1] * rgas * pt[km - 1] *
-               std::exp(capa1 * std::log(p1[km - 1]));
+               fv3_exp(capa1 * fv3_log(p1[km - 1]));
 
   for (int k = km - 2; k >= 0; --k) {
     p1[k] = (pe2[k] + bb[k] * pe2[k + 1] + g_rat[k] * pe2[k + 2]) * r3 -
             g_rat[k] * p1[k + 1];
-    dz[k] = -dm[k] * rgas * pt[k] * std::exp(capa1 * std::log(p1[k]));
+    dz[k] = -dm[k] * rgas * pt[k] * fv3_exp(capa1 * fv3_log(p1[k]));
   }
 
   for (int k = 0; k <= km; ++k) {
@@ -274,7 +287,7 @@ inline void sim3p0_column(T dt, T rgas, T gama, T kappa, T p_fac, T scale_m,
 // Exact translation of nh_utils.F90:SIM3_solver for one horizontal column.
 // General alpha/beta variant. All work arrays are caller-provided from persistent arena.
 template <class T>
-inline void sim3_column(T dt, T rgas, T gama, T kappa, T alpha, T p_fac,
+FV3_VERTICAL_HD inline void sim3_column(T dt, T rgas, T gama, T kappa, T alpha, T p_fac,
                         T scale_m, const T *dm, const T *pt, const T *pem,
                         T *w, T *dz, T ws, T *pe2, T *aa, T *bb, T *dd,
                         T *w1, T *wk, T *g_rat, T *gam, T *pp, T *bet, T *p1,
@@ -291,7 +304,7 @@ inline void sim3_column(T dt, T rgas, T gama, T kappa, T alpha, T p_fac,
 
   for (int k = 0; k < km; ++k) {
     w1[k] = w[k];
-    aa[k] = std::exp(gama * std::log(-dm[k] / dz[k] * rgas * pt[k]));
+    aa[k] = fv3_exp(gama * fv3_log(-dm[k] / dz[k] * rgas * pt[k]));
   }
 
   for (int k = 0; k < km - 1; ++k) {
@@ -354,17 +367,17 @@ inline void sim3_column(T dt, T rgas, T gama, T kappa, T alpha, T p_fac,
 
   pe2[0] = pem[0];
   for (int k = 1; k <= km; ++k) {
-    pe2[k] = std::max(p_fac * pem[k], pe2[k] + pem[k]);
+    pe2[k] = fv3_max(p_fac * pem[k], pe2[k] + pem[k]);
   }
 
   p1[km - 1] = (pe2[km - 1] + T(2) * pe2[km]) * r3 - r6g * dm[km - 1];
   dz[km - 1] = -dm[km - 1] * rgas * pt[km - 1] *
-               std::exp(capa1 * std::log(std::max(p1[km - 1], T(1))));
+               fv3_exp(capa1 * fv3_log(fv3_max(p1[km - 1], T(1))));
 
   for (int k = km - 2; k >= 0; --k) {
     p1[k] = (pe2[k] + bb[k] * pe2[k + 1] + g_rat[k] * pe2[k + 2]) * r3 -
             g_rat[k] * p1[k + 1];
-    dz[k] = -dm[k] * rgas * pt[k] * std::exp(capa1 * std::log(std::max(p1[k], T(1))));
+    dz[k] = -dm[k] * rgas * pt[k] * fv3_exp(capa1 * fv3_log(fv3_max(p1[k], T(1))));
   }
 
   for (int k = 0; k <= km; ++k) {
@@ -376,7 +389,7 @@ inline void sim3_column(T dt, T rgas, T gama, T kappa, T alpha, T p_fac,
 // Exact translation of nh_utils.F90:SIM_solver for one horizontal column.
 // General a_imp variant with moist_cappa support. All work arrays are caller-provided.
 template <class T>
-inline void sim_column(T dt, T rgas, T gama, T kappa, T alpha, T p_fac,
+FV3_VERTICAL_HD inline void sim_column(T dt, T rgas, T gama, T kappa, T alpha, T p_fac,
                        T scale_m, bool moist_cappa, const T *gm2, const T *cp2,
                        const T *dm, const T *pm, const T *pt, const T *pem,
                        T *w, T *dz, T ws, T *pe2, T *aa, T *bb, T *dd,
@@ -393,8 +406,8 @@ inline void sim_column(T dt, T rgas, T gama, T kappa, T alpha, T p_fac,
 
   for (int k = 0; k < km; ++k) {
     w1[k] = w[k];
-    pe2[k] = std::exp((moist_cappa ? gm2[k] : gama) *
-                      std::log(-dm[k] / dz[k] * rgas * pt[k])) - pm[k];
+    pe2[k] = fv3_exp((moist_cappa ? gm2[k] : gama) *
+                      fv3_log(-dm[k] / dz[k] * rgas * pt[k])) - pm[k];
   }
 
   for (int k = 0; k < km - 1; ++k) {
@@ -457,16 +470,16 @@ inline void sim_column(T dt, T rgas, T gama, T kappa, T alpha, T p_fac,
   }
 
   p1[km - 1] = (pe2[km - 1] + T(2) * pe2[km]) * r3;
-  const T pg_km = std::max(p_fac * pm[km - 1], p1[km - 1] + pm[km - 1]);
+  const T pg_km = fv3_max(p_fac * pm[km - 1], p1[km - 1] + pm[km - 1]);
   dz[km - 1] = -dm[km - 1] * rgas * pt[km - 1] *
-               std::exp((moist_cappa ? cp2[km - 1] - T(1) : capa1) * std::log(pg_km));
+               fv3_exp((moist_cappa ? cp2[km - 1] - T(1) : capa1) * fv3_log(pg_km));
 
   for (int k = km - 2; k >= 0; --k) {
     p1[k] = (pe2[k] + bb[k] * pe2[k + 1] + g_rat[k] * pe2[k + 2]) * r3 -
             g_rat[k] * p1[k + 1];
-    const T pg = std::max(p_fac * pm[k], p1[k] + pm[k]);
+    const T pg = fv3_max(p_fac * pm[k], p1[k] + pm[k]);
     dz[k] = -dm[k] * rgas * pt[k] *
-            std::exp((moist_cappa ? cp2[k] - T(1) : capa1) * std::log(pg));
+            fv3_exp((moist_cappa ? cp2[k] - T(1) : capa1) * fv3_log(pg));
   }
 
   for (int k = 0; k <= km; ++k) {
@@ -477,7 +490,7 @@ inline void sim_column(T dt, T rgas, T gama, T kappa, T alpha, T p_fac,
 // Exact translation of nh_utils.F90:RIM_2D for one horizontal column.
 // Method of characteristics with acoustic substeps. All work arrays are caller-provided.
 template <class T>
-inline void rim_2d_column(int ms, T bdt, T rgas, T gama, bool moist_cappa,
+FV3_VERTICAL_HD inline void rim_2d_column(int ms, T bdt, T rgas, T gama, bool moist_cappa,
                           const T *gm2, const T *dm2, const T *pm2, const T *pt2,
                           T ws, T *dz2, T *w2, T *pe2, T *dts, T *pf1,
                           T *r_lo, T *r_hi, T *m_bot, T *m_top, T *r_bot,
@@ -506,8 +519,8 @@ inline void rim_2d_column(int ms, T bdt, T rgas, T gama, bool moist_cappa,
   if (ms > 1 && ms < 8) {
     for (int k = 0; k < km; ++k) {
       const T rden = -rgas * dm_tmp[k] / dz_tmp[k];
-      pf1[k] = std::exp((moist_cappa ? gm2[k] : gama) * std::log(rden * pt2[k]));
-      dts[k] = -dz_tmp[k] / std::sqrt(grg * pf1[k] / rden);
+      pf1[k] = fv3_exp((moist_cappa ? gm2[k] : gama) * fv3_log(rden * pt2[k]));
+      dts[k] = -dz_tmp[k] / fv3_sqrt(grg * pf1[k] / rden);
       if (bdt > dts[k]) {
         ks0 = k;
         goto fast_path_check;
@@ -553,8 +566,8 @@ slow_path:
   for (int n = 0; n < ms; ++n) {
     for (int k = ks1; k < km; ++k) {
       const T rden = -rgas * dm_tmp[k] / dz_tmp[k];
-      const T pf = std::exp((moist_cappa ? gm2[k] : gama) * std::log(rden * pt2[k]));
-      dts[k] = -dz_tmp[k] / std::sqrt(grg * pf / rden);
+      const T pf = fv3_exp((moist_cappa ? gm2[k] : gama) * fv3_log(rden * pt2[k]));
+      dts[k] = -dz_tmp[k] / fv3_sqrt(grg * pf / rden);
       const T ptmp1 = dts[k] * (pf - pm2[k]);
       r_lo[k] = wm[k] + ptmp1;
       r_hi[k] = wm[k] - ptmp1;
@@ -669,7 +682,7 @@ slow_path:
 // Complete Riem_Solver3 column orchestration with a_imp dispatch.
 // Callers provide all workspace arrays from persistent arena.
 template <class T>
-inline void riem_solver3_column(int ms, T dt, T rgas, T gama, T kappa,
+FV3_VERTICAL_HD inline void riem_solver3_column(int ms, T dt, T rgas, T gama, T kappa,
                                 T ptop, T p_fac, T a_imp, T scale_m,
                                 bool use_cond, bool moist_cappa,
                                 bool last_call, bool fp_out, bool use_logp,

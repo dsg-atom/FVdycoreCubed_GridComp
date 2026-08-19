@@ -320,7 +320,7 @@ int launch_vertical_solver(const ExecutionContext &x, fv3_gpu_error *error) {
 
   const int km = static_cast<int>(b.npz);
   const auto layout = compute_workspace_layout(km);
-  const uint64_t bytes_per_column = vertical_workspace_per_column(km);
+  const uint64_t bytes_per_column = vertical_workspace_per_column<fv_real>(km);
   const uint64_t columns = static_cast<uint64_t>((b.ie - b.is + 1) * (b.je - b.js + 1));
 
   // Verify workspace capacity
