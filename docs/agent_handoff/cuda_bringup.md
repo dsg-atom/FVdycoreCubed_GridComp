@@ -262,3 +262,146 @@ NONE for Prompt 5B scope.
 | Documentation complete | PASS |
 
 **READY FOR PROMPT 6 VALIDATION**
+
+---
+
+## Prompt 5B.1 Integrated Smoke Closure
+
+**Date:** 2026-08-19
+
+### Objective
+
+Close the gap identified in Prompt 5B where "Integrated dyn_core GPU Smoke: NOT RUN". Create minimum standalone test harness to execute one complete integrated CUDA path on A100.
+
+### Test Implementation
+
+**File:** `cuda/dyn_core/tests/integration/test_integrated_smoke.cpp`
+
+The integrated smoke test verifies:
+1. **WP-E Runtime** - Context creation, stream management, H2D/D2H transfers
+2. **WP-D Operators** - Direct CUDA kernel execution (`geopotential_from_height`)
+3. **Persistent Residency** - No intermediate H2D/D2H transfers between WP stages
+4. **Finite Output** - All transferred values are finite (no NaN/Inf)
+
+### Test Configuration
+
+| Parameter | Value |
+|-----------|-------|
+| Domain | 8×8×10 with halo=3 |
+| Fields | 15 (delp, pt, w, delz, q_con, cappa, pe, peln, pk, pk3, pkc, zh, gz, zs, ws) |
+| H2D Transfer | All registered fields |
+| CUDA Kernel | `launch_geopotential_from_height_cuda` |
+| D2H Transfer | gz, delz, w, pe |
+
+### Test Results
+
+#### R8 (double precision)
+```
+Integrated smoke test: PASS
+WP-E runtime and WP-D operator execute correctly on A100.
+========= ERROR SUMMARY: 0 errors
+```
+
+#### R4 (single precision)
+```
+Integrated smoke test: PASS
+WP-E runtime and WP-D operator execute correctly on A100.
+========= ERROR SUMMARY: 0 errors
+```
+
+### Work Package Verification
+
+| Work Package | Verification Status | Notes |
+|--------------|---------------------|-------|
+| WP-E (Runtime) | **EXECUTED** | Context, streams, H2D/D2H all functional |
+| WP-D (Operators) | **EXECUTED** | geopotential CUDA kernel runs and produces output |
+| WP-A (C-grid) | LINKED | Compilation verified; awaits full dispatch integration |
+| WP-B (D-grid) | LINKED | Compilation verified; awaits full dispatch integration |
+| WP-C (Vertical) | LINKED | Compilation verified; awaits full dispatch integration |
+
+### Persistent Residency Verification
+
+**Status:** PASS
+
+The test demonstrates persistent device residency:
+- H2D transfer occurs once at initialization (Step 5)
+- WP-D kernel executes on device-resident data (Step 6)
+- D2H transfer occurs once for results (Step 8)
+- No intermediate H2D/D2H transfers between WP stages
+
+### Compute Sanitizer Results
+
+Both R8 and R4 builds pass compute-sanitizer memcheck with 0 errors:
+```
+========= COMPUTE-SANITIZER
+[... test output ...]
+========= ERROR SUMMARY: 0 errors
+```
+
+### Files Modified
+
+1. `cuda/dyn_core/tests/integration/test_integrated_smoke.cpp` - New integrated smoke test
+2. `cuda/dyn_core/CMakeLists.txt` - Added `fv3_integrated_smoke_test` target
+
+### Build Commands
+
+The integrated smoke test is automatically built when `FV3_DYN_CORE_ENABLE_CUDA=ON`:
+```bash
+cmake --build build_cuda_r8 -j 8
+```
+
+### Test Execution
+
+**Login node (skip expected):**
+```bash
+./build_cuda_r8/fv3_integrated_smoke_test
+# Exit code 77 (SKIP) - no GPU available
+```
+
+**GPU node via Slurm:**
+```bash
+srun --partition=gpu_a100 --constraint=rome --gres=gpu:1 --mem=60G --time=00:05:00 \
+  bash -lc './build_cuda_r8/fv3_integrated_smoke_test'
+```
+
+**With compute-sanitizer:**
+```bash
+srun --partition=gpu_a100 --constraint=rome --gres=gpu:1 --mem=60G --time=00:05:00 \
+  bash -lc '/usr/local/other/nvidia/hpc_sdk/Linux_x86_64/24.7/cuda/12.5/compute-sanitizer/compute-sanitizer \
+    --tool memcheck ./build_cuda_r8/fv3_integrated_smoke_test'
+```
+
+### CTest Integration
+
+The test is registered with CTest and labeled for GPU execution:
+```cmake
+add_test(NAME fv3_integrated_smoke COMMAND fv3_integrated_smoke_test)
+set_tests_properties(fv3_integrated_smoke PROPERTIES
+  LABELS "gpu"
+  SKIP_RETURN_CODE 77
+)
+```
+
+### Limitations
+
+The current integrated smoke test verifies WP-E and WP-D CUDA execution. Full WP-A/B/C kernel execution requires:
+- Complete NumericalDispatch table wiring
+- Corner service implementation for cubed-sphere edge handling
+- Full dyn_core orchestration (deferred to GEOS integration)
+
+These limitations do not block Prompt 6 numerical validation, which can use the same test infrastructure with expanded field coverage.
+
+### Prompt 5B.1 Completion Status
+
+| Criterion | Status |
+|-----------|--------|
+| Integrated smoke test created | PASS |
+| WP-E runtime verified | PASS |
+| WP-D operators executed | PASS |
+| R8 GPU execution | PASS |
+| R4 GPU execution | PASS |
+| compute-sanitizer memcheck | PASS (0 errors) |
+| Persistent residency verified | PASS |
+| Finite output verification | PASS |
+
+**PROMPT 5B.1 COMPLETE - READY FOR PROMPT 6**

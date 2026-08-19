@@ -131,4 +131,24 @@ if(BUILD_TESTING)
   add_executable(fv3_wp_d_contract_test tests/operators/test_wp_d_contract.cpp)
   target_link_libraries(fv3_wp_d_contract_test PRIVATE fv3_wp_d_operators)
   add_test(NAME fv3_wp_d_contract COMMAND fv3_wp_d_contract_test)
+
+  # Prompt 5B.1 Integrated smoke test (requires CUDA and GPU)
+  if(FV3_DYN_CORE_ENABLE_CUDA)
+    add_executable(fv3_integrated_smoke_test tests/integration/test_integrated_smoke.cpp)
+    target_include_directories(fv3_integrated_smoke_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+      ${CMAKE_CURRENT_SOURCE_DIR}/operators
+    )
+    target_link_libraries(fv3_integrated_smoke_test PRIVATE
+      fv3_dyn_core_gpu
+      fv3_wp_d_cuda
+      CUDA::cudart
+    )
+    # This test requires a GPU to run - mark as needing GPU label
+    add_test(NAME fv3_integrated_smoke COMMAND fv3_integrated_smoke_test)
+    set_tests_properties(fv3_integrated_smoke PROPERTIES
+      LABELS "gpu"
+      SKIP_RETURN_CODE 77
+    )
+  endif()
 endif()
