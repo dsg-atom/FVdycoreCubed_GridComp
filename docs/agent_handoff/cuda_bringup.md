@@ -263,6 +263,21 @@ NONE for Prompt 5B scope.
 
 **READY FOR PROMPT 6 VALIDATION**
 
+> **SUPERSEDED (Milestone 3A.1, 2026-08-21):** This line described Prompt 5B
+> compilation/runtime bring-up only ("Integrated dyn_core smoke: NOT RUN"
+> above), not a validated production dispatch path. Milestone 3A.1 activated
+> the real `NumericalDispatch` (WP-A `cgrid_pressure` + WP-C
+> `vertical_solver`) through `fv3_gpu_dyn_core_step` and found a genuine
+> illegal-memory-access defect (k-axis lower-bound mismatch feeding
+> `riem_solver3_kernel`) that had never been exercised by any test at the time
+> this line was written. That defect has since been fixed at the
+> test-harness level and is now sanitizer-clean, but this shows "READY FOR
+> PROMPT 6" was premature when written: no prior test had actually driven
+> WP-A/WP-C CUDA kernels through the dispatch/orchestration path this line
+> implicitly certified. See
+> `docs/agent_handoff/milestone_3a1_production_dispatch.md` for the current,
+> narrower validation status before relying on Prompt 6 readiness.
+
 ---
 
 ## Prompt 5B.1 Integrated Smoke Closure
@@ -405,3 +420,15 @@ These limitations do not block Prompt 6 numerical validation, which can use the 
 | Finite output verification | PASS |
 
 **PROMPT 5B.1 COMPLETE - READY FOR PROMPT 6**
+
+> **SUPERSEDED (Milestone 3A.1, 2026-08-21):** "Complete" here is accurate
+> only for what Prompt 5B.1 actually tested: WP-E runtime + a direct WP-D
+> `geopotential_from_height` kernel call, bypassing `NumericalDispatch` and
+> `fv3_gpu_dyn_core_step` entirely (see "Limitations" above — WP-A/B/C were
+> LINKED, not EXECUTED). It is not evidence that the production dispatch
+> path was sound. Milestone 3A.1 subsequently wired the real dispatch and
+> found (and fixed, at the test-harness level only) an illegal-memory-access
+> defect in the WP-C vertical-solver call path that this test never
+> exercised. Treat "READY FOR PROMPT 6" as referring only to the WP-E/WP-D
+> direct-call path, not the full production dispatch. Current status:
+> `docs/agent_handoff/milestone_3a1_production_dispatch.md`.

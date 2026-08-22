@@ -477,3 +477,16 @@ configuration are now implemented:
 - WP-D: 10 stages COMPLETE
 
 No PARTIAL or UNIMPLEMENTED stages remain for the production configuration.
+
+> **CLARIFIED (Milestone 3A.1, 2026-08-21):** "COMPLETE" above means
+> IMPLEMENTATION COVERAGE only (source exists and is wired), consistent with
+> `docs/agent_instructions/project_architecture.md`'s explicit statement that
+> this inventory does NOT mean GPU EXECUTION COMPLETE or NUMERICAL VALIDATION
+> COMPLETE. Milestone 3A.1 activated the real `NumericalDispatch` through
+> `fv3_gpu_dyn_core_step` and confirmed GPU-executed, sanitizer-clean results
+> for WP-A `cgrid_pressure` and WP-C `vertical_solver` only. WP-B has no CUDA
+> implementation at all (Fortran-only). WP-D's `nh_pressure` stage is wired
+> but fails contract validation for the milestone's test domain
+> (`missing required WP-D field u`). See
+> `docs/agent_handoff/milestone_3a1_production_dispatch.md` for current
+> per-WP GPU-execution status.

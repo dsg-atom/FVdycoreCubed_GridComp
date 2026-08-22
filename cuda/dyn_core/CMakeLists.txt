@@ -71,13 +71,31 @@ if(FV3_DYN_CORE_ENABLE_CUDA)
   set_target_properties(fv3_wp_c_vertical PROPERTIES CUDA_STANDARD 17)
 
   # WP-D operators CUDA sources
-  add_library(fv3_wp_d_cuda STATIC operators/wp_d_cuda.cu)
+  add_library(fv3_wp_d_cuda STATIC operators/wp_d_cuda.cu operators/wp_d_contract_cuda.cpp)
   target_include_directories(fv3_wp_d_cuda PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/operators
   )
   target_link_libraries(fv3_wp_d_cuda PUBLIC fv3_wp_d_operators CUDA::cudart)
   set_target_properties(fv3_wp_d_cuda PROPERTIES CUDA_STANDARD 17)
+
+  # Milestone 3A.1: production NumericalDispatch (wires WP-A/WP-C/WP-D CUDA
+  # adapters into a real dispatch table consumed by fv3_gpu_dyn_core_step).
+  # .cu (not .cpp): it transitively includes cgrid/fv3_cgrid_d2a2c.hpp, which
+  # declares __device__ functions that only nvcc can parse.
+  add_library(fv3_production_dispatch STATIC runtime/fv3_gpu_production_dispatch.cu)
+  target_include_directories(fv3_production_dispatch PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+  target_link_libraries(fv3_production_dispatch PUBLIC
+    fv3_dyn_core_gpu
+    fv3_wp_a_cgrid
+    fv3_wp_c_vertical
+    fv3_wp_d_cuda
+  )
+  target_compile_features(fv3_production_dispatch PUBLIC cxx_std_17)
+  set_target_properties(fv3_production_dispatch PROPERTIES CUDA_STANDARD 17)
 endif()
 
 include(CTest)
@@ -147,6 +165,24 @@ if(BUILD_TESTING)
     # This test requires a GPU to run - mark as needing GPU label
     add_test(NAME fv3_integrated_smoke COMMAND fv3_integrated_smoke_test)
     set_tests_properties(fv3_integrated_smoke PROPERTIES
+      LABELS "gpu"
+      SKIP_RETURN_CODE 77
+    )
+
+    # Milestone 3A.1 production dispatch smoke test (requires CUDA and GPU)
+    add_executable(fv3_dispatch_smoke_test tests/integration/test_dispatch_smoke.cpp)
+    target_include_directories(fv3_dispatch_smoke_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+      ${CMAKE_CURRENT_SOURCE_DIR}/runtime
+    )
+    target_link_libraries(fv3_dispatch_smoke_test PRIVATE
+      fv3_dyn_core_gpu
+      fv3_production_dispatch
+      CUDA::cudart
+    )
+    # This test requires a GPU to run - mark as needing GPU label
+    add_test(NAME fv3_dispatch_smoke COMMAND fv3_dispatch_smoke_test)
+    set_tests_properties(fv3_dispatch_smoke PROPERTIES
       LABELS "gpu"
       SKIP_RETURN_CODE 77
     )

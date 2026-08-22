@@ -46,6 +46,31 @@ int fail(fv3_gpu_error *e, fv3_gpu_status code, const char *api, const std::stri
     std::strncpy(e->api, api ? api : "", sizeof(e->api)-1); std::strncpy(e->message, msg.c_str(), sizeof(e->message)-1); }
   return code;
 }
+
+int set_numerical_dispatch(fv3_gpu_context *c, const NumericalDispatch &d, fv3_gpu_error *e) noexcept {
+  clear_error(e);
+  if (!c) return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"null context");
+  if (c->data.phase==ContextPhase::failed) return fail(e,FV3_GPU_STATE_CONFLICT,__func__,"context has failed");
+  if (d.contract_version!=internal_contract_version) return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"wrong dispatch version");
+  c->data.dispatch=d;
+  return FV3_GPU_SUCCESS;
+}
+int set_numerical_config(fv3_gpu_context *c, const NumericalConfig &cfg, fv3_gpu_error *e) noexcept {
+  clear_error(e);
+  if (!c) return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"null context");
+  if (c->data.phase==ContextPhase::failed) return fail(e,FV3_GPU_STATE_CONFLICT,__func__,"context has failed");
+  c->data.immutable.config=cfg;
+  return FV3_GPU_SUCCESS;
+}
+int mark_halo_ready(fv3_gpu_context *c, fv3_gpu_halo_group g, fv3_gpu_error *e) noexcept {
+  clear_error(e);
+  if (!c) return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"null context");
+  if (c->data.phase==ContextPhase::failed) return fail(e,FV3_GPU_STATE_CONFLICT,__func__,"context has failed");
+  fv3_gpu_event ev=issue_event(c->data);
+  int rc=c->data.dependencies.mark_ready(g,ev);
+  if (rc!=0) return fail(e,static_cast<fv3_gpu_status>(rc),__func__,"invalid halo group or event");
+  return FV3_GPU_SUCCESS;
+}
 }
 
 extern "C" int fv3_gpu_validate_field(const fv3_gpu_field_desc *f, fv3_gpu_error *e) {
@@ -132,7 +157,64 @@ extern "C" int fv3_gpu_sync_to_host(fv3_gpu_context *c,const fv3_gpu_field_mask 
   return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,"runtime was built without CUDA");
 #endif
 }
-extern "C" int fv3_gpu_dyn_core_step(fv3_gpu_context*,const fv3_gpu_step_desc*,fv3_gpu_event *ev,fv3_gpu_error *e){if(ev)*ev=0;return fv3::gpu::fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,"numerical work packages are not linked into this skeleton");}
+extern "C" int fv3_gpu_dyn_core_step(fv3_gpu_context *c,const fv3_gpu_step_desc *s,fv3_gpu_event *ev,fv3_gpu_error *e){
+  using namespace fv3::gpu; clear_error(e); if(ev)*ev=0;
+  if(!c||!s||!ev||!header_ok(s->abi_version,s->struct_bytes,sizeof(*s)))
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"invalid context, step descriptor, or event output");
+  if(c->data.phase!=ContextPhase::initialized) return fail(e,FV3_GPU_STATE_CONFLICT,__func__,"context is not initialized");
+  if(s->dependency && s->dependency>c->data.last_event) return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"step dependency references an unknown event");
+
+  const NumericalDispatch &dispatch=c->data.dispatch;
+  if(dispatch.contract_version!=internal_contract_version)
+    return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,"numerical dispatch table is not installed");
+  const bool any_stage = dispatch.cgrid_predictor||dispatch.cgrid_vertical_solver||dispatch.cgrid_pressure||
+                          dispatch.dgrid_dynamics||dispatch.dgrid_height_transport||dispatch.dgrid_height||
+                          dispatch.vertical_solver||dispatch.nh_pressure||dispatch.post_loop_heating;
+  if(!any_stage||!dispatch.corner_edge_service)
+    return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,"numerical dispatch table has no usable stages wired");
+
+  // Milestone 3A.1: dispatch_params carries only what fv3_gpu_step_desc
+  // actually provides. Multi-pass hyperdiffusion (diffusion_pass/passes) is
+  // not exposed by the current ABI, so a single pass is assumed here; any
+  // NumericalConfig requesting more passes will be rejected by the stage
+  // itself (launch_post_loop_heating requires diffusion_passes==config.nf_ke).
+  DispatchParams &p=c->data.dispatch_params;
+  p.contract_version=internal_contract_version; p.dt=s->bdt; p.dt2=s->bdt*0.5;
+  p.rdt=(s->bdt!=0.0)?1.0/s->bdt:0.0; p.model_step=s->model_step; p.acoustic_sequence=s->acoustic_sequence;
+  p.acoustic_index=0; p.n_split=s->n_split>0?s->n_split:1; p.k_split=s->k_split>0?s->k_split:1; p.vertical_ms=1;
+  p.diffusion_pass=0; p.diffusion_passes=1;
+  p.init_step=s->init_step; p.end_step=s->end_step; p.last_call=s->end_step; p.fp_out=0; p.remap_step=0;
+
+  ExecutionContext x{};
+  x.contract_version=internal_contract_version;
+  x.fields=&c->data.state.registry;
+  x.immutable=&c->data.immutable;
+  x.dispatch_params=&c->data.dispatch_params;
+  x.workspace=&c->data.workspace.layout;
+  x.submission=Submission{internal_contract_version,c->data.compute_stream,StreamId::compute,s->acoustic_sequence};
+  x.dependencies=&c->data.dependencies;
+  x.corner_service=dispatch.corner_edge_service;
+
+  int rc=validate_execution_context(x,e);
+  if(rc){ c->data.phase=ContextPhase::failed; return rc; }
+
+  // Only stages with a real, wired CUDA implementation are invoked.
+  // cgrid_predictor, cgrid_vertical_solver, dgrid_dynamics,
+  // dgrid_height_transport, and dgrid_height remain intentionally null in the
+  // production dispatch table built for this milestone (no adapter/kernel is
+  // integrated yet) and are skipped rather than treated as an orchestration
+  // error. Any stage that IS wired must fully succeed or the step fails --
+  // there is no silent host fallback inside this CUDA path.
+  const LaunchFn stages[]={dispatch.cgrid_pressure,dispatch.vertical_solver,dispatch.nh_pressure,dispatch.post_loop_heating};
+  for(LaunchFn stage:stages){
+    if(!stage) continue;
+    rc=stage(x,e);
+    if(rc!=FV3_GPU_SUCCESS){ c->data.phase=ContextPhase::failed; return rc; }
+  }
+
+  *ev=issue_event(c->data);
+  return FV3_GPU_SUCCESS;
+}
 extern "C" int fv3_gpu_event_wait(fv3_gpu_context *c,fv3_gpu_event ev,fv3_gpu_error *e){using namespace fv3::gpu;clear_error(e);if(!c||!ev||ev>c->data.last_event)return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"unknown event");
 #ifdef FV3_GPU_ENABLE_CUDA
   return cuda_fail(cudaStreamSynchronize((cudaStream_t)c->data.transfer_stream),e,__func__,&c->data);

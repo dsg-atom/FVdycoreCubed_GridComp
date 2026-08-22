@@ -202,4 +202,15 @@ struct NumericalDispatch {
 int validate_execution_context(const ExecutionContext &, fv3_gpu_error *) noexcept;
 int validate_dispatch(const NumericalDispatch &, fv3_gpu_error *) noexcept;
 
+/* Milestone 3A.1 plumbing: these three are C++-only setters (not part of the
+ * public C ABI) that let integration/test code populate state the existing
+ * contract layer already reads but that no current API can write:
+ * NumericalDispatch (production kernel wiring), NumericalConfig (WP-D/WP-C
+ * gating fields), and single-rank halo readiness (bypasses real MPI halo
+ * exchange; acceptable only under the project's Stage 1 host-staged-MPI
+ * policy, never a substitute for it in multi-rank runs). */
+int set_numerical_dispatch(fv3_gpu_context *, const NumericalDispatch &, fv3_gpu_error *) noexcept;
+int set_numerical_config(fv3_gpu_context *, const NumericalConfig &, fv3_gpu_error *) noexcept;
+int mark_halo_ready(fv3_gpu_context *, fv3_gpu_halo_group, fv3_gpu_error *) noexcept;
+
 }

@@ -12,6 +12,7 @@ struct ContextData {
   TopologyView topology;
   DispatchParams dispatch_params;
   DependencyState dependencies;
+  NumericalDispatch dispatch;
   void *compute_stream = nullptr;
   void *transfer_stream = nullptr;
   uint64_t next_event = 1;
