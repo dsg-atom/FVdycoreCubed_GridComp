@@ -6,3 +6,5 @@
 /gtFV3
 /gtFV3@
 __pycache__
+build_cuda_r4/
+build_cuda_r8/
