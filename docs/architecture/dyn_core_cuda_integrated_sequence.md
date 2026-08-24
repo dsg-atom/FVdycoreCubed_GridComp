@@ -117,6 +117,41 @@ Per the Gate A architecture documents, the acoustic substep ordering is:
 | `mix_dp` | WP-B | `wp_b_kernels.hpp` | — | `delp/pt/w`, `ak/bk` | Repaired state | Column-local | COMPLETE | PASS | PASS | NOT RUN | NOT RUN | NOT RUN |
 | `H_DSCALAR` | WP-E | `DependencyState::mark_stale` | — | `delp/pt/q_con` | — | Scalar group | COMPLETE | PASS | PASS | NOT RUN | NOT RUN | NOT RUN |
 
+> **Milestone 3A.3 annotation (2026-08-24):** Before this milestone, `cuda/dyn_core/dgrid/wp_b_kernels.hpp`
+> contained **zero** `__global__`/`__device__` CUDA code (confirmed by direct grep) and
+> `tests/dgrid/test_wp_b_kernels.cpp` never called `xppm_hord6`, `yppm_hord6`, `fv_tp_2d_hord6`,
+> `deln_flux_transport`, `contravariant_edge_corrections`, or `transport_service_for_update_dz`
+> directly. The `COMPLETE`/`PASS`/`PASS` marks on the rows above described **presence of translated
+> host C++ code**, not tested CUDA behavior, and are corrected here rather than deleted:
+>
+> - **Y-X / X-Y sequencing** (row: `fv_tp_2d_hord6`) and **ra_x / ra_y corrections**: now
+>   **CUDA: PASS, GPU: PASS** — real `__global__` kernels implemented in
+>   `dgrid/wp_b_cuda.cu`, GPU-executed on an A100 via
+>   `tests/dgrid/test_wp_b_cuda_smoke.cpp` Part 1, `compute-sanitizer --tool memcheck` clean,
+>   both R4/R8. See `docs/agent_handoff/milestone_3a3_wp_b_cuda.md`. PPM order-6 reconstruction
+>   logic is embedded directly in the `fv_tp_2d_hord6` kernel path (no separate
+>   `xppm_hord6_kernel`/`yppm_hord6_kernel` were needed — a deviation from the originally
+>   planned file list); it is therefore also GPU EXECUTED as part of Part 1, but only for
+>   `hord_tm=6` (positive). The **negative-hord clamping branch** (row: "Negative hord
+>   positivity") was NOT exercised (no negative-hord call was made this milestone) and remains
+>   `CUDA: NOT RUN`.
+> - **deln_flux damping**: `launch_deln_flux_transport_cuda` is implemented and GPU-executed
+>   in isolation (`test_wp_b_cuda_smoke.cpp` Part 2, `has_mass=false` path, sanitizer-clean,
+>   both precisions) — **CUDA: PASS (isolated only)**. It is **NOT wired** into
+>   `launch_dgrid_height_transport_cuda`'s production path: `NumericalConfig` has no field
+>   identifiable as the Fortran `vtdm4`-derived `damp_c` coefficient (confirmed by full
+>   re-read of the struct), so the mapping from `vtdm4>0` to a `damp_c` value is an open
+>   ambiguity, not a resolved translation decision. See handoff, "damp_c mapping ambiguity".
+> - **Mass transport (`hord_dp=-6`)**, **Contravariant edges**, and **Scalar transport
+>   (`pt/w/q_con`, `hord_tm=6`)**: still **CUDA: NOT RUN**. The new kernels this milestone are
+>   scoped to the single scalar field `zh` (WP-C's `update_dz_d` dependency,
+>   `dgrid_height_transport`), not the general D-grid dynamics dispatch slot
+>   (`dgrid_dynamics`, still `nullptr`). Generalizing to arbitrary scalars/mass fields is
+>   staged as WP-B.2 in the handoff; momentum/vorticity/damping/edges remain WP-B.3/B.4.
+> - **Fortran cross-check: NOT POSSIBLE** for any of the above — `@fvdycore`/authoritative
+>   GFDL Fortran is not populated in this checkout (not cloned, per `discover_platform.md`).
+>   All translations were checked only against the existing host C++ in `wp_b_kernels.hpp`.
+
 ### WP-C D-grid height/vertical (GEOS production path)
 
 | Fortran stage | WP | Entry point | Config | Input | Output | Halo | Status | R4 | R8 | CUDA | GPU | Savepoint |
@@ -130,6 +165,23 @@ Per the Gate A architecture documents, the acoustic substep ordering is:
 | Workspace layout | WP-C | `VerticalWorkspaceLayout` | `km=72` | — | 2716 scalars/column | — | COMPLETE | PASS | PASS | NOT RUN | NOT RUN | NOT RUN |
 | `H_ZH` | WP-E | `DependencyState::mark_stale` | — | `zh` | — | A/interface | COMPLETE | PASS | PASS | NOT RUN | NOT RUN | NOT RUN |
 | `H_PKC2` | WP-E | `DependencyState::mark_stale` | — | `pkc` | — | Two-cell | COMPLETE | PASS | PASS | NOT RUN | NOT RUN | NOT RUN |
+
+> **Milestone 3A.3 annotation (2026-08-24):** `dgrid_height_transport` (row: `update_dz_d
+> transport`) is now wired into the production `NumericalDispatch` table
+> (`runtime/fv3_gpu_production_dispatch.cu`) and confirmed **CUDA: PASS, GPU: PASS** —
+> `tests/dgrid/test_wp_b_cuda_smoke.cpp` Part 3 calls `fv3::gpu::vertical::launch_update_dz_d`
+> directly (not through `fv3_gpu_dyn_core_step`, which never calls it) with the real production
+> dispatch table and confirms `zh` genuinely changes end-to-end through WP-C → WP-B, both
+> R4/R8, `compute-sanitizer` clean. The `update_dz_d post-transport` row
+> (`height_boundary_v2_kernel`) was exercised in the same Part 3 call (it runs immediately
+> after the WP-B transport call inside `launch_update_dz_d`) and is likewise now
+> **CUDA: PASS, GPU: PASS**. Prior to this milestone, `launch_update_dz_d` had **zero callers**
+> anywhere in the codebase (not from `fv3_gpu_dyn_core_step`, not from any test) — this is a
+> pre-existing integration gap, not something introduced or fixed by 3A.3; it is worked around
+> here by calling `launch_update_dz_d` directly from the test, which is sufficient to
+> demonstrate GPU EXECUTED status but does not by itself wire it into the main per-substep
+> dispatch loop. Numerical validation against authoritative Fortran remains NOT RUN/NOT
+> POSSIBLE (source absent) for both rows.
 
 ### WP-D pressure operators
 
