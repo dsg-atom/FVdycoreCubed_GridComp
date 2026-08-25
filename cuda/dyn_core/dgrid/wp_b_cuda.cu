@@ -1,47 +1,14 @@
 #include "dgrid/wp_b_cuda.cuh"
+// PPM constants, plan2d/launch_status, level_active, the mord=6 seam
+// predicates and as_const now live here so Milestone 3A.6's momentum
+// translation unit shares one definition of each instead of restating them.
+#include "dgrid/wp_b_ppm_shared.cuh"
 
 #include <cmath>
 #include <cstdint>
 
 namespace fv3::gpu::dgrid {
 namespace {
-
-// tp_core.F90:89-96 PPM reconstruction constants.
-__device__ __forceinline__ fv_real ppm_p1() { return fv_real(7.0 / 12.0); }
-__device__ __forceinline__ fv_real ppm_p2() { return fv_real(-1.0 / 12.0); }
-__device__ __forceinline__ fv_real ppm_c1() { return fv_real(-2.0 / 14.0); }
-__device__ __forceinline__ fv_real ppm_c2() { return fv_real(11.0 / 14.0); }
-__device__ __forceinline__ fv_real ppm_c3() { return fv_real(5.0 / 14.0); }
-
-// nh_utils.F90:280 damping threshold.
-__device__ __forceinline__ fv_real damp_threshold() { return fv_real(1.0e-5); }
-
-struct Launch2D {
-  dim3 block, grid;
-};
-
-Launch2D plan2d(int64_t ni, int64_t nj, int64_t nk) {
-  Launch2D p;
-  p.block = dim3(16, 16, 1);
-  p.grid = dim3(static_cast<unsigned>((ni + 15) / 16),
-               static_cast<unsigned>((nj + 15) / 16), static_cast<unsigned>(nk));
-  return p;
-}
-
-fv3_gpu_status launch_status() {
-  return cudaPeekAtLastError() == cudaSuccess ? FV3_GPU_SUCCESS : FV3_GPU_INTERNAL_ERROR;
-}
-
-// --- per-level activation ------------------------------------------------
-__device__ __forceinline__ bool level_active(const LevelFilter &f, int64_t k) {
-  if (f.mode == 0) return true;
-  const int64_t kk = k < f.npz ? k : f.npz - 1;   // damp(km+1) = damp(km)
-  const bool damped = f.damp(kk) > damp_threshold();
-  if (f.mode == 1) return damped;
-  if (f.mode == 2) return !damped;
-  const int64_t nord = static_cast<int64_t>(llrint(static_cast<double>(f.ndif(kk))));
-  return damped && nord == static_cast<int64_t>(f.nord_sel);
-}
 
 // --- edge_profile (nh_utils.F90:1595-1629, uniform_grid = .false.) -------
 // gam(i,k) in the Fortran is independent of i (bet and gk depend only on dp0
@@ -259,28 +226,6 @@ __device__ __forceinline__ fv_real al_y_at(View3<const fv_real> q,
   }
   if (negative_hord && al < fv_real(0)) al = fv_real(0);
   return al;
-}
-
-// tp_core.F90:532-541 / 936-950: at the two cells adjacent to a panel seam the
-// mord=6 smoothness test degrades to the mord=5 sign test.
-__device__ __forceinline__ bool smt5_from(fv_real bl, fv_real br, fv_real b0,
-                                          bool seam_cell) {
-  if (seam_cell) return bl * br < fv_real(0);
-  return fv_real(3) * fabs(b0) < fabs(bl - br);
-}
-
-__device__ __forceinline__ bool seam_cell_x(int64_t i, const TransportBounds &b) {
-  if (!(b.cubed_sphere && !b.nested)) return false;
-  if (b.west_edge && (i == 0 || i == 1)) return true;
-  if (b.east_edge && (i == b.npx - 1 || i == b.npx)) return true;
-  return false;
-}
-
-__device__ __forceinline__ bool seam_cell_y(int64_t j, const TransportBounds &b) {
-  if (!(b.cubed_sphere && !b.nested)) return false;
-  if (b.south_edge && (j == 0 || j == 1)) return true;
-  if (b.north_edge && (j == b.npy - 1 || j == b.npy)) return true;
-  return false;
 }
 
 // mord = 6 face flux (tp_core.F90:524-555). Interior arithmetic is unchanged
@@ -668,10 +613,6 @@ __global__ void deln_add_mass_kernel(TransportBounds b, LevelFilter lf, bool alo
   const fv_real m_lo = along_x ? mass(i - 1, j, k) : mass(i, j - 1, k);
   flux(i, j, k) =
       flux(i, j, k) + damp2 * (m_lo + mass(i, j, k)) * flux2(i, j, k);
-}
-
-View3<const fv_real> as_const(const View3<fv_real> &v) {
-  return View3<const fv_real>{v.data, v.lo_i, v.lo_j, v.lo_k, v.si, v.sj, v.sk};
 }
 
 } // namespace

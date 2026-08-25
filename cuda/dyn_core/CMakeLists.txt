@@ -79,8 +79,14 @@ if(FV3_DYN_CORE_ENABLE_CUDA)
   target_link_libraries(fv3_wp_d_cuda PUBLIC fv3_wp_d_operators CUDA::cudart)
   set_target_properties(fv3_wp_d_cuda PROPERTIES CUDA_STANDARD 17)
 
-  # Milestone 3A.3: WP-B D-grid height-transport CUDA sources
-  add_library(fv3_wp_b_cuda STATIC dgrid/wp_b_cuda.cu dgrid/wp_b_contract_cuda.cpp)
+  # Milestone 3A.3/3A.5: WP-B D-grid height + scalar transport CUDA sources.
+  # Milestone 3A.6 adds dgrid/wp_b_momentum_cuda.cu (WP-B.3 momentum
+  # transport). Both .cu files share dgrid/wp_b_ppm_shared.cuh so the PPM
+  # constants, seam predicates and launch helpers have one definition.
+  add_library(fv3_wp_b_cuda STATIC
+    dgrid/wp_b_cuda.cu
+    dgrid/wp_b_momentum_cuda.cu
+    dgrid/wp_b_contract_cuda.cpp)
   target_include_directories(fv3_wp_b_cuda PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/dgrid
@@ -246,6 +252,33 @@ if(BUILD_TESTING)
     add_test(NAME fv3_wp_b2_scalar_transport
       COMMAND fv3_wp_b2_scalar_transport_test)
     set_tests_properties(fv3_wp_b2_scalar_transport PROPERTIES
+      LABELS "gpu"
+      SKIP_RETURN_CODE 77
+    )
+
+    # Milestone 3A.6 WP-B.3 authoritative momentum transport CUDA behavior test
+    # (requires CUDA and GPU). Every part compares the CUDA result against an
+    # independent host transcription written directly from sw_core.F90 -- the
+    # GPU code is never compared against itself.
+    # Parts A-J: xtp_u interior, ytp_v interior, xtp_u panel edge, ytp_v panel
+    # edge, vb/ub construction + D-wind update, kinetic-energy terms including
+    # the four-corner fix, cubed-sphere seam/corner liveness, a
+    # precision-sensitive near-tie case, hord_mt sign equivalence, and
+    # unsupported-configuration rejection.
+    add_executable(fv3_wp_b3_momentum_test
+      tests/dgrid/test_wp_b3_momentum_cuda.cpp)
+    target_include_directories(fv3_wp_b3_momentum_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+      ${CMAKE_CURRENT_SOURCE_DIR}/dgrid
+    )
+    target_link_libraries(fv3_wp_b3_momentum_test PRIVATE
+      fv3_dyn_core_gpu
+      fv3_wp_b_cuda
+      CUDA::cudart
+    )
+    # This test requires a GPU to run - mark as needing GPU label
+    add_test(NAME fv3_wp_b3_momentum COMMAND fv3_wp_b3_momentum_test)
+    set_tests_properties(fv3_wp_b3_momentum PROPERTIES
       LABELS "gpu"
       SKIP_RETURN_CODE 77
     )

@@ -22,13 +22,20 @@ int fv3_build_production_dispatch(NumericalDispatch &out, fv3_gpu_error *e) noex
   d.cgrid_predictor = nullptr;
   d.cgrid_vertical_solver = nullptr;
   d.cgrid_pressure = &fv3::gpu::cgrid::launch_cgrid_pressure_v3;
-  // Still nullptr after Milestone 3A.5. WP-B.2 landed the reusable arbitrary
-  // scalar transport service (launch_scalar_transport_cuda), but d_sw also needs
-  // momentum/vorticity transport, divergence damping, the kinetic-energy /
-  // heat-source terms and the order-critical pt/delp/w state updates before this
+  // Still nullptr after Milestone 3A.6. Three of d_sw's slices now exist as
+  // reusable internal WP-B services:
+  //   3A.4 -- update_dz_d height transport (launch_dgrid_height_transport_cuda)
+  //   3A.5 -- arbitrary scalar transport   (launch_scalar_transport_cuda)
+  //   3A.6 -- momentum transport           (launch_xtp_u_cuda / launch_ytp_v_cuda,
+  //           the vb/ub constructions, the kinetic-energy terms, the vorticity
+  //           precursor and the D-wind update)
+  // d_sw additionally needs divergence damping (delpc/divg_d/smag_corner), the
+  // d_con heat-source/diss_est block, the damp_v del6_vt_flux diffusive-flux
+  // add, the generalized corner_edge_service and the order-critical
+  // pt/delp/w state updates plus the cx/cy/xflux/yflux accumulation before this
   // slot can be populated. Wiring a partial dgrid_dynamics would let the
   // production path silently skip those stages, so it stays unwired until
-  // WP-B.3/WP-B.5 complete it.
+  // WP-B.4/WP-B.5 complete the ordered d_sw path.
   d.dgrid_dynamics = nullptr;
   // Milestone 3A.4: the authoritative update_dz_d transport body
   // (nh_utils.F90:255-305) -- edge_profile -> ra_x/ra_y -> per-level
