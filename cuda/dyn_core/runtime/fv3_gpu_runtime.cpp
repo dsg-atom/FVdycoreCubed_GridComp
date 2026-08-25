@@ -138,7 +138,20 @@ extern "C" int fv3_gpu_initialize_state(fv3_gpu_context *c, const fv3_gpu_state_
   { uint64_t ni=(uint64_t)(c->data.create.ie-c->data.create.is+1+2*c->data.create.halo_width),nj=(uint64_t)(c->data.create.je-c->data.create.js+1+2*c->data.create.halo_width),cells=0,values=0;
     if(mul_overflow(ni,nj,cells)||mul_overflow(cells,(uint64_t)c->data.create.npz+1,values)){fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"workspace dimension overflow");goto rollback;}
     uint64_t value_bytes=0,cgrid_bytes=0,transport_bytes=0,vertical_bytes=0,operator_bytes=0;
-    if(mul_overflow(values,sizeof(fv_real),value_bytes)||mul_overflow(value_bytes,12,cgrid_bytes)||mul_overflow(value_bytes,24,transport_bytes)||mul_overflow(value_bytes,16,vertical_bytes)||mul_overflow(value_bytes,12,operator_bytes)){fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"workspace byte-size overflow");goto rollback;}
+    /* WorkspaceId::transport is sized in whole (ni x nj x npz+1) fv_real
+     * arrays. It is shared, sequentially, by every WP-B service:
+     *   Milestone 3A.4 update_dz_d height transport -- 17 arrays
+     *   Milestone 3A.8 d_sw driver                  -- 34 arrays
+     * The d_sw figure is WpBDSwArena::array_count (dgrid/wp_b_dsw_cuda.cuh),
+     * which enumerates every sw_core.F90 local that is not a registered field:
+     * ub/vb/wk/ke/vort/fx/fy/gx/gy/ra_x/ra_y/fx2/fy2/dw (14), the fv_tp_2d +
+     * deln_flux scratch reused across the delp/w/pt/vort transports (7), the
+     * PPM momentum workspace (4), smag_corner's private locals plus a2b_ord4
+     * scratch (8) and one slot subdivided into the per-level derived
+     * coefficient arrays (1). The binder re-checks the slice against that
+     * constant, so a stale literal here fails loudly instead of corrupting
+     * neighbouring scratch. */
+    if(mul_overflow(values,sizeof(fv_real),value_bytes)||mul_overflow(value_bytes,12,cgrid_bytes)||mul_overflow(value_bytes,34,transport_bytes)||mul_overflow(value_bytes,16,vertical_bytes)||mul_overflow(value_bytes,12,operator_bytes)){fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"workspace byte-size overflow");goto rollback;}
     WorkspaceRequest requests[]={{WorkspaceId::cgrid,cgrid_bytes,256},{WorkspaceId::transport,transport_bytes,256},{WorkspaceId::vertical,vertical_bytes,256},{WorkspaceId::operators,operator_bytes,256}};
     if(build_workspace_layout(requests,4,c->data.workspace.layout,e)!=0)goto rollback;if(cudaMalloc(&c->data.workspace.allocation,c->data.workspace.layout.total_bytes)!=cudaSuccess)goto rollback;
     for(auto &slice:c->data.workspace.layout.slices)slice.data=(char*)c->data.workspace.allocation+slice.offset; }
@@ -206,14 +219,38 @@ extern "C" int fv3_gpu_dyn_core_step(fv3_gpu_context *c,const fv3_gpu_step_desc 
   int rc=validate_execution_context(x,e);
   if(rc){ c->data.phase=ContextPhase::failed; return rc; }
 
-  // Only stages with a real, wired CUDA implementation are invoked.
-  // cgrid_predictor, cgrid_vertical_solver, dgrid_dynamics,
-  // dgrid_height_transport, and dgrid_height remain intentionally null in the
-  // production dispatch table built for this milestone (no adapter/kernel is
-  // integrated yet) and are skipped rather than treated as an orchestration
-  // error. Any stage that IS wired must fully succeed or the step fails --
-  // there is no silent host fallback inside this CUDA path.
-  const LaunchFn stages[]={dispatch.cgrid_pressure,dispatch.vertical_solver,dispatch.nh_pressure,dispatch.post_loop_heating};
+  // Stage order follows dyn_core.F90's acoustic body: the C-grid predictor
+  // group, then the D-grid dynamics (d_sw), then the vertical/nonhydrostatic
+  // solve, then the pressure and post-loop operators. Only stages with a real,
+  // wired CUDA implementation are invoked; a null slot is skipped rather than
+  // treated as an orchestration error. Any stage that IS wired must fully
+  // succeed or the step fails -- there is no silent host fallback inside this
+  // CUDA path.
+  //
+  // Milestone 3A.8 adds dispatch.dgrid_dynamics (WP-B.5's complete d_sw
+  // driver). Still intentionally null in the production table:
+  //   cgrid_predictor, cgrid_vertical_solver -- no CUDA adapter integrated yet
+  //   dgrid_height                           -- ditto
+  // dgrid_height_transport IS wired, but it is not a free-standing acoustic
+  // stage: it is the horizontal-transport body of WP-C's update_dz_d, and the
+  // only caller is launch_update_dz_d (vertical/fv3_vertical_kernels.cu:172),
+  // which takes the dispatch table as an argument. Listing it here would
+  // transport zh a second time per substep, so it stays out.
+  //
+  // Be precise about what that means today: launch_vertical_solver does NOT
+  // call launch_update_dz_d, so nothing on this list reaches
+  // dgrid_height_transport. The slot is IMPLEMENTED and separately GPU
+  // EXECUTED (Milestone 3A.4's focused test), but it is not yet reached
+  // through fv3_gpu_dyn_core_step. That is a Gate C1 item, not a claim to
+  // make here.
+  //
+  // NOTE: this list is walked ONCE per fv3_gpu_dyn_core_step call, so one call
+  // advances one acoustic substep. The n_split acoustic loop is not implemented
+  // in the runtime yet (the d_sw binder divides dispatch_params->dt by n_split
+  // exactly as dyn_core.F90:297 does). That remains a Gate C1 item.
+  const LaunchFn stages[]={dispatch.cgrid_predictor,dispatch.cgrid_vertical_solver,dispatch.cgrid_pressure,
+                           dispatch.dgrid_dynamics,dispatch.vertical_solver,dispatch.nh_pressure,
+                           dispatch.post_loop_heating};
   for(LaunchFn stage:stages){
     if(!stage) continue;
     rc=stage(x,e);

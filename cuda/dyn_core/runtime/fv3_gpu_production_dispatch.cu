@@ -22,8 +22,8 @@ int fv3_build_production_dispatch(NumericalDispatch &out, fv3_gpu_error *e) noex
   d.cgrid_predictor = nullptr;
   d.cgrid_vertical_solver = nullptr;
   d.cgrid_pressure = &fv3::gpu::cgrid::launch_cgrid_pressure_v3;
-  // Still nullptr after Milestone 3A.7. Four of d_sw's slices now exist as
-  // reusable internal WP-B services:
+  // Milestone 3A.8 (WP-B.5) populates this slot. It was deliberately nullptr
+  // through 3A.7, when only d_sw's individual slices existed:
   //   3A.4 -- update_dz_d height transport (launch_dgrid_height_transport_cuda)
   //   3A.5 -- arbitrary scalar transport   (launch_scalar_transport_cuda)
   //   3A.6 -- momentum transport           (launch_xtp_u_cuda / launch_ytp_v_cuda,
@@ -32,15 +32,21 @@ int fv3_build_production_dispatch(NumericalDispatch &out, fv3_gpu_error *e) noex
   //   3A.7 -- divergence damping           (both nord_k branches, the two
   //           fill_corners rotations, smag_corner, the d_con heat-source chain
   //           and the damp_v del6_vt_flux add -- wp_b_divergence_cuda.cuh)
-  // What d_sw still needs before this slot can be populated is WP-B.5: the
-  // generalized corner_edge_service and the order-critical pt/delp/w state
-  // updates plus the cx/cy/xflux/yflux accumulation, and then the single
-  // ordered driver that calls the four services above in d_sw's own sequence
-  // with the per-level nord_k/damp_vt/d_con selectors that dyn_core.F90:697-760
-  // recomputes inside the k loop. Wiring a partial dgrid_dynamics would let the
-  // production path silently skip stages, so it stays unwired until WP-B.5
-  // completes the ordered d_sw path.
-  d.dgrid_dynamics = nullptr;
+  // Wiring a PARTIAL dgrid_dynamics would have let the production path silently
+  // skip stages, so the rule was: not until the complete ordered driver exists.
+  //
+  // It now does. launch_d_sw_cuda (dgrid/wp_b_dsw_cuda.cuh) executes the full
+  // sw_core.F90 d_sw sequence S1..S38 -- the four services above plus the twelve
+  // driver-owned kernels (contravariant/edge/corner winds, advective-flux
+  // finalize, the joint pt/delp update, the w chain, the flux capacitors and the
+  // heat_source reset) -- with the per-level nord_k / nord_v / nord_w / damp_vt /
+  // damp_w / damp_t / d_con / kgb selectors that dyn_core.F90:699-765 recomputes
+  // inside its k loop, so both divergence-damping branch families can be live in
+  // one call. Anything it has not been validated against
+  // (grid_type != 0, nested, hydrostatic, hord_* other than the production
+  // first-run set, a_imp != 1, inline_q, use_cond, do_f3d, do_skeb, rot3) is
+  // rejected with FV3_GPU_UNSUPPORTED_CONFIGURATION before it mutates any state.
+  d.dgrid_dynamics = &fv3::gpu::dgrid::launch_dgrid_dynamics_cuda;
   // Milestone 3A.4: the authoritative update_dz_d transport body
   // (nh_utils.F90:255-305) -- edge_profile -> ra_x/ra_y -> per-level
   // damped/undamped split -> fv_tp_2d -> del6_vt_flux -> area-weighted height

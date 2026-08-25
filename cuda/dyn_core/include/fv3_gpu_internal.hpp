@@ -25,6 +25,28 @@ enum class FieldId : uint32_t {
   grid_lonlat, agrid_lonlat, edge_w, edge_e, edge_s, edge_n,
   damping_d2_bg, damping_d4_bg, damping_v, damping_w, damping_t,
   damping_kgb, damping_ndif,
+  /* Milestone 3A.8 (WP-B.5) additions. dyn_core.F90:699-765 recomputes FOUR
+   * per-level damping controls inside its k loop that had no registered home:
+   *
+   *   nord_k   :702, forced to 0 by all three sponge branches (:743,:753,:760)
+   *   nord_w   :714, forced to 0 by all three sponge branches
+   *   d_con_k  :719, forced to 0 by all three sponge branches
+   *
+   * damping_ndif already carries nord_v(k) (:713, forced to 0 by sponge
+   * branches 1 and 2 only, and only when do_vort_damp). nord_t (:715) is NOT
+   * reset by any sponge branch, so it is genuinely scalar and stays in
+   * NumericalConfig::nord_t; the three above are genuinely per level.
+   *
+   * Collapsing any of them onto a NumericalConfig scalar would silently destroy
+   * the sponge behaviour that makes both divergence-damping branch families
+   * live in one production run, which is exactly the per-level requirement this
+   * milestone must preserve.
+   *
+   * Appended at the end of the enum on purpose: field_id_from_abi is the
+   * identity mapping (runtime/fv3_gpu_contract.cpp), so every previously
+   * assigned ABI id keeps its value and this is a purely additive contract
+   * change -- internal_contract_version does not move. */
+  damping_nord_k, damping_nord_w, damping_d_con,
   count
 };
 

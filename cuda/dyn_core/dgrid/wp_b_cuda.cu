@@ -526,15 +526,29 @@ __global__ void zh_update_kernel(TransportBounds b, LevelFilter lf,
 // changes no value that is read downstream (the extra ring feeds only
 // copy_corners destinations outside every fx2/fy2 read box). Doing so keeps
 // compute-sanitizer initcheck clean instead of importing an uninitialised read.
+//
+// Milestone 3A.8: `damp_level` is the optional per-level form of `damp_coef`.
+// When its data pointer is null the scalar value is used, so the Milestone 3A.5
+// path is unchanged; when it is set the coefficient is read at the same clamped
+// level index level_active uses, keeping activation and coefficient consistent.
+__device__ __forceinline__ fv_real deln_coef_at(const LevelFilter &lf, fv_real scalar,
+                                                View1<const fv_real> damp_level,
+                                                int64_t k) {
+  if (damp_level.data == nullptr) return scalar;
+  const int64_t kk = k < lf.npz ? k : lf.npz - 1;
+  return damp_level(kk);
+}
+
 __global__ void deln_init_kernel(TransportBounds b, LevelFilter lf, bool mass_weighted,
-                                 fv_real damp_coef, View3<const fv_real> q,
-                                 View3<fv_real> d2) {
+                                 fv_real damp_coef, View1<const fv_real> damp_level,
+                                 View3<const fv_real> q, View3<fv_real> d2) {
   const int64_t i = (b.is - b.ng) + blockIdx.x * blockDim.x + threadIdx.x;
   const int64_t j = (b.js - b.ng) + blockIdx.y * blockDim.y + threadIdx.y;
   const int64_t k = blockIdx.z;
   if (i > b.ie + b.ng || j > b.je + b.ng || k >= b.nk) return;
   if (!level_active(lf, k)) return;
-  d2(i, j, k) = mass_weighted ? q(i, j, k) : damp_coef * q(i, j, k);
+  const fv_real damp = deln_coef_at(lf, damp_coef, damp_level, k);
+  d2(i, j, k) = mass_weighted ? q(i, j, k) : damp * q(i, j, k);
 }
 
 // tp_core.F90:1316-1330 (first pass) and 1345-1368 (iteration passes). The two
@@ -600,8 +614,13 @@ __global__ void deln_add_no_mass_kernel(TransportBounds b, LevelFilter lf, bool 
 // tp_core.F90:1373-1384 (`present(mass)`): damp2 = 0.5*damp and the diffusive
 // flux is weighted by the two masses straddling the face. The mass neighbour is
 // taken along the flux direction: (i-1,j)/(i,j) for x, (i,j-1)/(i,j) for y.
+//
+// Milestone 3A.8: `damp2` carries 0.5*damp_coef for the scalar path; when
+// `damp_level` is set the 0.5 factor is applied here instead so the array can
+// hold the same coefficient deln_init_kernel consumes.
 __global__ void deln_add_mass_kernel(TransportBounds b, LevelFilter lf, bool along_x,
-                                     fv_real damp2, View3<const fv_real> mass,
+                                     fv_real damp2, View1<const fv_real> damp_level,
+                                     View3<const fv_real> mass,
                                      View3<const fv_real> flux2, View3<fv_real> flux) {
   const int64_t i = b.is + blockIdx.x * blockDim.x + threadIdx.x;
   const int64_t j = b.js + blockIdx.y * blockDim.y + threadIdx.y;
@@ -610,9 +629,13 @@ __global__ void deln_add_mass_kernel(TransportBounds b, LevelFilter lf, bool alo
   const int64_t hi_j = along_x ? b.je : b.je + 1;
   if (i > hi_i || j > hi_j || k >= b.nk) return;
   if (!level_active(lf, k)) return;
+  const fv_real half_damp =
+      damp_level.data == nullptr
+          ? damp2
+          : fv_real(0.5) * deln_coef_at(lf, damp2, damp_level, k);
   const fv_real m_lo = along_x ? mass(i - 1, j, k) : mass(i, j - 1, k);
   flux(i, j, k) =
-      flux(i, j, k) + damp2 * (m_lo + mass(i, j, k)) * flux2(i, j, k);
+      flux(i, j, k) + half_damp * (m_lo + mass(i, j, k)) * flux2(i, j, k);
 }
 
 } // namespace
@@ -875,31 +898,30 @@ fv3_gpu_status launch_zh_update_cuda(const TransportBounds &b, const LevelFilter
   return launch_status();
 }
 
-fv3_gpu_status launch_deln_flux_transport_cuda(
-    const TransportBounds &b, int32_t nord, fv_real damp_c, fv_real da_min,
-    bool mass_weighted, const LevelFilter &lf, View3<const fv_real> q,
-    View3<const fv_real> mass, View2<const fv_real> del6_u, View2<const fv_real> del6_v,
-    View2<const fv_real> rarea, View3<fv_real> fx, View3<fv_real> fy, View3<fv_real> d2,
-    View3<fv_real> fx2, View3<fv_real> fy2, void *stream) noexcept {
+// One complete deln_flux sequence at a single loop-nest order `nord`.
+//
+// Split out at Milestone 3A.8 so the scalar entry point and the per-level entry
+// point share one transcription of tp_core.F90:1263-1394 rather than two. The
+// only difference between them is how the coefficient reaches the two kernels
+// that consume it: `damp_coef` (scalar, precomputed by the caller) or
+// `damp_level` (per level, precomputed on device by the driver).
+namespace {
+fv3_gpu_status deln_flux_pass(const TransportBounds &b, int32_t nord, fv_real damp_coef,
+                              View1<const fv_real> damp_level, bool mass_weighted,
+                              const LevelFilter &lf, View3<const fv_real> q,
+                              View3<const fv_real> mass, View2<const fv_real> del6_u,
+                              View2<const fv_real> del6_v, View2<const fv_real> rarea,
+                              View3<fv_real> fx, View3<fv_real> fy, View3<fv_real> d2,
+                              View3<fv_real> fx2, View3<fv_real> fy2,
+                              void *stream) noexcept {
   const int64_t is = b.is, ie = b.ie, js = b.js, je = b.je;
   auto s = static_cast<cudaStream_t>(stream);
-
-  // The stencil reaches 1 + nord cells into the halo and copy_corners rotates
-  // only ng rings, so nord > ng - 1 would read un-rotated corner data no matter
-  // how much halo the caller registered. Fortran cannot produce it either:
-  // dyn_core.F90:713/716 set nord_v(k)/nord_t = min(2, nord).
-  if (nord < 0 || nord > static_cast<int32_t>(b.ng) - 1)
-    return FV3_GPU_UNSUPPORTED_CONFIGURATION;
-
-  // tp_core.F90:213/231 -- fv_tp_2d forms this immediately before the call.
-  // This is the coefficient rule that distinguishes deln_flux from
-  // del6_vt_flux, which uses the raw per-level damp(k) instead.
-  const fv_real damp_coef = std::pow(damp_c * da_min, static_cast<fv_real>(nord + 1));
 
   // tp_core.F90:1274-1287
   {
     Launch2D p = plan2d((ie + b.ng) - (is - b.ng) + 1, (je + b.ng) - (js - b.ng) + 1, b.nk);
-    deln_init_kernel<<<p.grid, p.block, 0, s>>>(b, lf, mass_weighted, damp_coef, q, d2);
+    deln_init_kernel<<<p.grid, p.block, 0, s>>>(b, lf, mass_weighted, damp_coef,
+                                                damp_level, q, d2);
   }
 
   // Rotation 1 of 2 + 2*nord (tp_core.F90:1313). Guarded on nord > 0 exactly as
@@ -968,13 +990,13 @@ fv3_gpu_status launch_deln_flux_transport_cuda(
     const fv_real damp2 = fv_real(0.5) * damp_coef;
     {
       Launch2D p = plan2d(ie - is + 2, je - js + 1, b.nk);
-      deln_add_mass_kernel<<<p.grid, p.block, 0, s>>>(b, lf, true, damp2, mass,
-                                                      as_const(fx2), fx);
+      deln_add_mass_kernel<<<p.grid, p.block, 0, s>>>(b, lf, true, damp2, damp_level,
+                                                      mass, as_const(fx2), fx);
     }
     {
       Launch2D p = plan2d(ie - is + 1, je - js + 2, b.nk);
-      deln_add_mass_kernel<<<p.grid, p.block, 0, s>>>(b, lf, false, damp2, mass,
-                                                      as_const(fy2), fy);
+      deln_add_mass_kernel<<<p.grid, p.block, 0, s>>>(b, lf, false, damp2, damp_level,
+                                                      mass, as_const(fy2), fy);
     }
   } else {
     {
@@ -987,6 +1009,58 @@ fv3_gpu_status launch_deln_flux_transport_cuda(
     }
   }
   return launch_status();
+}
+
+// The stencil reaches 1 + nord cells into the halo and copy_corners rotates only
+// ng rings, so nord > ng - 1 would read un-rotated corner data no matter how
+// much halo the caller registered. Fortran cannot produce it either:
+// dyn_core.F90:713/716 set nord_v(k)/nord_t = min(2, nord).
+bool deln_nord_supported(const TransportBounds &b, int32_t nord) noexcept {
+  return nord >= 0 && nord <= static_cast<int32_t>(b.ng) - 1;
+}
+} // namespace
+
+fv3_gpu_status launch_deln_flux_transport_cuda(
+    const TransportBounds &b, int32_t nord, fv_real damp_c, fv_real da_min,
+    bool mass_weighted, const LevelFilter &lf, View3<const fv_real> q,
+    View3<const fv_real> mass, View2<const fv_real> del6_u, View2<const fv_real> del6_v,
+    View2<const fv_real> rarea, View3<fv_real> fx, View3<fv_real> fy, View3<fv_real> d2,
+    View3<fv_real> fx2, View3<fv_real> fy2, void *stream) noexcept {
+  if (!deln_nord_supported(b, nord)) return FV3_GPU_UNSUPPORTED_CONFIGURATION;
+  // tp_core.F90:213/231 -- fv_tp_2d forms this immediately before the call.
+  // This is the coefficient rule that distinguishes deln_flux from
+  // del6_vt_flux, which uses the raw per-level damp(k) instead.
+  const fv_real damp_coef = std::pow(damp_c * da_min, static_cast<fv_real>(nord + 1));
+  return deln_flux_pass(b, nord, damp_coef, View1<const fv_real>{}, mass_weighted, lf, q,
+                        mass, del6_u, del6_v, rarea, fx, fy, d2, fx2, fy2, stream);
+}
+
+fv3_gpu_status launch_deln_flux_transport_level_cuda(
+    const TransportBounds &b, int32_t nord_cap, View1<const fv_real> damp_level,
+    bool mass_weighted, const LevelFilter &lf, View3<const fv_real> q,
+    View3<const fv_real> mass, View2<const fv_real> del6_u, View2<const fv_real> del6_v,
+    View2<const fv_real> rarea, View3<fv_real> fx, View3<fv_real> fy, View3<fv_real> d2,
+    View3<fv_real> fx2, View3<fv_real> fy2, void *stream) noexcept {
+  // Reject before launching anything, so an unsupported order cannot leave
+  // fx/fy partially accumulated.
+  if (!deln_nord_supported(b, nord_cap)) return FV3_GPU_UNSUPPORTED_CONFIGURATION;
+  if (damp_level.data == nullptr || lf.ndif.data == nullptr || lf.gate.data == nullptr ||
+      lf.npz <= 0)
+    return FV3_GPU_INVALID_ARGUMENT;
+
+  // One pass per distinct integer order. mode 3 selects "activated AND
+  // ndif(k) == nord_sel", so every level is visited by exactly one pass (or by
+  // none, when its gate is off) and no level is diffused twice.
+  for (int32_t nord = 0; nord <= nord_cap; ++nord) {
+    LevelFilter g = lf;
+    g.mode = 3;
+    g.nord_sel = nord;
+    fv3_gpu_status st =
+        deln_flux_pass(b, nord, fv_real(0), damp_level, mass_weighted, g, q, mass, del6_u,
+                       del6_v, rarea, fx, fy, d2, fx2, fy2, stream);
+    if (st != FV3_GPU_SUCCESS) return st;
+  }
+  return FV3_GPU_SUCCESS;
 }
 
 // --- WP-B.2 arbitrary scalar transport service ---------------------------
@@ -1017,8 +1091,15 @@ fv3_gpu_status launch_scalar_transport_cuda(
   // excludes hord == 10, so ord_in == ord_ou == hord holds and the single-hord
   // launch_fv_tp_2d_cuda signature is faithful here.
   const bool deln = opt.deln_flux_enabled != 0;
-  if (deln && (opt.nord < 0 || opt.nord > static_cast<int32_t>(b.ng) - 1))
+  const bool deln_per_level = deln && opt.per_level_deln != 0;
+  if (deln && !deln_nord_supported(b, deln_per_level ? opt.nord_cap : opt.nord))
     return FV3_GPU_UNSUPPORTED_CONFIGURATION;
+  // Milestone 3A.8: the per-level tail needs all three arrays. Checking here
+  // keeps the failure ahead of every launch.
+  if (deln_per_level && (opt.deln_damp_level.data == nullptr ||
+                         opt.deln_gate_level.data == nullptr ||
+                         opt.deln_nord_level.data == nullptr))
+    return FV3_GPU_INVALID_ARGUMENT;
 
   const bool mass_weighted = opt.mass_flux_weighting != 0;
   // tp_core.F90:216-234: only the final averaging weight differs. xfx_adv /
@@ -1031,15 +1112,31 @@ fv3_gpu_status launch_scalar_transport_cuda(
                                            q_i, q_j, fx, fy, fx2_tp, fy2_tp, stream);
   if (st != FV3_GPU_SUCCESS) return st;
 
-  // tp_core.F90:212-214 / 230-232. The damp_c threshold branch belongs to
-  // fv_tp_2d, not to deln_flux, so it is applied here. Note it is 1.e-4 --
-  // del6_vt_flux's activation threshold is 1.E-5 and the two must not be
-  // conflated.
-  if (!deln || !(opt.damp_c > fv_real(1.0e-4))) return FV3_GPU_SUCCESS;
+  if (!deln) return FV3_GPU_SUCCESS;
 
   // Fortran passes `mass` only in the mfx/mfy branch (tp_core.F90:222-224) and
   // never in the xfx/yfx branch (:236-238), so the weighting mode selects the
   // deln_flux mass mode as well.
+  if (deln_per_level) {
+    // The `damp_c > 1.e-4` branch is evaluated per level here, carried in
+    // deln_gate_level; see launch_deln_flux_transport_level_cuda. `lf` still
+    // supplies npz and the field views, but its mode/ndif/gate are replaced
+    // because the deln tail gates on damping activation while fv_tp_2d above
+    // must run on every level d_sw asks for.
+    LevelFilter dlf = lf;
+    dlf.damp = opt.deln_gate_level;
+    dlf.ndif = opt.deln_nord_level;
+    dlf.gate = opt.deln_gate_level;
+    return launch_deln_flux_transport_level_cuda(
+        b, opt.nord_cap, opt.deln_damp_level, mass_weighted, dlf, as_const(q), mass,
+        del6_u, del6_v, rarea, fx, fy, d2, fx2_dn, fy2_dn, stream);
+  }
+
+  // tp_core.F90:212-214 / 230-232. The damp_c threshold branch belongs to
+  // fv_tp_2d, not to deln_flux, so it is applied here. Note it is 1.e-4 --
+  // del6_vt_flux's activation threshold is 1.E-5 and the two must not be
+  // conflated.
+  if (!(opt.damp_c > fv_real(1.0e-4))) return FV3_GPU_SUCCESS;
   return launch_deln_flux_transport_cuda(b, opt.nord, opt.damp_c, opt.da_min,
                                          mass_weighted, lf, as_const(q), mass, del6_u,
                                          del6_v, rarea, fx, fy, d2, fx2_dn, fy2_dn,

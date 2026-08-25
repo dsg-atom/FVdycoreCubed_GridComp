@@ -82,14 +82,17 @@ if(FV3_DYN_CORE_ENABLE_CUDA)
   # Milestone 3A.3/3A.5: WP-B D-grid height + scalar transport CUDA sources.
   # Milestone 3A.6 adds dgrid/wp_b_momentum_cuda.cu (WP-B.3 momentum
   # transport); Milestone 3A.7 adds dgrid/wp_b_divergence_cuda.cu (WP-B.4
-  # divergence damping / smag_corner / d_con heating). All three .cu files
-  # share dgrid/wp_b_ppm_shared.cuh so the PPM constants, seam predicates and
-  # launch helpers have one definition.
+  # divergence damping / smag_corner / d_con heating); Milestone 3A.8 adds
+  # dgrid/wp_b_dsw_cuda.cu (WP-B.5, the complete d_sw driver that orchestrates
+  # all of the above). All four .cu files share dgrid/wp_b_ppm_shared.cuh so the
+  # PPM constants, seam predicates and launch helpers have one definition.
   add_library(fv3_wp_b_cuda STATIC
     dgrid/wp_b_cuda.cu
     dgrid/wp_b_momentum_cuda.cu
     dgrid/wp_b_divergence_cuda.cu
-    dgrid/wp_b_contract_cuda.cpp)
+    dgrid/wp_b_dsw_cuda.cu
+    dgrid/wp_b_contract_cuda.cpp
+    dgrid/wp_b_dsw_contract_cuda.cpp)
   target_include_directories(fv3_wp_b_cuda PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/dgrid
@@ -322,6 +325,37 @@ if(BUILD_TESTING)
     # This test requires a GPU to run - mark as needing GPU label
     add_test(NAME fv3_wp_b4_divergence COMMAND fv3_wp_b4_divergence_test)
     set_tests_properties(fv3_wp_b4_divergence PROPERTIES
+      LABELS "gpu"
+      SKIP_RETURN_CODE 77
+    )
+
+    # Milestone 3A.8 WP-B.5 authoritative d_sw driver test (requires CUDA and
+    # GPU). Parts A-H are host transcriptions of the DRIVER-OWNED kernels from
+    # sw_core.F90 d_sw (contravariant/edge/corner winds, advective fluxes and
+    # ra_x/ra_y, the joint pt/delp update, the dpx accumulation, the w chain, the
+    # flux capacitors, the heat_source reset, and the derived per-level
+    # coefficient arrays). Parts I-M exercise the COMPLETE launch_d_sw_cuda:
+    # mixed per-level damping branches inside ONE invocation compared against the
+    # equivalent uniform-parameter runs level by level, flux-capacitor
+    # accumulation across two invocations, end-to-end anti-dependence
+    # invariants, unsupported-configuration fences, and direct GPU execution at
+    # the seam and in the interior.
+    add_executable(fv3_wp_b5_dsw_test
+      tests/dgrid/test_wp_b5_dsw_cuda.cpp)
+    target_include_directories(fv3_wp_b5_dsw_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+      ${CMAKE_CURRENT_SOURCE_DIR}/dgrid
+      ${CMAKE_CURRENT_SOURCE_DIR}/operators
+    )
+    target_link_libraries(fv3_wp_b5_dsw_test PRIVATE
+      fv3_dyn_core_gpu
+      fv3_wp_b_cuda
+      fv3_wp_d_cuda
+      CUDA::cudart
+    )
+    # This test requires a GPU to run - mark as needing GPU label
+    add_test(NAME fv3_wp_b5_dsw COMMAND fv3_wp_b5_dsw_test)
+    set_tests_properties(fv3_wp_b5_dsw PROPERTIES
       LABELS "gpu"
       SKIP_RETURN_CODE 77
     )

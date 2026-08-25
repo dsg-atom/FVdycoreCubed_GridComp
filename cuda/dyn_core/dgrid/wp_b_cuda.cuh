@@ -273,6 +273,46 @@ fv3_gpu_status launch_deln_flux_transport_cuda(
     View2<const fv_real> rarea, View3<fv_real> fx, View3<fv_real> fy,
     View3<fv_real> d2, View3<fv_real> fx2, View3<fv_real> fy2, void *stream) noexcept;
 
+// Milestone 3A.8: per-level (nord, damp_c) form of the same routine.
+//
+// Both of d_sw's damped transports take their deln_flux parameters from
+// dyn_core's k loop -- delp uses (nord_v(k), damp_v(k)) at sw_core.F90:939 and
+// pt uses (nord_t(k), damp_t(k)) at :1004 -- and dyn_core.F90:713-760 makes BOTH
+// vary with k in the production configuration: the three sponge branches force
+// nord_v = 0 and damp_vt(k) = 0.5*d2_divg on the top levels while the interior
+// keeps nord_v = min(2,nord) and damp_vt(k) = max(0.01, min(vtdm4, ...)).
+// Collapsing either to a scalar would silently delete that sponge behaviour, so
+// this entry point exists rather than a scalar approximation.
+//
+// Structure mirrors launch_del6_vt_flux_cuda: nord is a compile-time-invariant
+// loop-nest shape, so it cannot be read from a device array. Instead the levels
+// are partitioned by their integer nord and one full deln_flux sequence is
+// launched per group with LevelFilter::mode == 3 (damped AND ndif == nord_sel),
+// which is exactly the established per-level idiom. Levels not in the current
+// group return from every kernel before touching memory.
+//
+//   lf.ndif  -> nord(k), the per-level integer order (as real storage)
+//   lf.gate  -> pre-thresholded activation, i.e. 1 where damp_c(k) > 1.e-4 and
+//               0 elsewhere. deln_flux's caller-side activation threshold is
+//               1.e-4 but level_active tests against damp_threshold() == 1.E-5;
+//               pre-thresholding on the host/driver side reproduces the
+//               authoritative 1.e-4 branch exactly without giving level_active a
+//               second threshold to get wrong.
+//   damp_level -> the FORMED coefficient (damp_c(k)*da_min)**(nord(k)+1), not
+//               raw damp_c(k). The exponent depends on k, so the power cannot be
+//               taken inside a nord-invariant kernel; the driver builds this
+//               array on device. Mass weighting still uses 0.5*damp_level(k).
+//
+// nord_cap is the largest nord present in lf.ndif; groups above it are not
+// launched. Passing an empty damp_level is a programming error here -- use
+// launch_deln_flux_transport_cuda for the scalar case.
+fv3_gpu_status launch_deln_flux_transport_level_cuda(
+    const TransportBounds &b, int32_t nord_cap, View1<const fv_real> damp_level,
+    bool mass_weighted, const LevelFilter &lf, View3<const fv_real> q,
+    View3<const fv_real> mass, View2<const fv_real> del6_u, View2<const fv_real> del6_v,
+    View2<const fv_real> rarea, View3<fv_real> fx, View3<fv_real> fy,
+    View3<fv_real> d2, View3<fv_real> fx2, View3<fv_real> fy2, void *stream) noexcept;
+
 // --- WP-B.2 arbitrary scalar transport -----------------------------------
 // Numerical options for one fv_tp_2d scalar-transport call. These are exactly
 // fv_tp_2d's optional-argument combinations as exercised by d_sw
@@ -300,6 +340,30 @@ struct ScalarTransportOptions {
   int32_t nord = 0;
   fv_real damp_c = fv_real(0);
   fv_real da_min = fv_real(0);
+
+  // --- Milestone 3A.8: optional per-level deln_flux parameters -------------
+  // When per_level_deln is nonzero the scalar nord/damp_c above are IGNORED for
+  // the deln_flux tail and the three views below drive it instead, via
+  // launch_deln_flux_transport_level_cuda. This is required by d_sw: both its
+  // damped transports take (nord, damp_c) from dyn_core's k loop and both vary
+  // with k in production (dyn_core.F90:713-760 sponge overrides).
+  //
+  // Leaving per_level_deln zero reproduces the Milestone 3A.5 scalar path
+  // bit-for-bit -- no branch above this line is affected -- so existing callers
+  // and tests are untouched by this addition.
+  int32_t per_level_deln = 0;
+  // Largest nord present in nord_level. Bounded by ng - 1 for the same
+  // copy_corners reach reason as the scalar nord.
+  int32_t nord_cap = 0;
+  // (damp_c(k)*da_min)**(nord(k)+1), already formed. See the
+  // launch_deln_flux_transport_level_cuda comment for why the power cannot be
+  // deferred into the kernels.
+  View1<const fv_real> deln_damp_level{};
+  // 1 where damp_c(k) > 1.e-4, 0 elsewhere: the authoritative fv_tp_2d
+  // activation branch (tp_core.F90:212/230) evaluated per level.
+  View1<const fv_real> deln_gate_level{};
+  // nord(k) in real storage, consumed as LevelFilter::ndif.
+  View1<const fv_real> deln_nord_level{};
 };
 
 // Reusable internal WP-B service: transport one arbitrary scalar field.

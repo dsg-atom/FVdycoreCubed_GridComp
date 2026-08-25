@@ -66,4 +66,87 @@ int bind_wp_b_height_transport(const ExecutionContext &, WpBHeightTransportViews
 // this operator and then finishes the column.
 int launch_dgrid_height_transport_cuda(const ExecutionContext &, fv3_gpu_error *) noexcept;
 
+// ---------------------------------------------------------------------------
+// Milestone 3A.8 -- the complete d_sw driver (NumericalDispatch::dgrid_dynamics)
+// ---------------------------------------------------------------------------
+// Resolved FieldRegistry views for the d_sw CUDA driver. Grouped the way
+// launch_d_sw_cuda consumes them so a reader can check the binder against
+// DSwState / DSwGeometry / DSwLevels one group at a time.
+//
+// Every entry is a REGISTERED field. d_sw's locals live in the arena instead,
+// because they have no meaning outside one call and registering them would
+// invite a caller to treat them as state.
+// Defined in dgrid/wp_b_dsw_cuda.cuh, which this header deliberately does not
+// include: the arena is a set of typed device Views and only the binder and the
+// driver need its layout. Callers of bind_wp_b_d_sw include that header too.
+struct WpBDSwArena;
+
+struct WpBDSwViews {
+  // DSwState -- prognostic and shared temporaries (x.fields)
+  const DeviceViewBase *u = nullptr, *v = nullptr, *w = nullptr;
+  const DeviceViewBase *delp = nullptr, *pt = nullptr;
+  const DeviceViewBase *uc = nullptr, *vc = nullptr;
+  const DeviceViewBase *ua = nullptr, *va = nullptr;
+  const DeviceViewBase *divgd = nullptr, *delpc = nullptr, *ptc = nullptr;
+  const DeviceViewBase *ut = nullptr, *vt = nullptr;
+  const DeviceViewBase *crx = nullptr, *cry = nullptr;
+  const DeviceViewBase *xfx = nullptr, *yfx = nullptr;
+  const DeviceViewBase *heat_source = nullptr, *diss_est = nullptr;
+  const DeviceViewBase *z_rat = nullptr;
+  // kind=8 flux capacitors (§5 of wp_b_dsw_cuda.cuh)
+  const DeviceViewBase *mfx = nullptr, *mfy = nullptr;
+  const DeviceViewBase *cx = nullptr, *cy = nullptr, *dpx = nullptr;
+
+  // DSwGeometry::div
+  const DeviceViewBase *rarea_c = nullptr, *rarea = nullptr;
+  const DeviceViewBase *dxc = nullptr, *dyc = nullptr;
+  const DeviceViewBase *dx = nullptr, *dy = nullptr;
+  const DeviceViewBase *rdx = nullptr, *rdy = nullptr;
+  const DeviceViewBase *divg_u = nullptr, *divg_v = nullptr;
+  const DeviceViewBase *cosa_u = nullptr, *cosa_v = nullptr;
+  const DeviceViewBase *sina_u = nullptr, *sina_v = nullptr;
+  const DeviceViewBase *cosa_s = nullptr, *rsin2 = nullptr, *sin_sg = nullptr;
+
+  // DSwGeometry::a2b (S31's smag_corner arm reuses WP-D's a2b_ord4)
+  const DeviceViewBase *grid_lonlat = nullptr, *agrid_lonlat = nullptr;
+  const DeviceViewBase *edge_w = nullptr, *edge_e = nullptr;
+  const DeviceViewBase *edge_s = nullptr, *edge_n = nullptr;
+
+  // DSwGeometry -- the rest
+  const DeviceViewBase *area = nullptr;
+  const DeviceViewBase *dxa = nullptr, *dya = nullptr;
+  const DeviceViewBase *rdxa = nullptr, *rdya = nullptr;
+  const DeviceViewBase *del6_u = nullptr, *del6_v = nullptr;
+  const DeviceViewBase *cosa = nullptr, *rsina = nullptr;
+  const DeviceViewBase *rsin_u = nullptr, *rsin_v = nullptr;
+  const DeviceViewBase *f0 = nullptr;
+
+  // DSwLevels -- the ten per-level dyn_core controls (§4)
+  const DeviceViewBase *nord_k = nullptr;  // damping_nord_k
+  const DeviceViewBase *nord_v = nullptr;  // damping_ndif
+  const DeviceViewBase *nord_w = nullptr;  // damping_nord_w
+  const DeviceViewBase *d2_bg = nullptr, *d4_bg = nullptr;
+  const DeviceViewBase *damp_v = nullptr, *damp_w = nullptr, *damp_t = nullptr;
+  const DeviceViewBase *d_con = nullptr, *kgb = nullptr;
+};
+
+// Resolves views + carves WpBDSwArena from WorkspaceId::transport. Does not
+// launch, synchronize, or allocate.
+//
+// Unlike WpBHeightTransportArena (raw void* slots handed to the launcher), the
+// d_sw arena is already a set of typed Views, so this binder fills them in
+// directly. The slice is divided into WpBDSwArena::array_count whole
+// (ni x nj x (npz+1)) fv_real slots over [is-halo, ie+halo] x [js-halo, je+halo],
+// with the LAST slot subdivided into WpBDSwArena::level_array_count npz-length
+// columns. Sizing everything in whole slots keeps the overflow arithmetic
+// uniform and keeps the level arrays from ever aliasing a 3-D local.
+int bind_wp_b_d_sw(const ExecutionContext &, WpBDSwViews &, WpBDSwArena &,
+                   fv3_gpu_error *) noexcept;
+
+// LaunchFn-compatible entry point wired into NumericalDispatch::dgrid_dynamics.
+// Executes the complete authoritative d_sw sequence (sw_core.F90:600-1540) for
+// the production first-run configuration; see §1 of wp_b_dsw_cuda.cuh for the
+// stage map and §6 for what it refuses.
+int launch_dgrid_dynamics_cuda(const ExecutionContext &, fv3_gpu_error *) noexcept;
+
 } // namespace fv3::gpu::dgrid

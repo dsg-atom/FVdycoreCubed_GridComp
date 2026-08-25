@@ -1,4 +1,5 @@
 #include "dgrid/wp_b_contract_cuda.hpp"
+#include "dgrid/wp_b_contract_views.hpp"
 #include "dgrid/wp_b_cuda.cuh"
 #include "fv3_gpu_errors.hpp"
 #include "fv3_gpu_types.hpp"
@@ -7,83 +8,10 @@
 #include <cstring>
 
 namespace fv3::gpu::dgrid {
-namespace {
 
-template <class T>
-View3<T> to_view3(const DeviceViewBase *v) {
-  return View3<T>{static_cast<T *>(v->data), v->lower[0], v->lower[1], v->lower[2],
-                  v->stride[0], v->stride[1], v->stride[2]};
-}
-
-template <class T>
-View2<T> to_view2(const DeviceViewBase *v) {
-  return View2<T>{static_cast<T *>(v->data), v->lower[0], v->lower[1], v->stride[0],
-                  v->stride[1]};
-}
-
-template <class T>
-View1<T> to_view1(const DeviceViewBase *v) {
-  return View1<T>{static_cast<T *>(v->data), v->lower[0], v->stride[0]};
-}
-
-View3<const fv_real> to_const3(const View3<fv_real> &v) {
-  return View3<const fv_real>{v.data, v.lo_i, v.lo_j, v.lo_k, v.si, v.sj, v.sk};
-}
-
-// Arena arrays are all sized identically ([is-h,ie+h] x [js-h,je+h] x
-// [0,npz]) by bind_wp_b_height_transport; wrap each raw pointer as a batched
-// View3 over that box (matches WpBHeightTransportArena's documented layout).
-View3<fv_real> to_arena_view3(void *p, const DomainBounds &b) {
-  const int64_t h = static_cast<int64_t>(b.halo_width);
-  const int64_t ni = (b.ie + h) - (b.is - h) + 1;
-  const int64_t nj = (b.je + h) - (b.js - h) + 1;
-  return View3<fv_real>{static_cast<fv_real *>(p), b.is - h, b.js - h, 0, 1, ni, ni * nj};
-}
-
-// gam is a length-npz column living in the first values of one arena slot.
-View1<fv_real> to_arena_view1(void *p) {
-  return View1<fv_real>{static_cast<fv_real *>(p), 0, 1};
-}
-
-View1<const fv_real> to_const1(const View1<fv_real> &v) {
-  return View1<const fv_real>{v.data, v.lo_i, v.si};
-}
-
-bool covers1(const DeviceViewBase *v, int64_t lo, int64_t hi) {
-  if (!v || v->rank < 1 || !v->data) return false;
-  if (v->lower[0] > lo) return false;
-  if (v->lower[0] + static_cast<int64_t>(v->extent[0]) - 1 < hi) return false;
-  return true;
-}
-
-bool covers2(const DeviceViewBase *v, int64_t lo_i, int64_t hi_i, int64_t lo_j,
-             int64_t hi_j) {
-  if (!v || v->rank < 2) return false;
-  if (v->lower[0] > lo_i || v->lower[0] + static_cast<int64_t>(v->extent[0]) - 1 < hi_i)
-    return false;
-  if (v->lower[1] > lo_j || v->lower[1] + static_cast<int64_t>(v->extent[1]) - 1 < hi_j)
-    return false;
-  return true;
-}
-
-bool covers3(const DeviceViewBase *v, int64_t lo_i, int64_t hi_i, int64_t lo_j,
-             int64_t hi_j, int64_t lo_k, int64_t hi_k) {
-  if (!covers2(v, lo_i, hi_i, lo_j, hi_j)) return false;
-  if (v->rank < 3) return false;
-  if (v->lower[2] > lo_k || v->lower[2] + static_cast<int64_t>(v->extent[2]) - 1 < hi_k)
-    return false;
-  return true;
-}
-
-// Overflow-safe uint64_t multiply-accumulate, mirroring the arena-sizing
-// rigor used by wp_d_contract.cpp's bind_wp_d.
-bool mul_into(uint64_t &acc, uint64_t factor) {
-  if (factor != 0 && acc > (UINT64_MAX / factor)) return true;
-  acc *= factor;
-  return false;
-}
-
-} // namespace
+// The DeviceViewBase -> View adapters, coverage predicates and overflow-safe
+// size arithmetic are shared with the d_sw binder; see wp_b_contract_views.hpp.
+using namespace contract_views;
 
 int bind_wp_b_height_transport(const ExecutionContext &x, WpBHeightTransportViews &out,
                                WpBHeightTransportArena &arena, fv3_gpu_error *error) noexcept {

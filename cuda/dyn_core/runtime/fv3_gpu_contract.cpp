@@ -56,7 +56,14 @@ constexpr FieldSpec specs[] = {
  S(damping_d2_bg,immutable_grid,fv_real,1,A,INPUT), S(damping_d4_bg,immutable_grid,fv_real,1,A,INPUT),
  S(damping_v,immutable_grid,fv_real,1,A,INPUT), S(damping_w,immutable_grid,fv_real,1,A,INPUT),
  S(damping_t,immutable_grid,fv_real,1,A,INPUT), S(damping_kgb,immutable_grid,fv_real,1,A,INPUT),
- S(damping_ndif,immutable_grid,integer,1,A,INPUT)
+ S(damping_ndif,immutable_grid,integer,1,A,INPUT),
+ /* Milestone 3A.8. damping_nord_k and damping_nord_w mirror damping_ndif's
+  * LogicalType::integer storage-as-real convention (the public ABI has no
+  * integer element type), so consumers must guard them with
+  * view_element_width_is exactly as they do for damping_ndif. damping_d_con is a
+  * genuine real. */
+ S(damping_nord_k,immutable_grid,integer,1,A,INPUT), S(damping_nord_w,immutable_grid,integer,1,A,INPUT),
+ S(damping_d_con,immutable_grid,fv_real,1,A,INPUT)
 };
 #undef S
 uint64_t align_up(uint64_t value,uint32_t alignment) { return (value+alignment-1)&~uint64_t(alignment-1); }
