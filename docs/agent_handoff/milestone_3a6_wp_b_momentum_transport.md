@@ -20,8 +20,8 @@ comparison against Fortran savepoints generated at runtime.
 - Branch: `cuda/gpu-bringup`
 - Starting commit: `2849401c3a819981d1fdabc3a684b29a4b94c604`
   ("Close WP-B scalar transport milestone 3A.5")
-- Final commit: see `git log -1` (this milestone's commit,
-  "Implement authoritative WP-B momentum transport CUDA")
+- Final commit: `c405d8032ceda7ba7f795ffbff9f9c46763f366b`
+  ("Implement authoritative WP-B momentum transport CUDA")
 - Not pushed, not merged.
 
 ## Authoritative Fortran revision
