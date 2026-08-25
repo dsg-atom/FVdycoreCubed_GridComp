@@ -7,7 +7,7 @@
 | Branch | `cuda/gpu-bringup` |
 | Starting commit | `295fb029d231073d5a9b51d8b44c3ac8f03b1d9c` (*Record milestone 3A.7 commit SHA in handoff*) |
 | 3A.7 implementation commit | `1fe108c` (*Implement authoritative WP-B divergence damping / corner slice*) |
-| Final commit | *recorded in the follow-up commit; see §14* |
+| Final commit | `f5a2f18adea38c64b750b9cac2a598ca5f6c0081` (*Integrate authoritative WP-B d_sw CUDA driver*) |
 | Authoritative Fortran revision | GEOS-ESM/GFDL_atmos_cubed_sphere, tag `geos/v3.0.0`, SHA `ca30e26305fda43831095334c02a3f5e0b8c0c45` |
 | Local authoritative clone | `/discover/nobackup/projects/imvi-nse/jli30/fv3_reference/GFDL_atmos_cubed_sphere` |
 | Primary Fortran sources | `model/sw_core.F90` (`d_sw` :520–1540, `del6_vt_flux` :1544–…), `model/dyn_core.F90` (:699–802), `model/tp_core.F90` (`fv_tp_2d` :109–243, `copy_corners` :247–322) |
