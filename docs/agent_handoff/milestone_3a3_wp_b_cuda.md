@@ -257,3 +257,36 @@ wiring, a pre-existing gap). Neither blocks starting the next WP-B
 sub-milestone (WP-B.2).
 
 READY FOR NEXT WP-B CUDA SUB-MILESTONE
+
+---
+
+## ANNOTATION — superseded in part by Milestone 3A.3B (2026-08-24)
+
+Added append-only; nothing above has been altered. See
+`docs/agent_handoff/milestone_3a3b_wp_b_fortran_reconciliation.md` for evidence.
+
+Three claims above are **superseded**:
+
+1. **"Fortran cross-check: NOT POSSIBLE (source absent)"** — now **false**. The
+   authoritative source is available on Discover at the pinned revision
+   `GEOS-ESM/GFDL_atmos_cubed_sphere`, tag `geos/v3.0.0`, SHA `ca30e26`.
+2. **The `damp_c` / `vtdm4` blocker as stated** — the premise was wrong. The
+   `update_dz_d` height path never reaches `deln_flux`; it calls
+   `del6_vt_flux` with a raw per-level coefficient. No scalar `damp_c` field is
+   needed; a per-level `(damp[npz+1], ndif[npz+1])` pair plus `dp0[npz]` is.
+3. **"`ra_x`/`ra_y` is new code, numerical semantics: N/A"** — authoritative
+   definitions exist (`nh_utils.F90:269-278`) with narrower extents than the
+   CUDA computes.
+
+**`dgrid_height_transport` as delivered in 3A.3 would not pass a numerical
+comparison against authoritative Fortran.** 3A.3B identifies 9 discrepancies,
+3 critical: `edge_profile` is entirely absent; the `zh` update uses an additive
+`rarea` increment instead of the authoritative area-weighted remap; the damping
+follows `deln_flux` rather than `del6_vt_flux` conventions.
+
+Its GPU-execution and sanitizer-clean results remain valid as stated — those
+were never numerical-validation claims.
+
+**Standing:** the order-6 PPM *interior* arithmetic in `wp_b_cuda.cu` was
+verified element-by-element against `tp_core.F90:523-555` and is a correct
+translation. The errors are in the surrounding assembly, edges, and corners.
