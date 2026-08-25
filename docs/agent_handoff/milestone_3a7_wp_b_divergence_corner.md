@@ -19,8 +19,7 @@ only supports the former. See §11.
 
 - Branch: `cuda/gpu-bringup`
 - Parent commit: `c3f34b0` *Record milestone 3A.6 commit SHA in handoff*
-- Commit SHA for this milestone: recorded in the follow-up commit (see the
-  final line of this document)
+- Commit SHA for this milestone: `1fe108c`
 
 Files added:
 
@@ -467,5 +466,4 @@ four completed WP-B transport/damping services and a populated
 
 ---
 
-Commit SHA for this milestone: recorded by the follow-up commit that amends
-this line.
+Commit SHA for this milestone: `1fe108c8b14361752c790d9f861550a10e3d3119`
