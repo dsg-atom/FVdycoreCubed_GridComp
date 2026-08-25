@@ -72,6 +72,11 @@ int make_device_view(const fv3_gpu_field_desc &d,const FieldSpec &s,DeviceViewBa
   uint32_t bytes=s.logical_type==LogicalType::accumulator_real?8u:s.logical_type==LogicalType::fv_real?(uint32_t)sizeof(fv_real):d.element_bytes;
   if(s.logical_type!=LogicalType::bytes&&d.element_bytes!=bytes)return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"field precision differs from contract");
   v.data=d.base;v.rank=d.rank;v.stagger=(fv3_gpu_stagger)d.stagger;v.access=(fv3_gpu_access)d.access;
+  /* Milestone 3A.4: retain the registered element width. For fv_real and
+   * accumulator_real logical types the check above already pinned it, but for
+   * LogicalType::integer `bytes` is d.element_bytes, so that comparison is a
+   * tautology and this is the only record a consumer can validate against. */
+  v.element_bytes=d.element_bytes;
   std::copy_n(d.lower,FV3_GPU_MAX_RANK,v.lower.begin());std::copy_n(d.extent,FV3_GPU_MAX_RANK,v.extent.begin());std::copy_n(d.stride_elements,FV3_GPU_MAX_RANK,v.stride.begin());return 0;
 }
 int FieldRegistry::insert(const fv3_gpu_field_desc &d,void *device,fv3_gpu_error *e) noexcept {

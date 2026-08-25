@@ -290,3 +290,47 @@ were never numerical-validation claims.
 **Standing:** the order-6 PPM *interior* arithmetic in `wp_b_cuda.cu` was
 verified element-by-element against `tp_core.F90:523-555` and is a correct
 translation. The errors are in the surrounding assembly, edges, and corners.
+
+---
+
+## ANNOTATION — repaired by Milestone 3A.4 (2026-08-24)
+
+Added append-only; nothing above has been altered. See
+`docs/agent_handoff/milestone_3a4_wp_b_height_transport_repair.md`.
+
+**The `dgrid_height_transport` implementation described in this document no
+longer exists in the working tree.** Milestone 3A.4 replaced it with the
+authoritative `update_dz_d` transport body (`nh_utils.F90:236-325`):
+`edge_profile` → `ra_x`/`ra_y` → per-level damped/undamped split → `fv_tp_2d`
+→ `del6_vt_flux` → area-weighted `zh` update. Treat every algorithmic
+description of the height path above as **historical only**.
+
+Specifically superseded:
+
+1. **"`fv_tp_2d_hord6` + flux divergence on `zh`"** as the operator definition
+   — the authoritative update is an area-weighted remap renormalised by
+   `((ra_x+ra_y) - area)`, not an additive `rarea` increment.
+2. **`edge_profile`'s absence** — now implemented (gam + x + y launchers) and
+   checked against an independent host transcription of the non-uniform
+   tridiagonal branch.
+3. **The `deln_flux` damping convention on the height path** — replaced by
+   `del6_vt_flux` with the raw per-level `damp(k)`. A bitwise linearity test
+   (Part G1) now guards against the substitution recurring.
+4. **`ra_x`/`ra_y` extents** — corrected to the Fortran's (they differ from
+   each other, and both are narrower than 3A.3 computed).
+5. **The 3A.3 smoke fixture** — rewritten. It registered only 11 fields and no
+   `npx`/`npy`, and is *correctly rejected* by the 3A.4 binder. Binder
+   validation was not weakened to keep it.
+6. **`ng` conflated with `halo_width`** — separated; `ng` is a Fortran
+   compile-time PARAMETER `= 3` (`tools/fv_mp_mod.F90:108`).
+
+The `damp_c`/`vtdm4` "open ambiguity" section above is fully closed, not merely
+superseded: there was no coefficient to map, because the height path never
+calls `deln_flux`.
+
+As with the 3A.3B annotation, this document's GPU-execution and
+sanitizer-clean claims were never numerical-validation claims and remain
+accurate as historical statements about the code as it stood then. Milestone
+3A.4 re-established both, on the repaired code, in R8 and R4.
+
+**Numerical validation remains NOT RUN** after 3A.4 as well.

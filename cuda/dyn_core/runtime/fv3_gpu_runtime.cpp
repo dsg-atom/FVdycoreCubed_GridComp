@@ -62,6 +62,14 @@ int set_numerical_config(fv3_gpu_context *c, const NumericalConfig &cfg, fv3_gpu
   c->data.immutable.config=cfg;
   return FV3_GPU_SUCCESS;
 }
+int set_topology(fv3_gpu_context *c, const TopologyView &t, fv3_gpu_error *e) noexcept {
+  clear_error(e);
+  if (!c) return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"null context");
+  if (c->data.phase==ContextPhase::failed) return fail(e,FV3_GPU_STATE_CONFLICT,__func__,"context has failed");
+  if (t.contract_version!=internal_contract_version) return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"wrong topology version");
+  c->data.topology=t;
+  return FV3_GPU_SUCCESS;
+}
 int mark_halo_ready(fv3_gpu_context *c, fv3_gpu_halo_group g, fv3_gpu_error *e) noexcept {
   clear_error(e);
   if (!c) return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"null context");

@@ -10,7 +10,7 @@
 
 namespace fv3::gpu {
 
-inline constexpr uint32_t internal_contract_version = 3;
+inline constexpr uint32_t internal_contract_version = 4;
 
 enum class FieldId : uint32_t {
   invalid=0, u, v, w, delz, pt, delp, q, q_con, cappa, pe, pk, peln,
@@ -47,12 +47,44 @@ FieldId field_id_from_abi(uint32_t id) noexcept;
 struct DeviceViewBase {
   void *data = nullptr;
   uint32_t rank = 0;
+  /* Storage width of one element, in bytes, as registered by the caller.
+   *
+   * Milestone 3A.4 addition. `stride` is expressed in ELEMENTS, so nothing else
+   * in this struct records how wide an element actually is, and a consumer that
+   * wraps `data` in a typed view has no way to detect a width mismatch.
+   *
+   * That is a live hazard for LogicalType::integer fields: the public C ABI
+   * offers only FV3_GPU_ELEMENT_F32/F64 (fv3_gpu_api.h), so integral field
+   * values must travel as reals, and make_device_view's precision check
+   * degenerates to a tautology for them (it compares d.element_bytes against
+   * itself). A caller could therefore register damping_ndif with
+   * element_bytes = 4 inside an R8 build and a View1<const fv_real> would
+   * reinterpret that storage as doubles.
+   *
+   * Consumers that wrap a non-fv_real logical type in a typed view MUST check
+   * this against sizeof(their element type) and reject a mismatch rather than
+   * reinterpret the memory. Zero means "not recorded" (a default-constructed
+   * view that never went through make_device_view). */
+  uint32_t element_bytes = 0;
   std::array<int64_t,FV3_GPU_MAX_RANK> lower{};
   std::array<uint64_t,FV3_GPU_MAX_RANK> extent{};
   std::array<int64_t,FV3_GPU_MAX_RANK> stride{};
   fv3_gpu_stagger stagger = FV3_GPU_STAGGER_A;
   fv3_gpu_access access = FV3_GPU_ACCESS_INPUT;
 };
+
+/* Guards a typed view over a field whose LogicalType is not fv_real (today:
+ * only LogicalType::integer, i.e. damping_ndif). Returns true when `v` records
+ * exactly `expected_bytes` per element and so may safely be wrapped in a view
+ * of that element type.
+ *
+ * This is a storage-contract workaround for the current ABI's lack of an
+ * integer element type, NOT an assertion that integer semantics should
+ * permanently use real storage; see the FUTURE CONTRACT WORK note in
+ * docs/agent_handoff/milestone_3a4_wp_b_height_transport_repair.md. */
+inline bool view_element_width_is(const DeviceViewBase *v, size_t expected_bytes) noexcept {
+  return v && v->element_bytes == static_cast<uint32_t>(expected_bytes);
+}
 
 template<class T> struct DeviceView : DeviceViewBase {
   using element_type = T;
@@ -100,6 +132,13 @@ struct TopologyView {
   uint8_t global_cubed_sphere=1, nested=0, regional=0, periodic_x=0, periodic_y=0;
   uint8_t sw_corner=0, se_corner=0, ne_corner=0, nw_corner=0;
   std::array<int8_t,4> corner_owner_rank{{-1,-1,-1,-1}};
+  /* Fortran tile corner counts (fv_grid_bounds_type npx/npy: the number of
+   * cell corners along a tile edge, so the last cell index is npx-1/npy-1).
+   * Zero means "not supplied by the caller". Any consumer that needs
+   * panel-edge or panel-corner semantics -- PPM edge profiles, copy_corners,
+   * edge_profile -- MUST reject zero rather than infer a value, because a
+   * wrong npx/npy silently applies interior stencils at a panel seam. */
+  int64_t npx=0, npy=0;
 };
 struct ImmutableViews {
   uint32_t contract_version=internal_contract_version;
@@ -212,5 +251,8 @@ int validate_dispatch(const NumericalDispatch &, fv3_gpu_error *) noexcept;
 int set_numerical_dispatch(fv3_gpu_context *, const NumericalDispatch &, fv3_gpu_error *) noexcept;
 int set_numerical_config(fv3_gpu_context *, const NumericalConfig &, fv3_gpu_error *) noexcept;
 int mark_halo_ready(fv3_gpu_context *, fv3_gpu_halo_group, fv3_gpu_error *) noexcept;
+/* Milestone 3A.4 addition to the same C++-only setter family: TopologyView now
+ * carries npx/npy, which nothing in the public C ABI can write. */
+int set_topology(fv3_gpu_context *, const TopologyView &, fv3_gpu_error *) noexcept;
 
 }

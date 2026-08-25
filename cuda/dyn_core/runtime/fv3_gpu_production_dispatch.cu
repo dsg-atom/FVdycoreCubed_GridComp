@@ -23,9 +23,18 @@ int fv3_build_production_dispatch(NumericalDispatch &out, fv3_gpu_error *e) noex
   d.cgrid_vertical_solver = nullptr;
   d.cgrid_pressure = &fv3::gpu::cgrid::launch_cgrid_pressure_v3;
   d.dgrid_dynamics = nullptr;
-  // Milestone 3A.3: fv_tp_2d_hord6 + flux divergence on zh, wired for WP-C's
-  // update_dz_d dependency. deln_flux_transport is implemented but not
-  // invoked here -- see wp_b_cuda.cuh's damp_c mapping ambiguity note.
+  // Milestone 3A.4: the authoritative update_dz_d transport body
+  // (nh_utils.F90:255-305) -- edge_profile -> ra_x/ra_y -> per-level
+  // damped/undamped split -> fv_tp_2d -> del6_vt_flux -> area-weighted height
+  // update -- wired for WP-C's update_dz_d dependency.
+  //
+  // Milestone 3A.3's "damp_c mapping ambiguity" is resolved and that note is
+  // gone: the zh path calls sw_core.F90's del6_vt_flux, which uses the raw
+  // per-level damp(k) and emits separate fx2/fy2, NOT tp_core.F90's deln_flux
+  // with its (damp_c*da_min)**(nord+1) coefficient folded into fx/fy. There
+  // was no coefficient to map. launch_deln_flux_transport_cuda is retained for
+  // the later WP-B.2/WP-B.4 stages that do call deln_flux, and is never
+  // invoked from the height path.
   d.dgrid_height_transport = &fv3::gpu::dgrid::launch_dgrid_height_transport_cuda;
   d.dgrid_height = nullptr;
   d.vertical_solver = &fv3::gpu::vertical::launch_vertical_solver;

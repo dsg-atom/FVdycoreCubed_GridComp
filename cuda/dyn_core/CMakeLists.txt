@@ -198,9 +198,11 @@ if(BUILD_TESTING)
       SKIP_RETURN_CODE 77
     )
 
-    # Milestone 3A.3 WP-B height-transport CUDA smoke test (requires CUDA and GPU)
-    # Part 3 additionally exercises WP-C's launch_update_dz_d (fv3_wp_c_vertical)
-    # to prove the cross-WP call into the new WP-B kernel end-to-end.
+    # Milestone 3A.4 WP-B height-transport CUDA behavior test (requires CUDA and GPU)
+    # Parts A-J: interior order-6 transport, panel-edge PPM, copy_corners,
+    # edge_profile, both damping branches, del6_vt_flux, the area-weighted zh
+    # update, the cross-WP path through WP-C's launch_update_dz_d
+    # (fv3_wp_c_vertical), and storage-contract rejection cases.
     add_executable(fv3_wp_b_cuda_smoke_test tests/dgrid/test_wp_b_cuda_smoke.cpp)
     target_include_directories(fv3_wp_b_cuda_smoke_test PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}

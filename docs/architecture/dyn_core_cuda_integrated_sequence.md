@@ -183,6 +183,25 @@ Per the Gate A architecture documents, the acoustic substep ordering is:
 > dispatch loop. Numerical validation against authoritative Fortran remains NOT RUN/NOT
 > POSSIBLE (source absent) for both rows.
 
+> **Milestone 3A.4 annotation (2026-08-24):** the `update_dz_d transport` row's
+> *implementation* was **replaced**, not merely re-tested. 3A.3 delivered an additive
+> flux-divergence increment with `deln_flux` damping conventions and no `edge_profile`;
+> 3A.4 replaced it with the authoritative `update_dz_d` transport body
+> (`nh_utils.F90:236-325`): `edge_profile` → `ra_x`/`ra_y` → per-level split on
+> `damp(k) > 1.E-5` → `fv_tp_2d` → `del6_vt_flux` → area-weighted `zh` update
+> renormalised by `((ra_x+ra_y) - area)`. Both rows re-confirmed **CUDA: PASS,
+> GPU: PASS** on A100 in R8 and R4, now also `initcheck`- and `racecheck`-clean, via
+> a rewritten Parts A–J behavior test. The `deln_flux damping` row above refers to
+> `launch_deln_flux_transport_cuda`, which is a **different Fortran routine**
+> (`tp_core.F90:1263`) and is *not* on the height path; it is now fenced to
+> `UNSUPPORTED_CONFIGURATION` because it omits `deln_flux`'s `2 + 2·nord` corner
+> rotations of `d2` and so is correct only at `nord == 0` — that fix is WP-B.2 work.
+> "Numerical validation NOT POSSIBLE (source absent)" is **obsolete**: the
+> authoritative source is available at SHA `ca30e26`, an eight-item source-level
+> reconciliation against it found no remaining discrepancy in scope, and savepoint
+> validation is now merely NOT RUN (Prompt 6). See
+> `docs/agent_handoff/milestone_3a4_wp_b_height_transport_repair.md`.
+
 ### WP-D pressure operators
 
 | Fortran stage | WP | Entry point | Config | Input | Output | Halo | Status | R4 | R8 | CUDA | GPU | Savepoint |

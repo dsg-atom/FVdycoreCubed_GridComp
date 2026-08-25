@@ -29,11 +29,22 @@ __global__ void height_boundary_kernel(fv_real *zh, fv_real *delz, fv_real *ws,
   ws[c] = update_height_boundary_column(z, dz, zs[c], rdt, dz_min, l.levels);
 }
 
+// Authoritative closure of update_dz_d (nh_utils.F90:307-322): ws from the
+// bottom interface, then a bottom-to-top monotonicity floor on zh.
+//
+// write_delz is a Milestone 3A.4 correction. Fortran update_dz_d declares delz
+// intent(out) but NEVER assigns it -- delz is produced later by the Riemann
+// solver from the final zh. Writing it here made the CUDA path diverge from the
+// authoritative sequence, so launch_update_dz_d now passes false.
+// launch_dgrid_height_v2 keeps true: it is the standalone height-boundary
+// operator whose callers rely on it to derive delz, and it is not the
+// update_dz_d path.
 __global__ void height_boundary_v2_kernel(View3 zh,View3 delz,View2 ws,View2 zs,
- int64_t is,int64_t ie,int64_t js,int64_t je,int km,fv_real rdt,fv_real dz_min){
+ int64_t is,int64_t ie,int64_t js,int64_t je,int km,fv_real rdt,fv_real dz_min,
+ bool write_delz){
   const int64_t i=is+blockIdx.x*blockDim.x+threadIdx.x,j=js+blockIdx.y*blockDim.y+threadIdx.y;
   if(i>ie||j>je)return;ws.at(i,j)=(zs.at(i,j)-zh.at(i,j,km))*rdt;
-  for(int k=km-1;k>=0;--k){const fv_real floor=zh.at(i,j,k+1)+dz_min;if(zh.at(i,j,k)<floor)zh.at(i,j,k)=floor;delz.at(i,j,k)=zh.at(i,j,k+1)-zh.at(i,j,k);}
+  for(int k=km-1;k>=0;--k){const fv_real floor=zh.at(i,j,k+1)+dz_min;if(zh.at(i,j,k)<floor)zh.at(i,j,k)=floor;if(write_delz)delz.at(i,j,k)=zh.at(i,j,k+1)-zh.at(i,j,k);}
 }
 View3 view3(const DeviceViewBase&v){return{static_cast<fv_real*>(v.data),v.lower[0],v.lower[1],v.lower[2],v.stride[0],v.stride[1],v.stride[2]};}
 View2 view2(const DeviceViewBase&v){return{static_cast<fv_real*>(v.data),v.lower[0],v.lower[1],v.stride[0],v.stride[1]};}
@@ -72,7 +83,7 @@ int launch_dgrid_height_v2(const ExecutionContext &x,fv3_gpu_error *error) {
   const auto &p=*x.dispatch_params;
   if(b.npz<2||p.rdt==0)return FV3_GPU_UNSUPPORTED_CONFIGURATION;
   const dim3 t(16,8),g((b.ie-b.is+16)/16,(b.je-b.js+8)/8);
-  height_boundary_v2_kernel<<<g,t,0,static_cast<cudaStream_t>(x.submission.stream)>>>(view3(*z),view3(*d),view2(*w),view2(*s),b.is,b.ie,b.js,b.je,(int)b.npz,fv_real(p.rdt),fv_real(c.dz_min));
+  height_boundary_v2_kernel<<<g,t,0,static_cast<cudaStream_t>(x.submission.stream)>>>(view3(*z),view3(*d),view2(*w),view2(*s),b.is,b.ie,b.js,b.je,(int)b.npz,fv_real(p.rdt),fv_real(c.dz_min),true);
   return cudaGetLastError()==cudaSuccess?FV3_GPU_SUCCESS:FV3_GPU_CUDA_ERROR;
 }
 
@@ -143,12 +154,16 @@ int launch_update_dz_d(const ExecutionContext &x, const NumericalDispatch &dispa
     return FV3_GPU_UNSUPPORTED_CONFIGURATION;
 
   // === Step 1: Call WP-B dgrid_height_transport for horizontal advection ===
-  // This executes fv_tp_2d with hord_tm on the height field zh.
-  // WP-B transport_service_for_update_dz handles:
-  // - PPM order-6 reconstruction
-  // - Y-X / X-Y directional sequencing
-  // - ra_x/ra_y area corrections
-  // - deln_flux damping when vtdm4 > 0
+  // Milestone 3A.4: the WP-B operator now implements the whole authoritative
+  // transport body of update_dz_d (nh_utils.F90:255-305):
+  // - edge_profile -> the interface crx_adv/xfx_adv/cry_adv/yfx_adv actually
+  //   transported with
+  // - ra_x on is..ie x jsd..jed, ra_y on isd..ied x js..je
+  // - per-level damped/undamped split on damp(k) > 1.E-5
+  // - fv_tp_2d with PPM order-6 incl. cubed-sphere panel-edge reconstruction
+  //   and copy_corners
+  // - del6_vt_flux (NOT tp_core's deln_flux) on the damped levels
+  // - the area-weighted height update renormalised by ((ra_x+ra_y)-area)
   if (!dispatch.dgrid_height_transport) {
     // WP-B transport service not wired - integration incomplete
     return FV3_GPU_UNSUPPORTED_CONFIGURATION;
@@ -158,17 +173,18 @@ int launch_update_dz_d(const ExecutionContext &x, const NumericalDispatch &dispa
   if (transport_status != FV3_GPU_SUCCESS) return transport_status;
 
   // === Step 2: Post-transport boundary/monotonicity enforcement ===
-  // The height boundary kernel applies:
+  // nh_utils.F90:307-322 applies exactly:
   // - ws = (zs - zh_bottom) * rdt
   // - Bottom-to-top monotonic: zh[k] >= zh[k+1] + dz_min
-  // - delz[k] = zh[k+1] - zh[k]
+  // and nothing else. delz is intent(out) there but never assigned, so
+  // write_delz = false: the Riemann solver derives delz from the final zh.
   const dim3 threads(16, 8);
   const dim3 grid((b.ie - b.is + 16) / 16, (b.je - b.js + 8) / 8);
   height_boundary_v2_kernel<<<grid, threads, 0,
                                static_cast<cudaStream_t>(x.submission.stream)>>>(
       view3(*v_zh), view3(*v_delz), view2(*v_ws), view2(*v_zs),
       b.is, b.ie, b.js, b.je, static_cast<int>(b.npz),
-      fv_real(p.rdt), fv_real(cfg.dz_min));
+      fv_real(p.rdt), fv_real(cfg.dz_min), false);
 
   return cudaGetLastError() == cudaSuccess ? FV3_GPU_SUCCESS : FV3_GPU_CUDA_ERROR;
 }

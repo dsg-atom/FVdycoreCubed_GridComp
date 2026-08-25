@@ -1090,3 +1090,43 @@ element-by-element against `tp_core.F90:523-555` this milestone.
 | **Numerical validation** | **NOT RUN** |
 | **Source files modified** | **NONE** (only this handoff document was written) |
 | **Working tree preservation** | **PASS** — no reset, checkout, clean, stash or discard was performed; `@fvdycore` not populated; no build directory touched |
+
+---
+
+## ANNOTATION — acted on by Milestone 3A.4 (2026-08-24)
+
+Added append-only; nothing above has been altered. See
+`docs/agent_handoff/milestone_3a4_wp_b_height_transport_repair.md`.
+
+This document's recommendation — **Slice B5, "Authoritative `update_dz_d`
+height transport, rebuilt on a corrected `fv_tp_2d` engine"** — has been
+implemented. All 9 reconciliation discrepancies recorded above are closed,
+including the 3 critical ones (`edge_profile` absent; additive `rarea`
+increment instead of the area-weighted remap; `deln_flux` damping conventions
+where `del6_vt_flux` is required), plus the missing `damp(k) > 1.E-5`
+two-branch structure, all `copy_corners`, and all panel-edge PPM treatment.
+
+The "Existing `dgrid_height_transport` reconciliation: **DISCREPANCY**" row in
+Section 12 therefore describes code that no longer exists. A fresh
+eight-item reconciliation against the same SHA `ca30e26` was performed in 3A.4
+and found **no remaining discrepancy in scope**: five items MATCH FORTRAN or
+MATCH WITH EXPLAINED CUDA STRUCTURAL DIFFERENCE, and four further defects found
+during that pass (D1 operand reassociation, D2 the `nord_v` group-loop cap, D3
+`deln_flux`'s missing `d2` corner rotations, D4 the corner-flag/`cubed_sphere`
+caller hazard) were fixed or explicitly fenced.
+
+Everything else in this document stands as written, including:
+
+- the authoritative revision pin;
+- the WP-B Fortran mapping;
+- the `damp_c`/`vtdm4` resolution (3A.4 confirmed it in the implementation:
+  the height path uses raw per-level `damp`, and a bitwise linearity test now
+  guards it);
+- the per-level `(damp[npz+1], ndif[npz+1])` + `dp0[npz]` contract requirement
+  (3A.4 registers these as `damping_v`, `damping_ndif`, `dp_ref`, and closed a
+  type-safety hazard in how `damping_ndif`'s integral values travel through
+  real storage);
+- the `corner_edge_service` analysis — still unimplemented, still a
+  fail-adapter. 3A.4's height path was verified never to call it.
+
+**Numerical validation remains NOT RUN.**
