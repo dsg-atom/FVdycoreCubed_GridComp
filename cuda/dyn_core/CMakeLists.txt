@@ -221,5 +221,33 @@ if(BUILD_TESTING)
       LABELS "gpu"
       SKIP_RETURN_CODE 77
     )
+
+    # Milestone 3A.5 WP-B.2 arbitrary scalar transport / deln_flux CUDA behavior
+    # test (requires CUDA and GPU). Kept as a separate executable from
+    # fv3_wp_b_cuda_smoke_test because the scalar transport contract is distinct
+    # from the update_dz_d height contract (nk == npz cell levels, no per-level
+    # damping split, deln_flux instead of del6_vt_flux, no arena).
+    # Parts A-K: interior order-6, panel-edge PPM, corner rotation, deln_flux
+    # enabled/disabled, nord dependence, the (damp_c*da_min)**(nord+1)
+    # coefficient law, mass weighting and hord<0 positivity, R8/R4 precision,
+    # and unsupported-configuration rejection.
+    add_executable(fv3_wp_b2_scalar_transport_test
+      tests/dgrid/test_wp_b2_scalar_transport_cuda.cpp)
+    target_include_directories(fv3_wp_b2_scalar_transport_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+      ${CMAKE_CURRENT_SOURCE_DIR}/dgrid
+    )
+    target_link_libraries(fv3_wp_b2_scalar_transport_test PRIVATE
+      fv3_dyn_core_gpu
+      fv3_wp_b_cuda
+      CUDA::cudart
+    )
+    # This test requires a GPU to run - mark as needing GPU label
+    add_test(NAME fv3_wp_b2_scalar_transport
+      COMMAND fv3_wp_b2_scalar_transport_test)
+    set_tests_properties(fv3_wp_b2_scalar_transport PROPERTIES
+      LABELS "gpu"
+      SKIP_RETURN_CODE 77
+    )
   endif()
 endif()

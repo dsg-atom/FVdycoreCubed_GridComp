@@ -371,9 +371,11 @@ struct Fixture {
     cudaDeviceSynchronize();
   }
 
-  dgrid::HeightTransportBounds bounds() const {
-    dgrid::HeightTransportBounds b{};
+  dgrid::TransportBounds bounds() const {
+    dgrid::TransportBounds b{};
     b.is = s.is; b.ie = s.ie; b.js = s.js; b.je = s.je; b.npz = s.npz;
+    // Height transport covers the npz+1 interface levels of zh.
+    b.nk = s.npz + 1;
     b.halo_width = h; b.ng = 3;
     b.npx = s.npx; b.npy = s.npy;
     b.nested = s.nested ? 1 : 0;

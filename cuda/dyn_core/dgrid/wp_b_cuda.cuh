@@ -12,7 +12,10 @@ using fv3::gpu::operators::View1;
 using fv3::gpu::operators::View2;
 using fv3::gpu::operators::View3;
 
-// Geometry + panel-topology parameters for the height-transport path.
+// Geometry + panel-topology parameters shared by every WP-B transport path
+// (Milestone 3A.4's update_dz_d height transport and Milestone 3A.5's arbitrary
+// scalar transport). It carries no field identity and no numerical option, so
+// the two paths share it without sharing a contract.
 //
 // npx/npy are the Fortran fv_grid_bounds_type tile corner counts (the last
 // cell index along a tile edge is npx-1/npy-1). They are REQUIRED: xppm/yppm
@@ -24,8 +27,20 @@ using fv3::gpu::operators::View3;
 // cubed_sphere mirrors the Fortran guard `.not.nested .and. grid_type < 3`,
 // which gates BOTH the xppm/yppm edge formulas and copy_corners. west/east/
 // south/north mirror `is==1`, `(ie+1)==npx`, `js==1`, `(je+1)==npy`.
-struct HeightTransportBounds {
+struct TransportBounds {
   int64_t is, ie, js, je, npz;
+  // Number of vertical slabs the batched launches cover: every kernel processes
+  // k in [0, nk-1]. This is NOT always npz.
+  //
+  //   height transport  -> nk = npz + 1. update_dz_d transports the npz+1
+  //                        INTERFACE heights zh (nh_utils.F90:255-305).
+  //   scalar transport  -> nk = npz. d_sw transports the npz CELL-centered
+  //                        delp/w/q_con/pt (sw_core.F90:939-1007).
+  //
+  // Kept separate from npz because LevelFilter still indexes the per-level
+  // damping arrays at min(k, npz-1) -- that clamp reproduces update_dz_d's
+  // `damp(km+1) = damp(km)` prologue and must not be driven by nk.
+  int64_t nk = 0;
   // Registered domain halo width. Used only for arena geometry / bounds
   // validation, never for a Fortran loop bound -- see ng below.
   int64_t halo_width;
@@ -79,11 +94,11 @@ struct LevelFilter {
 // update_dz_d actually transports with (crx_adv/xfx_adv/cry_adv/yfx_adv) from
 // the km cell-centered crx/xfx/cry/yfx. gam is the tridiagonal factor array;
 // it depends only on dp_ref and k, so it is computed once for all (i,j).
-fv3_gpu_status launch_edge_profile_gam_cuda(const HeightTransportBounds &b,
+fv3_gpu_status launch_edge_profile_gam_cuda(const TransportBounds &b,
                                             View1<const fv_real> dp_ref,
                                             View1<fv_real> gam, void *stream) noexcept;
 
-fv3_gpu_status launch_edge_profile_x_cuda(const HeightTransportBounds &b,
+fv3_gpu_status launch_edge_profile_x_cuda(const TransportBounds &b,
                                           View3<const fv_real> crx,
                                           View3<const fv_real> xfx,
                                           View1<const fv_real> dp_ref,
@@ -91,7 +106,7 @@ fv3_gpu_status launch_edge_profile_x_cuda(const HeightTransportBounds &b,
                                           View3<fv_real> crx_adv, View3<fv_real> xfx_adv,
                                           void *stream) noexcept;
 
-fv3_gpu_status launch_edge_profile_y_cuda(const HeightTransportBounds &b,
+fv3_gpu_status launch_edge_profile_y_cuda(const TransportBounds &b,
                                           View3<const fv_real> cry,
                                           View3<const fv_real> yfx,
                                           View1<const fv_real> dp_ref,
@@ -106,7 +121,7 @@ fv3_gpu_status launch_edge_profile_y_cuda(const HeightTransportBounds &b,
 // band and every destination block is a (halo, halo) corner, so the eight
 // regions are pairwise disjoint and the in-place update is race-free.
 // No-op when b.nested or !b.cubed_sphere.
-fv3_gpu_status launch_copy_corners_cuda(const HeightTransportBounds &b, int32_t dir,
+fv3_gpu_status launch_copy_corners_cuda(const TransportBounds &b, int32_t dir,
                                         const LevelFilter &lf, View3<fv_real> q,
                                         void *stream) noexcept;
 
@@ -114,15 +129,15 @@ fv3_gpu_status launch_copy_corners_cuda(const HeightTransportBounds &b, int32_t 
 // ra_x(i,j) = area(i,j) + (xfx_adv(i,j,k) - xfx_adv(i+1,j,k)) on is..ie x jsd..jed
 // ra_y(i,j) = area(i,j) + (yfx_adv(i,j,k) - yfx_adv(i,j+1,k)) on isd..ied x js..je
 // The extents differ between the two and the parenthesisation is the Fortran's.
-fv3_gpu_status launch_ra_x_cuda(const HeightTransportBounds &b,
+fv3_gpu_status launch_ra_x_cuda(const TransportBounds &b,
                                 View3<const fv_real> xfx_adv, View2<const fv_real> area,
                                 View3<fv_real> ra_x, void *stream) noexcept;
 
-fv3_gpu_status launch_ra_y_cuda(const HeightTransportBounds &b,
+fv3_gpu_status launch_ra_y_cuda(const TransportBounds &b,
                                 View3<const fv_real> yfx_adv, View2<const fv_real> area,
                                 View3<fv_real> ra_y, void *stream) noexcept;
 
-// --- fv_tp_2d (tp_core.F90:109, no mfx/mfy, no deln_flux) ----------------
+// --- fv_tp_2d (tp_core.F90:109, no deln_flux) ----------------------------
 // Full authoritative sequence for hord == ord_in == ord_ou:
 //   copy_corners(q, dir=2)
 //   yppm(fy2, q,   cry_adv) on isd..ied x js..je+1
@@ -132,16 +147,25 @@ fv3_gpu_status launch_ra_y_cuda(const HeightTransportBounds &b,
 //   xppm(fx2, q,   crx_adv) on is..ie+1  x jsd..jed
 //   q_j = (q*area + xfx*fx2(i) - xfx*fx2(i+1)) / ra_x   on is..ie   x jsd..jed
 //   yppm(fy,  q_j, cry_adv) on is..ie    x js..je+1
-//   fx = 0.5*(fx + fx2)*xfx ; fy = 0.5*(fy + fy2)*yfx
+//   fx = 0.5*(fx + fx2)*wx ; fy = 0.5*(fy + fy2)*wy
 // q is mutated in place by the two copy_corners calls, exactly as in Fortran.
 // fx2/fy2 are fv_tp_2d's OWN scratch and are distinct from del6_vt_flux's
 // fx2/fy2 outputs; update_dz_d's zh update reads the latter.
-fv3_gpu_status launch_fv_tp_2d_cuda(const HeightTransportBounds &b, int32_t hord,
+//
+// wx/wy are the FINAL flux-averaging weights and are the only difference
+// between fv_tp_2d's two optional-argument branches:
+//   tp_core.F90:229-234 (`else`, mfx/mfy absent) -> wx = xfx_adv, wy = yfx_adv
+//   tp_core.F90:216-221 (mfx/mfy present)        -> wx = mfx,     wy = mfy
+// xfx_adv/yfx_adv are ALSO passed separately and are used unconditionally by
+// the q_i/q_j intermediates (tp_core.F90:168-193 build fyy/fx1 from xfx/yfx in
+// both branches), so a mass-flux-weighted call must supply both.
+fv3_gpu_status launch_fv_tp_2d_cuda(const TransportBounds &b, int32_t hord,
                                     const LevelFilter &lf, View3<fv_real> q,
                                     View3<const fv_real> crx_adv,
                                     View3<const fv_real> cry_adv,
                                     View3<const fv_real> xfx_adv,
                                     View3<const fv_real> yfx_adv,
+                                    View3<const fv_real> wx, View3<const fv_real> wy,
                                     View2<const fv_real> area, View2<const fv_real> dxa,
                                     View2<const fv_real> dya, View3<const fv_real> ra_x,
                                     View3<const fv_real> ra_y, View3<fv_real> q_i,
@@ -172,7 +196,7 @@ fv3_gpu_status launch_fv_tp_2d_cuda(const HeightTransportBounds &b, int32_t hord
 //
 // fx2/fy2 are still pre-zeroed on all damped levels first, so a malformed
 // damping_ndif yields zero damping rather than uninitialized workspace.
-fv3_gpu_status launch_del6_vt_flux_cuda(const HeightTransportBounds &b, int32_t nord_cap,
+fv3_gpu_status launch_del6_vt_flux_cuda(const TransportBounds &b, int32_t nord_cap,
                                         const LevelFilter &lf, View3<fv_real> q,
                                         View2<const fv_real> del6_u,
                                         View2<const fv_real> del6_v,
@@ -182,7 +206,7 @@ fv3_gpu_status launch_del6_vt_flux_cuda(const HeightTransportBounds &b, int32_t 
 
 // --- z2 copy + zh update (nh_utils.F90:281-305) --------------------------
 // z2(i,j,k) = zh(i,j,k) over isd..ied x jsd..jed, damped levels only.
-fv3_gpu_status launch_copy_z2_cuda(const HeightTransportBounds &b, const LevelFilter &lf,
+fv3_gpu_status launch_copy_z2_cuda(const TransportBounds &b, const LevelFilter &lf,
                                    View3<const fv_real> zh, View3<fv_real> z2,
                                    void *stream) noexcept;
 
@@ -194,7 +218,7 @@ fv3_gpu_status launch_copy_z2_cuda(const HeightTransportBounds &b, const LevelFi
 //                  / ((ra_x+ra_y) - area)
 // This is NOT an additive flux-divergence increment: the transported height is
 // renormalised by the swept-area denominator ((ra_x+ra_y)-area).
-fv3_gpu_status launch_zh_update_cuda(const HeightTransportBounds &b, const LevelFilter &lf,
+fv3_gpu_status launch_zh_update_cuda(const TransportBounds &b, const LevelFilter &lf,
                                      View3<const fv_real> z2, View3<const fv_real> fx,
                                      View3<const fv_real> fy, View3<const fv_real> fx2,
                                      View3<const fv_real> fy2, View3<const fv_real> ra_x,
@@ -202,16 +226,101 @@ fv3_gpu_status launch_zh_update_cuda(const HeightTransportBounds &b, const Level
                                      View2<const fv_real> rarea, View3<fv_real> zh,
                                      void *stream) noexcept;
 
-// --- deln_flux (tp_core.F90:1263 / wp_b_kernels.hpp deln_flux_transport) --
-// Retained from milestone 3A.3 for the later WP-B.2/WP-B.4 scalar/momentum
-// transport stages, which DO call tp_core's deln_flux with the
-// (damp_c*da_min)**(nord+1) coefficient and DO fold fx2/fy2 into fx/fy. It is
-// a different Fortran routine from del6_vt_flux above and is not part of the
-// update_dz_d height path; launch_dgrid_height_transport_cuda never calls it.
+// --- deln_flux (tp_core.F90:1263) ----------------------------------------
+// tp_core's deln_flux, which is a DIFFERENT Fortran routine from
+// del6_vt_flux above and must not be confused with it:
+//
+//                      del6_vt_flux              deln_flux
+//   coefficient        raw per-level damp(k)     (damp_c*da_min)**(nord+1)
+//   output             separate fx2/fy2          folded into fx/fy
+//   activation         damp(k) > 1.E-5           damp_c > 1.e-4
+//   copy_corners       2 + 2*nord (of d2)        2 + 2*nord (of d2)
+//   mass weighting     none                      optional, 0.5*damp*(m+m)
+//
+// Only deln_flux has the (damp_c*da_min)**(nord+1) coefficient, so its
+// diffusive flux scales as damp_c**(nord+1) -- NOT linearly in damp_c the way
+// del6_vt_flux does. Milestone 3A.5 test G exploits exactly that difference.
+//
+// damp_c is passed RAW; this routine forms (damp_c*da_min)**(nord+1) itself,
+// mirroring tp_core.F90:213/231 where fv_tp_2d builds `damp` immediately before
+// the call. The `damp_c > 1.e-4` activation branch is the CALLER's (it lives in
+// fv_tp_2d, not deln_flux); launch_scalar_transport_cuda applies it.
+//
+// mass_weighted mirrors `present(mass)`:
+//   false -> d2 = damp*q ; fx += fx2 ; fy += fy2                (tp_core:1276, 1388)
+//   true  -> d2 = q      ; fx += 0.5*damp*(mass(i-1,j)+mass(i,j))*fx2
+//                        ; fy += 0.5*damp*(mass(i,j-1)+mass(i,j))*fy2  (:1373)
+// `mass` is not dereferenced when mass_weighted is false.
+//
+// Milestone 3A.5 closes defect D3 (fenced during 3A.4): the 2 + 2*nord
+// copy_corners rotations of d2 required at tp_core.F90:1313, 1326, 1354 and
+// 1366 are now performed, so nord > 0 is supported on corner-owning blocks.
 fv3_gpu_status launch_deln_flux_transport_cuda(
-    const HeightTransportBounds &b, int32_t nord, fv_real damp, fv_real da_min,
-    View3<const fv_real> q, View2<const fv_real> del6_u, View2<const fv_real> del6_v,
+    const TransportBounds &b, int32_t nord, fv_real damp_c, fv_real da_min,
+    bool mass_weighted, const LevelFilter &lf, View3<const fv_real> q,
+    View3<const fv_real> mass, View2<const fv_real> del6_u, View2<const fv_real> del6_v,
     View2<const fv_real> rarea, View3<fv_real> fx, View3<fv_real> fy,
     View3<fv_real> d2, View3<fv_real> fx2, View3<fv_real> fy2, void *stream) noexcept;
+
+// --- WP-B.2 arbitrary scalar transport -----------------------------------
+// Numerical options for one fv_tp_2d scalar-transport call. These are exactly
+// fv_tp_2d's optional-argument combinations as exercised by d_sw
+// (sw_core.F90:939, 986, 993, 1004); no other combination occurs:
+//
+//   scalar  hord      wx/wy      deln_flux         mass
+//   delp    hord_dp   xfx/yfx    nord_v, damp_v    absent
+//   w       hord_vt   mfx/mfy    absent            absent
+//   q_con   hord_dp   mfx/mfy    nord_t, damp_t    delp
+//   pt      hord_tm   mfx/mfy    nord_t, damp_t    delp
+//
+// mass_flux_weighting therefore also selects deln_flux's mass mode: Fortran
+// passes `mass` only in the mfx/mfy branch (tp_core.F90:222-224) and never in
+// the xfx/yfx branch (tp_core.F90:236-238). Encoding it as one flag makes the
+// off-manifold combinations unrepresentable rather than merely rejected.
+struct ScalarTransportOptions {
+  // Signed hord. abs(hord) selects the PPM order; hord < 0 additionally applies
+  // the al >= 0 positivity clamp (tp_core.F90:390-394). The production
+  // configuration uses hord_dp = -6, hord_vt = hord_tm = 6.
+  int32_t hord = 0;
+  // 0 -> average fluxes against xfx_adv/yfx_adv; 1 -> against mfx/mfy.
+  int32_t mass_flux_weighting = 0;
+  // Mirrors `present(nord) .and. present(damp_c)` at the fv_tp_2d call site.
+  int32_t deln_flux_enabled = 0;
+  int32_t nord = 0;
+  fv_real damp_c = fv_real(0);
+  fv_real da_min = fv_real(0);
+};
+
+// Reusable internal WP-B service: transport one arbitrary scalar field.
+//
+// This is deliberately NOT wired into NumericalDispatch. WP-B.2 owns the
+// transport machinery; the d_sw driver that calls it four times per level (and
+// then applies the order-critical pt/delp/w state updates and the cx/cy/xflux/
+// yflux flux-capacitor accumulation) is WP-B.3/WP-B.5 work. Exposing the
+// service at this granularity is what lets dgrid_dynamics reuse it later
+// without a redesign: the caller supplies views, this launches kernels.
+//
+// The scalar `q` is mutated in place by fv_tp_2d's two copy_corners calls,
+// exactly as in Fortran. The transported result is delivered as the flux pair
+// (fx, fy); applying it to model state is the caller's business, because the
+// authoritative update differs per scalar (delp is an additive flux
+// divergence, pt/w/q_con are mass-weighted, zh is renormalised by the swept
+// area).
+//
+// Returns FV3_GPU_UNSUPPORTED_CONFIGURATION when abs(hord) != 6 (only the
+// order-6 PPM path is ported) or when nord is outside [0, ng-1] with damping
+// enabled, and does so BEFORE launching any kernel, so model state is never
+// partially mutated by a rejected configuration.
+fv3_gpu_status launch_scalar_transport_cuda(
+    const TransportBounds &b, const ScalarTransportOptions &opt, const LevelFilter &lf,
+    View3<fv_real> q, View3<const fv_real> mass, View3<const fv_real> crx_adv,
+    View3<const fv_real> cry_adv, View3<const fv_real> xfx_adv,
+    View3<const fv_real> yfx_adv, View3<const fv_real> mfx, View3<const fv_real> mfy,
+    View2<const fv_real> area, View2<const fv_real> rarea, View2<const fv_real> dxa,
+    View2<const fv_real> dya, View2<const fv_real> del6_u, View2<const fv_real> del6_v,
+    View3<const fv_real> ra_x, View3<const fv_real> ra_y, View3<fv_real> q_i,
+    View3<fv_real> q_j, View3<fv_real> fx2_tp, View3<fv_real> fy2_tp, View3<fv_real> d2,
+    View3<fv_real> fx2_dn, View3<fv_real> fy2_dn, View3<fv_real> fx, View3<fv_real> fy,
+    void *stream) noexcept;
 
 } // namespace fv3::gpu::dgrid

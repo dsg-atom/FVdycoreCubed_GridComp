@@ -287,12 +287,15 @@ int launch_dgrid_height_transport_cuda(const ExecutionContext &x,
   const auto &cfg = x.immutable->config;
   const auto &topo = *x.immutable->topology;
 
-  HeightTransportBounds b{};
+  TransportBounds b{};
   b.is = db.is;
   b.ie = db.ie;
   b.js = db.js;
   b.je = db.je;
   b.npz = db.npz;
+  // update_dz_d transports the npz+1 INTERFACE heights, so every batched launch
+  // covers k in [0, npz]. Scalar transport uses nk = npz instead.
+  b.nk = db.npz + 1;
   b.halo_width = static_cast<int64_t>(db.halo_width);
   // Fortran ng is a parameter, not the registered halo (tools/fv_mp_mod.F90:108);
   // halo_width >= 3 is validated above so all ng-wide stencils stay in bounds.
@@ -376,8 +379,11 @@ int launch_dgrid_height_transport_cuda(const ExecutionContext &x,
   st = launch_copy_z2_cuda(b, lf_damped, to_const3(zh), z2, stream);
   if (st != FV3_GPU_SUCCESS) return fail(error, st, __func__, "launch_copy_z2_cuda failed");
 
+  // wx/wy == xfx_adv/yfx_adv: update_dz_d calls fv_tp_2d without mfx/mfy, so
+  // the `else` averaging branch (tp_core.F90:229-234) applies.
   st = launch_fv_tp_2d_cuda(b, cfg.hord_tm, lf_damped, z2, to_const3(crx_adv),
                             to_const3(cry_adv), to_const3(xfx_adv), to_const3(yfx_adv),
+                            to_const3(xfx_adv), to_const3(yfx_adv),
                             area, dxa, dya, to_const3(ra_x), to_const3(ra_y), q_i, q_j, fx,
                             fy, fx2_tp, fy2_tp, stream);
   if (st != FV3_GPU_SUCCESS)
@@ -395,6 +401,7 @@ int launch_dgrid_height_transport_cuda(const ExecutionContext &x,
   // --- undamped levels: transport zh in place, no damping ---
   st = launch_fv_tp_2d_cuda(b, cfg.hord_tm, lf_undamped, zh, to_const3(crx_adv),
                             to_const3(cry_adv), to_const3(xfx_adv), to_const3(yfx_adv),
+                            to_const3(xfx_adv), to_const3(yfx_adv),
                             area, dxa, dya, to_const3(ra_x), to_const3(ra_y), q_i, q_j, fx,
                             fy, fx2_tp, fy2_tp, stream);
   if (st != FV3_GPU_SUCCESS)
