@@ -82,6 +82,17 @@ struct TransportBounds {
 struct LevelFilter {
   View1<const fv_real> damp{};
   View1<const fv_real> ndif{};
+  // Optional ACTIVATION array, separate from the COEFFICIENT in damp.
+  //
+  // update_dz_d gates del6_vt_flux on the very coefficient it hands the routine
+  // (nh_utils.F90:280), so damp alone is enough there. d_sw's vorticity damping
+  // does not: sw_core.F90:1476-1479 tests `damp_v > 1.E-5` but passes
+  // damp4 = (damp_v*da_min_c)**(nord_v+1), and the two numbers differ. When
+  // gate is non-empty level_active tests gate(kk) instead of damp(kk).
+  //
+  // Leaving it empty selects the historical behaviour exactly, so Milestone
+  // 3A.4's height path and 3A.5's scalar path are bit-for-bit unaffected.
+  View1<const fv_real> gate{};
   int64_t npz = 0;
   // 0 = every level, 1 = damped levels, 2 = undamped levels,
   // 3 = damped levels whose nord equals nord_sel.

@@ -81,18 +81,26 @@ if(FV3_DYN_CORE_ENABLE_CUDA)
 
   # Milestone 3A.3/3A.5: WP-B D-grid height + scalar transport CUDA sources.
   # Milestone 3A.6 adds dgrid/wp_b_momentum_cuda.cu (WP-B.3 momentum
-  # transport). Both .cu files share dgrid/wp_b_ppm_shared.cuh so the PPM
-  # constants, seam predicates and launch helpers have one definition.
+  # transport); Milestone 3A.7 adds dgrid/wp_b_divergence_cuda.cu (WP-B.4
+  # divergence damping / smag_corner / d_con heating). All three .cu files
+  # share dgrid/wp_b_ppm_shared.cuh so the PPM constants, seam predicates and
+  # launch helpers have one definition.
   add_library(fv3_wp_b_cuda STATIC
     dgrid/wp_b_cuda.cu
     dgrid/wp_b_momentum_cuda.cu
+    dgrid/wp_b_divergence_cuda.cu
     dgrid/wp_b_contract_cuda.cpp)
   target_include_directories(fv3_wp_b_cuda PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/dgrid
     ${CMAKE_CURRENT_SOURCE_DIR}
   )
-  target_link_libraries(fv3_wp_b_cuda PUBLIC fv3_wp_b_dgrid CUDA::cudart)
+  # fv3_wp_d_cuda: Milestone 3A.7's smag_corner REUSES WP-D's
+  # operators::launch_a2b_ord4_global_cuda rather than transcribing a second
+  # a2b_ord4 (project no-duplication rule). This is the only cross-work-package
+  # call in WP-B and introduces no cycle -- fv3_wp_d_cuda does not depend on
+  # fv3_wp_b_cuda.
+  target_link_libraries(fv3_wp_b_cuda PUBLIC fv3_wp_b_dgrid fv3_wp_d_cuda CUDA::cudart)
   set_target_properties(fv3_wp_b_cuda PROPERTIES CUDA_STANDARD 17)
 
   # Milestone 3A.1: production NumericalDispatch (wires WP-A/WP-C/WP-D CUDA
@@ -279,6 +287,41 @@ if(BUILD_TESTING)
     # This test requires a GPU to run - mark as needing GPU label
     add_test(NAME fv3_wp_b3_momentum COMMAND fv3_wp_b3_momentum_test)
     set_tests_properties(fv3_wp_b3_momentum PROPERTIES
+      LABELS "gpu"
+      SKIP_RETURN_CODE 77
+    )
+
+    # Milestone 3A.7 WP-B.4 authoritative divergence-damping / corner slice CUDA
+    # behavior test (requires CUDA and GPU). Host references are transcribed from
+    # sw_core.F90 d_sw :1277-1534 and smag_corner :1857-1947 in the Fortran's own
+    # multi-pass structure, so agreement is evidence rather than tautology.
+    # Parts A-L: branch L (nord == 0) at the seam and in the interior,
+    # fill_corners BGRID scalar and DGRID vector rotations, the branch-H
+    # iterate, vort zeroing + the high-order finalize, smag_corner (which reuses
+    # WP-D's a2b_ord4 rather than duplicating it), the d_con heat-source chain,
+    # the damp_v wind update, bitwise identity of the vorticity-damping adapter
+    # with launch_del6_vt_flux_cuda, unsupported-configuration rejection, and the
+    # DivergenceLevels selector semantics.
+    #
+    # fv3_wp_d_cuda is already PUBLIC on fv3_wp_b_cuda (smag_corner calls
+    # launch_a2b_ord4_global_cuda); it is repeated here because this test also
+    # calls that launcher DIRECTLY to build its reference sh.
+    add_executable(fv3_wp_b4_divergence_test
+      tests/dgrid/test_wp_b4_divergence_cuda.cpp)
+    target_include_directories(fv3_wp_b4_divergence_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+      ${CMAKE_CURRENT_SOURCE_DIR}/dgrid
+      ${CMAKE_CURRENT_SOURCE_DIR}/operators
+    )
+    target_link_libraries(fv3_wp_b4_divergence_test PRIVATE
+      fv3_dyn_core_gpu
+      fv3_wp_b_cuda
+      fv3_wp_d_cuda
+      CUDA::cudart
+    )
+    # This test requires a GPU to run - mark as needing GPU label
+    add_test(NAME fv3_wp_b4_divergence COMMAND fv3_wp_b4_divergence_test)
+    set_tests_properties(fv3_wp_b4_divergence PROPERTIES
       LABELS "gpu"
       SKIP_RETURN_CODE 77
     )

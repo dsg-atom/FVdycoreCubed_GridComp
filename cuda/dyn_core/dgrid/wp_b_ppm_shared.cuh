@@ -51,7 +51,12 @@ inline fv3_gpu_status launch_status() {
 __device__ __forceinline__ bool level_active(const LevelFilter &f, int64_t k) {
   if (f.mode == 0) return true;
   const int64_t kk = k < f.npz ? k : f.npz - 1;   // damp(km+1) = damp(km)
-  const bool damped = f.damp(kk) > damp_threshold();
+  // When the caller supplies a separate activation array the test uses it; with
+  // gate empty this is exactly the historical f.damp(kk) test. See
+  // LevelFilter::gate -- d_sw's `damp_v > 1.E-5` gate is not the damp4
+  // coefficient it passes to del6_vt_flux.
+  const bool damped =
+      (f.gate.data != nullptr ? f.gate(kk) : f.damp(kk)) > damp_threshold();
   if (f.mode == 1) return damped;
   if (f.mode == 2) return !damped;
   const int64_t nord = static_cast<int64_t>(llrint(static_cast<double>(f.ndif(kk))));

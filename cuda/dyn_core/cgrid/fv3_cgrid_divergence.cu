@@ -1,7 +1,15 @@
-// Authoritative source: model/sw_core.F90:divergence_corner (lines 1694-1799)
-// Corner flux divergence for nord > 0 damping on global cubed-sphere.
+// Authoritative source: model/sw_core.F90:divergence_corner (lines 1659-1764)
+// (GFDL_atmos_cubed_sphere tag geos/v3.0.0, ca30e26). Corner flux divergence
+// for nord > 0 damping on the global cubed-sphere.
 //
-// The nested branch (divergence_corner_nest) is milestone-one unsupported.
+// The separate subroutine divergence_corner_nest (:1766-) is not implemented
+// here. NOTE: DivergenceCornerArgs carries no `nested` flag, so the
+// nested-grid `is2 = is; ie1 = ie+1` selection at :1694-1698 cannot be
+// represented and divergence_corner_vf unconditionally applies the non-nested
+// `is2 = max(2,is); ie1 = min(npx-1,ie+1)`. Whoever wires the first caller
+// (c_sw, sw_core.F90:175-181) must add that flag and reject nested here
+// rather than silently running the global formula. See
+// docs/agent_handoff/milestone_3a7_wp_b_divergence_corner.md.
 
 #include "fv3_cgrid_divergence.hpp"
 #include "fv3_gpu_errors.hpp"
@@ -12,9 +20,19 @@ namespace fv3::gpu::cgrid {
 namespace {
 
 // Simple case: grid_type > 3 (Cartesian-like)
+//
+// Origin is (is-2, js-2), NOT (is-1, js-1). uf is declared over is-2:ie+2
+// (:1668, written by the i=is-2,ie+2 loop at :1702) and vf over js-2:je+2
+// (:1669, written by the j=js-2,je+2 loop at :1706), and
+// divergence_corner_simple_divg reads uf(is-2,j) and vf(i,js-2) at its own
+// low corner. Launching from (is-1, js-1) left those two rings unwritten --
+// the `i >= is-2` and `j >= js-2` guards below were unreachable -- so the
+// divg kernel consumed uninitialized workspace. The extents (ie-is+5,
+// je-js+5) were already exactly the Fortran loop counts; only the origin was
+// wrong. Numerical semantics changed: NO.
 __global__ void divergence_corner_simple(DivergenceCornerArgs a, int64_t k) {
-  const int64_t i = a.bounds.is - 1 + blockIdx.x * blockDim.x + threadIdx.x;
-  const int64_t j = a.bounds.js - 1 + blockIdx.y * blockDim.y + threadIdx.y;
+  const int64_t i = a.bounds.is - 2 + blockIdx.x * blockDim.x + threadIdx.x;
+  const int64_t j = a.bounds.js - 2 + blockIdx.y * blockDim.y + threadIdx.y;
 
   // Compute uf (is-2:ie+2, js-1:je+2)
   if (i >= a.bounds.is - 2 && i <= a.bounds.ie + 2 &&
@@ -29,6 +47,9 @@ __global__ void divergence_corner_simple(DivergenceCornerArgs a, int64_t k) {
   }
 }
 
+// Origin stays (is-1, js-1) here: :1711-1712 writes divg_d only over
+// j=js-1,je+2 / i=is-1,ie+2, one ring narrower on the low side than the uf/vf
+// loops above. The guard supplies the high side.
 __global__ void divergence_corner_simple_divg(DivergenceCornerArgs a, int64_t k) {
   const int64_t i = a.bounds.is - 1 + blockIdx.x * blockDim.x + threadIdx.x;
   const int64_t j = a.bounds.js - 1 + blockIdx.y * blockDim.y + threadIdx.y;
@@ -164,7 +185,9 @@ fv3_gpu_status launch_divergence_corner_level(const DivergenceCornerArgs &a,
   constexpr dim3 block(16, 8);
 
   if (a.grid_type > 3) {
-    // Simple Cartesian case
+    // Simple Cartesian case. nx/ny are the widest Fortran loop counts
+    // (i=is-2..ie+2, j=js-2..je+2); the two kernels start from different
+    // origins and clip with their own guards.
     const auto nx = static_cast<unsigned>(a.bounds.ie - a.bounds.is + 5);
     const auto ny = static_cast<unsigned>(a.bounds.je - a.bounds.js + 5);
     dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);

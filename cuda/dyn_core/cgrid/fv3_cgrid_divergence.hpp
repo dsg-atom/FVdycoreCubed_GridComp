@@ -5,7 +5,7 @@
 namespace fv3::gpu::cgrid {
 
 // Arguments for divergence_corner (global cubed-sphere, non-nested)
-// Authoritative source: model/sw_core.F90:1694-1799
+// Authoritative source: model/sw_core.F90:1659-1764
 struct DivergenceCornerArgs {
   Bounds bounds{};
   int32_t npx{}, npy{};
@@ -36,7 +36,9 @@ struct DivergenceCornerArgs {
 };
 
 // Launch divergence_corner for one vertical level. Returns status.
-// Nested grids are milestone-one unsupported.
+// Nested grids are milestone-one unsupported and, because this struct carries
+// no `nested` flag, are not currently *rejected* either -- see the note at the
+// top of fv3_cgrid_divergence.cu.
 fv3_gpu_status launch_divergence_corner_level(const DivergenceCornerArgs &args,
                                               int64_t k, void *stream);
 
