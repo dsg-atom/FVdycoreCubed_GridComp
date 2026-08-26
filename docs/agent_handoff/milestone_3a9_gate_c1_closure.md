@@ -21,7 +21,7 @@ It is required, so this reports blocked.
 | --- | --- |
 | branch | `cuda/gpu-bringup` |
 | parent commit | `7ddb6f9` (Record milestone 3A.8 commit SHA in handoff) |
-| this milestone's commit | recorded in a follow-up commit, as in 3A.6/3A.7/3A.8 |
+| this milestone's commit | `b5bd177` (Close integrated FV3 dyn_core GPU Gate C1) |
 | authoritative Fortran | `GEOS-ESM/GFDL_atmos_cubed_sphere`, tag `geos/v3.0.0`, SHA `ca30e26305fda43831095334c02a3f5e0b8c0c45` |
 | reference clone used | `/discover/nobackup/projects/imvi-nse/jli30/fv3_reference/GFDL_atmos_cubed_sphere` |
 | platform | NASA NCCS Discover, `gpu_a100`, `--constraint=rome`, node `warpa003` |
