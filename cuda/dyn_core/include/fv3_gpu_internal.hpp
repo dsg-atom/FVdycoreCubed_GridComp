@@ -12,6 +12,11 @@ namespace fv3::gpu {
 
 inline constexpr uint32_t internal_contract_version = 4;
 
+/* Milestone 3A.10: forward-declared rather than included, so that <mutex> and
+ * <condition_variable> do not enter every translation unit that needs the
+ * contract types. The definition is in include/fv3_gpu_halo_peer.hpp. */
+namespace halo { class HaloPeerGroup; }
+
 enum class FieldId : uint32_t {
   invalid=0, u, v, w, delz, pt, delp, q, q_con, cappa, pe, pk, peln,
   pkz, phis, omga, ua, va, uc, vc, mfx, mfy, cx, cy, dpx, diss_est, ws,
@@ -234,6 +239,38 @@ struct Submission {
 };
 
 enum class HaloState : uint8_t { unknown, ready, stale, exchange_pending };
+
+/* Milestone 3A.10 §10/§27: WHY a halo group became ready.
+ *
+ * HaloState records only that a group is ready; it cannot distinguish readiness
+ * that was earned by moving and transforming the data from readiness that was
+ * merely asserted. Gate C1's pass condition is stated in terms of exactly that
+ * distinction -- "no required halo is declared ready without the corresponding
+ * data movement/transformation having actually completed" -- so the runtime has
+ * to be able to answer it rather than have the report assert it.
+ *
+ *   none             never resolved this run.
+ *   vacuous_topology the decomposition provably has nothing to exchange, so
+ *                    mpp_update_domains would copy nothing and readiness skips
+ *                    no operation.
+ *   caller_declared  the CALLER said it fills this group (mark_halo_caller_managed
+ *                    / mark_halo_ready). The runtime asserts nothing about the
+ *                    data. Any group resolved this way DISQUALIFIES a Gate C1
+ *                    pass for that group.
+ *   exchanged        a real pack -> transform -> transfer -> unpack completed,
+ *                    and the readiness event is that sequence's completion.
+ *
+ * Ordering matters: `exchanged` must be attempted before `caller_declared` is
+ * consulted, or a legacy caller declaration would silently shadow the real
+ * exchange and §14's "no manual halo-ready declarations may bypass required
+ * exchange" would be violated without anything reporting it. */
+enum class HaloResolution : uint8_t {
+  none = 0,
+  vacuous_topology = 1,
+  caller_declared = 2,
+  exchanged = 3
+};
+
 struct DependencyState {
   std::array<HaloState,FV3_GPU_H_DWIND_NEXT+1> halo{};
   std::array<fv3_gpu_event,FV3_GPU_H_DWIND_NEXT+1> ready_event{};
@@ -332,5 +369,27 @@ int mark_halo_caller_managed(fv3_gpu_context *, fv3_gpu_halo_group, fv3_gpu_erro
 /* Milestone 3A.4 addition to the same C++-only setter family: TopologyView now
  * carries npx/npy, which nothing in the public C ABI can write. */
 int set_topology(fv3_gpu_context *, const TopologyView &, fv3_gpu_error *) noexcept;
+
+/* Milestone 3A.10 §4/§9/§10: attach this context to the Model B peer group so
+ * that its halo groups are resolved by a REAL device-to-device exchange rather
+ * than by a caller declaration.
+ *
+ * Deliberately NOT part of the public C ABI. Model B represents all six tiles in
+ * one process, which is a Gate C1 execution model, not a production one --
+ * production is six MPI ranks and remains future work (§15). Exposing it through
+ * fv3_gpu_api.h would invite a Fortran caller to build a topology it cannot
+ * actually satisfy, and would grow the ABI for a harness.
+ *
+ * Requires: a topology already installed (npx/npy > 0) and domain bounds set, so
+ * the buffers can be sized. Allocates this context's send/recv buffers and its
+ * two ordering events; detach frees them. Once attached, resolve_halo() performs
+ * the exchange and records HaloResolution::exchanged. */
+int attach_halo_peer_group(fv3_gpu_context *, halo::HaloPeerGroup *, int32_t tile,
+                           fv3_gpu_error *) noexcept;
+int detach_halo_peer_group(fv3_gpu_context *, fv3_gpu_error *) noexcept;
+/* Provenance of a group's most recent readiness, for a harness that must prove no
+ * required group was resolved by declaration. Returns HaloResolution::none for an
+ * invalid group or a null context. */
+HaloResolution halo_resolution_of(const fv3_gpu_context *, fv3_gpu_halo_group) noexcept;
 
 }

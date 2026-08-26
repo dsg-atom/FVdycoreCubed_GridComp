@@ -616,6 +616,49 @@ int launch_dgrid_dynamics_cuda(const ExecutionContext &x, fv3_gpu_error *error) 
   if (status != FV3_GPU_SUCCESS)
     return fail(error, status, __func__, "launch_d_sw_cuda failed");
 
+  /* Milestone 3A.10 §12 -- what d_sw INVALIDATES.
+   *
+   * Until this milestone d_sw marked nothing stale, which was survivable only
+   * because every group below happens to be re-resolved before its next
+   * consumer. That is a property of the current stage list, not of the state
+   * machine, and it left the recorded state saying "ready" about arrays whose
+   * halo -- and in one case whose interior -- no longer held what the name
+   * implies. Now that resolve_halo can perform a real exchange, the bookkeeping
+   * has to describe the data.
+   *
+   *   H_CWIND    uc/vc are not merely halo-stale, they are DESTROYED. The
+   *              high-order divergence damping reuses them as scratch:
+   *              sw_core.F90:1378-1389 (nord > 0, which the production first-run
+   *              config has), ported verbatim as divdamp_divg_dx_kernel /
+   *              divdamp_divg_dy_kernel (wp_b_divergence_cuda.cu:263,:275).
+   *              d2a2c_vect re-creates them next substep as intent(out)
+   *              (sw_core.F90:2806-2807), so they carry nothing across.
+   *   H_DWIND_IN u/v are updated INTERIOR ONLY: sw_core.F90:1465-1472 and, when
+   *              damp_v > 1.e-5, :1524-1533. dyn_core.F90:1109 exists precisely
+   *              because of that, and the runtime's unconditional resolve at the
+   *              top of the next substep is that exchange.
+   *   H_W_IN     w likewise interior-only (the damp_w path).
+   *   H_DSCALAR  delp/pt interior-only via the transport; dyn_core.F90:844
+   *              re-exchanges them immediately, which is the very next resolve
+   *              point in the runtime loop.
+   *
+   * Marking stale here does not gate the exchange -- resolve_halo re-exchanges
+   * at every authoritative point regardless of state, as the Fortran does. What
+   * it buys is that a future consumer inserted into any of these intervals fails
+   * loudly instead of reading divergence-damping scratch that still reads as a
+   * C-grid wind.
+   *
+   * Numerical semantics changed: NO. */
+  const fv3_gpu_halo_group invalidated[] = {FV3_GPU_H_CWIND, FV3_GPU_H_DWIND_IN,
+                                            FV3_GPU_H_W_IN, FV3_GPU_H_DSCALAR};
+  for (fv3_gpu_halo_group g : invalidated) {
+    /* mark_stale returns plain int and can only fail on an invalid group, which
+     * these four literals are not; checked anyway rather than discarded. */
+    if (x.dependencies->mark_stale(g) != 0)
+      return fail(error, FV3_GPU_INVALID_ARGUMENT, __func__,
+                  "d_sw could not record the halo group it invalidates");
+  }
+
   return FV3_GPU_SUCCESS;
 }
 

@@ -1,6 +1,8 @@
 #include "fv3_gpu_api.h"
 #include "fv3_gpu_context.hpp"
 #include "fv3_gpu_errors.hpp"
+#include "fv3_gpu_halo_peer.hpp"
+#include "fv3_gpu_halo_topology.hpp"
 #include "fv3_gpu_types.hpp"
 #include <algorithm>
 #include <cstring>
@@ -157,6 +159,15 @@ int zero_accumulators(ContextData &d, fv3_gpu_error *e, const char *api) {
  * "management" of a group is a no-op has a falsely-ready halo in substance even
  * though the runtime never claimed otherwise.
  *
+ * MILESTONE 3A.10 AMENDS THE ABOVE IN TWO WAYS. First, outcome 1's predicate
+ * failed OPEN on a topology that had never been supplied, which made the
+ * "runtime invents no readiness" claim untrue in one reachable case; there is
+ * now a fourth outcome, `not_supplied`, which refuses -- see
+ * classify_halo_topology() below. Second, readiness now carries provenance
+ * (HaloResolution, recorded in ContextData::halo_resolution), so the distinction
+ * this comment draws in prose between "exchanged" and "asserted by the caller"
+ * is machine-checkable rather than something a report has to promise.
+ *
  * mark_stale stays fully live. Groups are re-resolved at the authoritative
  * exchange points on every substep, so a stage that invalidates a group
  * (cgrid_predictor -> H_CWIND/H_DIVGD, cgrid_pressure -> H_CWIND) still forces
@@ -179,35 +190,298 @@ const char *halo_group_name(fv3_gpu_halo_group g) noexcept {
   }
 }
 
-/* True when mpp_update_domains would copy nothing for this decomposition, so
- * that "ready" claims no data this runtime did not produce. */
-bool halo_exchange_is_vacuous(const TopologyView &t) noexcept {
+/* ---------------------------------------------------------------------------
+ * Milestone 3A.10 §2: the vacuity test USED TO FAIL OPEN, and that was
+ * reachable false halo readiness.
+ *
+ * The previous predicate was:
+ *
+ *     for (const auto &nb : t.neighbors)
+ *       if (nb.rank >= 0 || nb.tile >= 0) return false;
+ *     for (const auto owner : t.corner_owner_rank)
+ *       if (owner >= 0) return false;
+ *     return !(t.nested || t.regional || t.periodic_x || t.periodic_y);
+ *
+ * A default-constructed TopologyView has every neighbour rank and tile at -1,
+ * every corner_owner_rank at -1, and none of the wrap flags set -- so it
+ * returned TRUE. resolve_halo then marked every group ready having moved
+ * nothing, on a context whose global_cubed_sphere defaults to 1, i.e. one that
+ * positively declares itself a global cubed sphere. The predicate conflated
+ * "no topology information was supplied" with "this topology genuinely has
+ * nothing to exchange", and those are opposite conclusions.
+ *
+ * It was reachable: set_topology() had no production caller at all, and the
+ * Fortran bridge (cuda/interface/fv3_gpu_interface_mod.F90) never mentions
+ * topology, npx, npy or tile. Nothing but luck stood in the way -- npx = npy = 0
+ * makes the panel-geometry stages reject later in the substep, which masks it
+ * incidentally for a FULL production dispatch but guarantees nothing for a
+ * partial one.
+ *
+ * Vacuity now requires POSITIVE evidence and has a third outcome for absence of
+ * evidence:
+ *
+ *   - npx/npy > 0. The contract already documents zero as "not supplied by the
+ *     caller" (see TopologyView in fv3_gpu_internal.hpp), so this is the
+ *     existing supplied-ness signal, not a new one.
+ *   - global_cubed_sphere == 0. A global cubed sphere puts a neighbouring tile
+ *     on all four edges of every tile; a TopologyView asserting both "global
+ *     cubed sphere" and "no neighbours" is self-contradictory and must never be
+ *     read as vacuous.
+ *   - and then, as before, no connected edge, no corner owner, and no
+ *     periodic/nested/regional wrap.
+ * ------------------------------------------------------------------------- */
+enum class HaloTopologyClass { not_supplied, connected, vacuous };
+
+HaloTopologyClass classify_halo_topology(const TopologyView &t) noexcept {
+  if (t.npx <= 0 || t.npy <= 0) return HaloTopologyClass::not_supplied;
+  if (t.global_cubed_sphere) return HaloTopologyClass::connected;
+  if (t.nested || t.regional || t.periodic_x || t.periodic_y)
+    return HaloTopologyClass::connected;
   for (const auto &nb : t.neighbors)
-    if (nb.rank >= 0 || nb.tile >= 0) return false;
+    if (nb.rank >= 0 || nb.tile >= 0) return HaloTopologyClass::connected;
   for (const auto owner : t.corner_owner_rank)
-    if (owner >= 0) return false;
-  return !(t.nested || t.regional || t.periodic_x || t.periodic_y);
+    if (owner >= 0) return HaloTopologyClass::connected;
+  return HaloTopologyClass::vacuous;
 }
+
+#ifdef FV3_GPU_ENABLE_CUDA
+/* ---------------------------------------------------------------------------
+ * Milestone 3A.10 §9/§10/§17 -- the REAL exchange, wired into readiness.
+ *
+ * §10 requires that "a halo may become ready only after producer stage -> pack ->
+ * transfer/transform -> unpack -> completion event", and §17 requires the stream
+ * ordering to be proven rather than assumed. The sequence and the reason each
+ * step exists are documented once, in include/fv3_gpu_halo_peer.hpp; this is the
+ * implementation of it.
+ * ------------------------------------------------------------------------- */
+halo::HaloGeometry geometry_of(const ContextData &d) noexcept {
+  halo::HaloGeometry g{};
+  g.nx = d.immutable.bounds.ie - d.immutable.bounds.is + 1;
+  g.ny = d.immutable.bounds.je - d.immutable.bounds.js + 1;
+  g.npz = d.immutable.bounds.npz;
+  return g;
+}
+
+/* Reduce a group's declarative field table to the fields this context actually
+ * has registered, and build the device views the kernels need.
+ *
+ * Compaction is necessary because a group's table is the AUTHORITATIVE field list
+ * while a caller's registry is configuration-dependent -- cappa exists only under
+ * MOIST_CAPPA, heat_source only when d_con exceeds its threshold. It is also
+ * dangerous, because the send and receive sides index slots positionally: two
+ * tiles that compacted differently would read each other's buffers at the wrong
+ * offset and get a plausible number from the wrong field. That is why the
+ * resulting field count is agreed across the peer group before any data moves.
+ *
+ * A VECTOR field is never compacted away. Dropping one half of a pair would leave
+ * the survivor's rotated-seam partner unresolvable, and the seam would then be
+ * served from the wrong component -- so a half-registered wind pair is refused. */
+int build_group_fields(const ContextData &d, uint32_t group,
+                       halo::HaloGroupSpec &eff, halo::HaloTileFields &f,
+                       fv3_gpu_error *e, const char *api) {
+  const halo::HaloGroupSpec spec = halo::halo_group_spec(group);
+  if (!spec.live)
+    return fail(e, FV3_GPU_INVALID_ARGUMENT, api,
+                std::string("halo group ") +
+                    halo_group_name(static_cast<fv3_gpu_halo_group>(group)) +
+                    " is not live and cannot be exchanged");
+  eff = spec;
+  eff.field_count = 0;
+  for (int n = 0; n < spec.field_count; ++n) {
+    const halo::HaloFieldSpec &fs = spec.fields[n];
+    const DeviceViewBase *v = d.state.registry.find(fs.id);
+    if (!v || !v->data) {
+      if (fs.role != halo::VectorRole::scalar)
+        return fail(e, FV3_GPU_INVALID_ARGUMENT, api,
+                    std::string("halo group ") +
+                        halo_group_name(static_cast<fv3_gpu_halo_group>(group)) +
+                        " is a vector pair but only one component is registered; "
+                        "a rotated seam could not resolve the missing partner");
+      continue;  /* configuration-dependent scalar; genuinely absent */
+    }
+    if (v->rank < 3)
+      return fail(e, FV3_GPU_INVALID_ARGUMENT, api,
+                  "a halo group field is registered with fewer than three "
+                  "dimensions; the exchange indexes (i, j, k)");
+    if (!view_element_width_is(v, sizeof(fv_real)))
+      return fail(e, FV3_GPU_INVALID_ARGUMENT, api,
+                  "a halo group field's registered element width does not match "
+                  "this build's fv_real; the exchange will not reinterpret it");
+    const int slot = eff.field_count;
+    eff.fields[slot] = fs;
+    halo::HaloStripView view{};
+    view.data = static_cast<fv_real *>(v->data);
+    view.lo_i = v->lower[0]; view.lo_j = v->lower[1]; view.lo_k = v->lower[2];
+    view.st_i = v->stride[0]; view.st_j = v->stride[1]; view.st_k = v->stride[2];
+    view.nk = static_cast<int64_t>(v->extent[2]);
+    f.view[slot] = view;
+    f.present[slot] = 1;
+    ++eff.field_count;
+  }
+  if (eff.field_count == 0)
+    return fail(e, FV3_GPU_INVALID_ARGUMENT, api,
+                std::string("halo group ") +
+                    halo_group_name(static_cast<fv3_gpu_halo_group>(group)) +
+                    " has no registered fields, so no exchange can be performed "
+                    "for it; readiness is refused rather than granted vacuously");
+  return FV3_GPU_SUCCESS;
+}
+
+int perform_peer_exchange(ContextData &d, fv3_gpu_halo_group g, fv3_gpu_error *e,
+                          const char *api) {
+  auto *pg = static_cast<halo::HaloPeerGroup *>(d.halo_peer);
+  const uint32_t group = static_cast<uint32_t>(g);
+  halo::HaloGroupSpec eff{};
+  halo::HaloTileFields fields{};
+  int rc = build_group_fields(d, group, eff, fields, e, api);
+  if (rc != FV3_GPU_SUCCESS) return rc;
+
+  if (!pg->agree_on_layout(group, eff.field_count))
+    return fail(e, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                std::string("peers disagree on the registered field layout of ") +
+                    halo_group_name(g) +
+                    "; slot-indexed buffers would be read at the wrong offset");
+
+  const halo::HaloGeometry geom = geometry_of(d);
+  if (halo::group_buffer_elements(eff, geom) > d.halo_buffer_elements)
+    return fail(e, FV3_GPU_INTERNAL_ERROR, api,
+                "halo buffers were sized for a smaller group than the one being "
+                "exchanged");
+
+  /* 1. The pack must observe the producer stage's writes. Both streams are
+   *    cudaStreamNonBlocking, so this event is the only thing that makes them
+   *    visible to each other (§17). */
+  cudaError_t crc = order_after(d.compute_stream, d.transfer_stream, d.event_compute_done);
+  if (crc != cudaSuccess) return cuda_fail(crc, e, api, &d);
+
+  rc = halo::launch_halo_pack(eff, geom, fields, d.halo_send, d.transfer_stream, e);
+  if (rc != FV3_GPU_SUCCESS) return rc;
+  crc = cudaEventRecord(static_cast<cudaEvent_t>(d.event_halo_pack),
+                        static_cast<cudaStream_t>(d.transfer_stream));
+  if (crc != cudaSuccess) return cuda_fail(crc, e, api, &d);
+
+  /* 2. Every peer has now ENQUEUED its pack. This is a host rendezvous over
+   *    enqueue order, not a device synchronization: no thread waits for the GPU
+   *    here. It is the same guarantee MPI_Waitall on the sends would give. */
+  if (!pg->barrier())
+    return fail(e, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                "the halo peer group is not fully attached; waiting for a member "
+                "that will never arrive would deadlock, so it is refused");
+
+  /* 3. Wait on the DEVICE for the four donors' packs. Only the four neighbours
+   *    matter, and taking them from the topology rather than from all six keeps
+   *    this honest about who actually feeds this tile. */
+  for (int q = 0; q < 4; ++q) {
+    const int32_t nbt = d.topology.neighbors[static_cast<size_t>(q)].tile;
+    if (nbt < 1 || nbt > halo::cubed_sphere_tiles)
+      return fail(e, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                  "an edge has no neighbour tile, so its halo cannot be exchanged");
+    void *ev = pg->member(nbt).pack_done;
+    if (!ev)
+      return fail(e, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                  "a neighbour tile is not attached to the peer group");
+    crc = cudaStreamWaitEvent(static_cast<cudaStream_t>(d.transfer_stream),
+                              static_cast<cudaEvent_t>(ev), 0);
+    if (crc != cudaSuccess) return cuda_fail(crc, e, api, &d);
+  }
+
+  fv_real *send_table[halo::cubed_sphere_tiles + 1];
+  pg->send_table(send_table);
+  rc = halo::launch_halo_transfer(eff, geom, d.topology, send_table, d.halo_recv,
+                                  d.transfer_stream, e);
+  if (rc != FV3_GPU_SUCCESS) return rc;
+  rc = halo::launch_halo_unpack(eff, geom, d.topology, fields, d.halo_recv,
+                                d.transfer_stream, e);
+  if (rc != FV3_GPU_SUCCESS) return rc;
+
+  crc = cudaEventRecord(static_cast<cudaEvent_t>(d.event_halo_xfer),
+                        static_cast<cudaStream_t>(d.transfer_stream));
+  if (crc != cudaSuccess) return cuda_fail(crc, e, api, &d);
+  /* 4. The CONSUMER runs on compute_stream and must not start before the unpack
+   *    lands. This is the edge that makes readiness mean something. */
+  crc = cudaStreamWaitEvent(static_cast<cudaStream_t>(d.compute_stream),
+                            static_cast<cudaEvent_t>(d.event_halo_xfer), 0);
+  if (crc != cudaSuccess) return cuda_fail(crc, e, api, &d);
+
+  /* 5. Nobody may repack into a send buffer that somebody else is still reading.
+   *    My next pack is on my stream; the transfer that reads my buffer is on the
+   *    reader's stream, and nothing orders those two. Without this the next
+   *    group's pack is a write-after-read hazard across streams. */
+  if (!pg->barrier())
+    return fail(e, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                "the halo peer group lost a member mid-exchange");
+  for (int t = 1; t <= pg->tiles(); ++t) {
+    void *ev = pg->member(static_cast<int32_t>(t)).xfer_done;
+    if (!ev) continue;
+    crc = cudaStreamWaitEvent(static_cast<cudaStream_t>(d.transfer_stream),
+                              static_cast<cudaEvent_t>(ev), 0);
+    if (crc != cudaSuccess) return cuda_fail(crc, e, api, &d);
+  }
+  return FV3_GPU_SUCCESS;
+}
+#endif  // FV3_GPU_ENABLE_CUDA
 
 int resolve_halo(ContextData &d, fv3_gpu_halo_group g, fv3_gpu_error *e,
                  const char *api) {
   const auto slot = static_cast<size_t>(g);
   if (slot >= d.halo_caller_managed.size())
     return fail(e, FV3_GPU_INVALID_ARGUMENT, api, "invalid halo group");
-  const bool caller_managed = d.halo_caller_managed[slot] != 0;
-  if (!caller_managed && !halo_exchange_is_vacuous(d.topology))
+
+  const HaloTopologyClass klass = classify_halo_topology(d.topology);
+
+  /* Absence of a topology is never a licence to resolve, and a caller
+   * declaration cannot substitute for one: a caller that has not said where its
+   * neighbours are has not said what it is filling either. This is the branch
+   * that used to be silently the vacuous one. */
+  if (klass == HaloTopologyClass::not_supplied)
     return fail(e, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
                 std::string("halo group ") + halo_group_name(g) +
-                    " requires a real domain exchange; this runtime has no halo "
-                    "transport, and the caller has not declared this group "
-                    "caller-managed, so readiness cannot be established for a "
-                    "connected, periodic, nested or regional topology");
+                    " cannot be resolved because no topology has been supplied "
+                    "(TopologyView::npx/npy are zero, which the contract "
+                    "defines as not-supplied); an absent topology is refused "
+                    "rather than treated as having nothing to exchange");
+
+  HaloResolution provenance = HaloResolution::none;
+  if (klass == HaloTopologyClass::vacuous) {
+    provenance = HaloResolution::vacuous_topology;
+  } else if (d.halo_peer != nullptr) {
+    /* Milestone 3A.10: the branch that did not exist. A real exchange runs here
+     * and readiness is granted only if it completed enqueuing without error, with
+     * the consumer stream ordered behind the unpack. This is checked BEFORE the
+     * caller declaration, deliberately: if a real exchange is available it is
+     * always the truthful answer, and a caller's claim must not be able to
+     * suppress it. */
+#ifdef FV3_GPU_ENABLE_CUDA
+    const int xrc = perform_peer_exchange(d, g, e, api);
+    if (xrc != FV3_GPU_SUCCESS) return xrc;
+    provenance = HaloResolution::exchanged;
+#else
+    return fail(e, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                "a halo peer group is attached but this build has no CUDA "
+                "support, so no exchange can be performed");
+#endif
+  } else if (d.halo_caller_managed[slot] != 0) {
+    /* Retained for callers that own mpp_update_domains themselves. It records
+     * whose claim readiness is; it asserts nothing about the halo cells. A group
+     * resolved here is reported as caller_declared and cannot count towards a
+     * Gate C1 pass. */
+    provenance = HaloResolution::caller_declared;
+  } else {
+    return fail(e, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                std::string("halo group ") + halo_group_name(g) +
+                    " requires a real domain exchange on this connected "
+                    "topology, no exchange is installed for it, and the caller "
+                    "has not declared this group caller-managed, so readiness "
+                    "cannot be established");
+  }
+
   const fv3_gpu_event ev = issue_event(d);
   const int rc = d.dependencies.mark_ready(g, ev);
   if (rc != 0)
     return fail(e, static_cast<fv3_gpu_status>(rc), api,
                 std::string("could not mark halo group ") + halo_group_name(g) +
                     " ready");
+  d.halo_resolution[slot] = provenance;
   return FV3_GPU_SUCCESS;
 }
 
@@ -328,18 +602,33 @@ int fence_production_config(const NumericalConfig &cfg, const TopologyView *topo
       return reject("global_cubed_sphere must be set; the supported subset is "
                     "the global gnomonic cubed sphere");
     /* npx/npy == 0 is deliberately NOT fenced here. It is a missing INPUT, not
-     * an unsupported configuration -- the difference matters, because the two
-     * consumers that need panel geometry (bind_wp_b_d_sw, and WP-D's
-     * physical_edges feeding a2b_ord4) already refuse zero at their binders,
-     * with the correct FV3_GPU_INVALID_ARGUMENT, and stages that need no panel
-     * semantics are legitimately drivable without it.
+     * an unsupported configuration, and stages that need no panel semantics are
+     * legitimately drivable without it.
      *
-     * Those refusals are not pre-mutation, so a dispatch table containing a
-     * panel-geometry consumer plus an npx == 0 topology can still tear device
-     * state -- a residual gap recorded in the milestone 3A.9 handoff rather
-     * than papered over here. Fencing it at this level would have required
-     * every minimal-dispatch driver to describe a full tile geometry it does
-     * not use, which trades a narrow real gap for a broad false requirement. */
+     * CORRECTED in milestone 3A.10. This comment previously claimed that the
+     * two consumers needing panel geometry -- bind_wp_b_d_sw and "WP-D's
+     * physical_edges feeding a2b_ord4" -- both refuse zero at their binders.
+     * Only the first half was true. WP-D CANNOT refuse a zero npx, because it
+     * never reads npx/npy at all: operators/ contains zero occurrences of
+     * either, and operators/wp_d_contract.cpp:398-405 derives physical_edges
+     * from topology.neighbors[] instead. bind_wp_d (:53-171) therefore has no
+     * value to check.
+     *
+     * What actually refuses a zero npx before WP-D can run is a different pair,
+     * and the distinction matters because it is ORDERING rather than validation:
+     *   - cgrid/fv3_cgrid_predictor.cu:251-254 and
+     *     dgrid/wp_b_dsw_contract_cuda.cpp:78-80 both refuse it, and
+     *   - validate_dispatch (runtime/fv3_gpu_contract.cpp:119) requires all ten
+     *     stages, so a dispatch table holding WP-D without those two cannot be
+     *     installed in the first place.
+     * Anything that reaches WP-D has already passed through them.
+     *
+     * Those refusals are not pre-mutation, so a panel-geometry consumer plus an
+     * npx == 0 topology can still tear device state -- a residual gap recorded
+     * in the handoff rather than papered over here. Fencing it at this level
+     * would have required every minimal-dispatch driver to describe a full tile
+     * geometry it does not use, trading a narrow real gap for a broad false
+     * requirement. */
   }
   return FV3_GPU_SUCCESS;
 }
@@ -380,6 +669,151 @@ int set_topology(fv3_gpu_context *c, const TopologyView &t, fv3_gpu_error *e) no
   c->data.topology=t;
   return FV3_GPU_SUCCESS;
 }
+/* Milestone 3A.10 §4/§9/§10 -- join the Model B peer group.
+ *
+ * Buffers are sized ONCE here, for the largest live group, so that no exchange
+ * ever allocates. A cudaMalloc inside the acoustic loop is an implicit
+ * device-wide synchronization and would quietly dismantle the persistent
+ * residency model, so the allocation is hoisted out even though it makes this
+ * function the place where geometry must already be known.
+ *
+ * Order matters and is enforced rather than documented: without a topology there
+ * is no tile connectivity to size or validate against, and npx/npy == 0 is the
+ * contract's "not supplied". */
+int attach_halo_peer_group(fv3_gpu_context *c, halo::HaloPeerGroup *pg, int32_t tile,
+                           fv3_gpu_error *e) noexcept {
+  clear_error(e);
+  if (!c) return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"null context");
+  if (!pg) return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"null peer group");
+  if (c->data.phase==ContextPhase::failed)
+    return fail(e,FV3_GPU_STATE_CONFLICT,__func__,"context has failed");
+  if (c->data.halo_peer)
+    return fail(e,FV3_GPU_STATE_CONFLICT,__func__,
+                "this context is already attached to a halo peer group");
+  if (tile < 1 || tile > halo::cubed_sphere_tiles)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"tile must be 1..6");
+  if (c->data.topology.npx <= 0 || c->data.topology.npy <= 0)
+    return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,
+                "a topology must be installed before attaching to a peer group; "
+                "npx/npy are zero, which the contract defines as not-supplied");
+  if (c->data.topology.tile != tile)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,
+                "the tile being attached disagrees with TopologyView::tile");
+#ifndef FV3_GPU_ENABLE_CUDA
+  return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,
+              "a real halo exchange requires a CUDA build");
+#else
+  ContextData &d = c->data;
+  const halo::HaloGeometry geom = geometry_of(d);
+  if (geom.nx <= 0 || geom.ny <= 0 || geom.npz <= 0)
+    return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,
+                "domain bounds must be set before attaching to a peer group");
+  int64_t need = 0;
+  for (uint32_t g = 1; g <= static_cast<uint32_t>(FV3_GPU_H_DWIND_NEXT); ++g) {
+    const halo::HaloGroupSpec spec = halo::halo_group_spec(g);
+    if (!spec.live) continue;
+    const int64_t n = halo::group_buffer_elements(spec, geom);
+    if (n > need) need = n;
+  }
+  if (need <= 0)
+    return fail(e,FV3_GPU_INTERNAL_ERROR,__func__,"no live halo group has a buffer size");
+
+  void *send=nullptr, *recv=nullptr;
+  cudaEvent_t ev_pack=nullptr, ev_xfer=nullptr;
+  const size_t bytes = static_cast<size_t>(need) * sizeof(fv_real);
+  cudaError_t rc = cudaMalloc(&send, bytes);
+  if (rc == cudaSuccess) rc = cudaMalloc(&recv, bytes);
+  /* Milestone 3A.10 §20, found by compute-sanitizer initcheck and fixed here.
+   *
+   * A slot is sized at the WORST CASE over edges and staggerings
+   * (group_slot_elements uses max(nx,ny)+1 and npz+1), while the pack writes only
+   * width * along_extent * nk of it. launch_halo_transfer copies the whole slot,
+   * because a fixed-size copy is what makes a slot address pure arithmetic. So
+   * every transfer moved a tail of never-written bytes, and initcheck reported
+   * 24587 "Host API memory access error ... on access by cudaMemcpy source" for
+   * the R8 six-tile run -- all from launch_halo_transfer, all at an offset in the
+   * last 30% of the copy and NEVER at offset 0, which is what identifies it as
+   * the slot tail rather than a pack that ran late.
+   *
+   * The tail is provably never READ: both sides derive the same along-extent from
+   * the donor edge and the source field's staggering, and the unpack refuses a
+   * mismatch outright rather than clamping. Results were therefore never
+   * affected, and the multi-tile test's 20484 decoded cells confirm it.
+   *
+   * Zeroing once at attach is the fix rather than shortening the copy, because
+   * the copy length would have to be derived from the DONOR's per-field nk, which
+   * this side does not have -- and because a report that is merely rarer is
+   * worse than none: 24587 known-benign records would bury the one that matters.
+   * This is a one-time memset outside the acoustic loop, so it costs nothing per
+   * substep and does not touch persistent residency. */
+  if (rc == cudaSuccess) rc = cudaMemset(send, 0, bytes);
+  if (rc == cudaSuccess) rc = cudaMemset(recv, 0, bytes);
+  if (rc == cudaSuccess) rc = cudaEventCreateWithFlags(&ev_pack, cudaEventDisableTiming);
+  if (rc == cudaSuccess) rc = cudaEventCreateWithFlags(&ev_xfer, cudaEventDisableTiming);
+  if (rc != cudaSuccess) {
+    if (send) cudaFree(send);
+    if (recv) cudaFree(recv);
+    if (ev_pack) cudaEventDestroy(ev_pack);
+    if (ev_xfer) cudaEventDestroy(ev_xfer);
+    return cuda_fail(rc, e, __func__, &d);
+  }
+
+  halo::PeerMember m{};
+  m.send = static_cast<fv_real*>(send);
+  m.recv = static_cast<fv_real*>(recv);
+  m.pack_done = ev_pack;
+  m.xfer_done = ev_xfer;
+  m.transfer_stream = d.transfer_stream;
+  if (!pg->attach(tile, m)) {
+    cudaFree(send); cudaFree(recv);
+    cudaEventDestroy(ev_pack); cudaEventDestroy(ev_xfer);
+    return fail(e,FV3_GPU_STATE_CONFLICT,__func__,
+                "that tile is already attached to this peer group; a duplicate "
+                "would make the rendezvous count wrong and feed one tile's halo "
+                "from the wrong buffer");
+  }
+  d.halo_peer = pg;
+  d.halo_peer_tile = tile;
+  d.halo_send = m.send;
+  d.halo_recv = m.recv;
+  d.halo_buffer_elements = need;
+  d.event_halo_pack = ev_pack;
+  d.event_halo_xfer = ev_xfer;
+  return FV3_GPU_SUCCESS;
+#endif
+}
+
+int detach_halo_peer_group(fv3_gpu_context *c, fv3_gpu_error *e) noexcept {
+  clear_error(e);
+  if (!c) return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"null context");
+  ContextData &d = c->data;
+  if (!d.halo_peer) return FV3_GPU_SUCCESS;
+  auto *pg = static_cast<halo::HaloPeerGroup*>(d.halo_peer);
+  pg->detach(d.halo_peer_tile);
+#ifdef FV3_GPU_ENABLE_CUDA
+  /* The peers must be past their last barrier before this frees anything. That is
+   * the caller's sequencing obligation -- it is the same obligation MPI_Finalize
+   * imposes -- so this only synchronizes MY stream, which is a teardown boundary
+   * and not an acoustic-loop one. */
+  if (d.transfer_stream) cudaStreamSynchronize(static_cast<cudaStream_t>(d.transfer_stream));
+  if (d.halo_send) cudaFree(d.halo_send);
+  if (d.halo_recv) cudaFree(d.halo_recv);
+  if (d.event_halo_pack) cudaEventDestroy(static_cast<cudaEvent_t>(d.event_halo_pack));
+  if (d.event_halo_xfer) cudaEventDestroy(static_cast<cudaEvent_t>(d.event_halo_xfer));
+#endif
+  d.halo_send=nullptr; d.halo_recv=nullptr;
+  d.event_halo_pack=nullptr; d.event_halo_xfer=nullptr;
+  d.halo_buffer_elements=0; d.halo_peer=nullptr; d.halo_peer_tile=0;
+  return FV3_GPU_SUCCESS;
+}
+
+HaloResolution halo_resolution_of(const fv3_gpu_context *c, fv3_gpu_halo_group g) noexcept {
+  if (!c) return HaloResolution::none;
+  const auto slot = static_cast<size_t>(g);
+  if (slot >= c->data.halo_resolution.size()) return HaloResolution::none;
+  return c->data.halo_resolution[slot];
+}
+
 int mark_halo_ready(fv3_gpu_context *c, fv3_gpu_halo_group g, fv3_gpu_error *e) noexcept {
   clear_error(e);
   if (!c) return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"null context");
@@ -387,6 +821,10 @@ int mark_halo_ready(fv3_gpu_context *c, fv3_gpu_halo_group g, fv3_gpu_error *e) 
   fv3_gpu_event ev=issue_event(c->data);
   int rc=c->data.dependencies.mark_ready(g,ev);
   if (rc!=0) return fail(e,static_cast<fv3_gpu_status>(rc),__func__,"invalid halo group or event");
+  /* Milestone 3A.10 §27: this entry point IS a declaration, by construction --
+   * it moves no data. Record it as such so that a Gate C1 report cannot count a
+   * group poked ready by a harness as one that was exchanged. */
+  c->data.halo_resolution[static_cast<size_t>(g)]=HaloResolution::caller_declared;
   return FV3_GPU_SUCCESS;
 }
 /* Milestone 3A.9 §8: the caller takes responsibility for one halo group.
@@ -515,6 +953,31 @@ extern "C" int fv3_gpu_sync_from_host(fv3_gpu_context *c,const fv3_gpu_field_mas
 #else
   return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,"runtime was built without CUDA");
 #endif
+}
+/* Milestone 3A.10: the first public way to describe the decomposition.
+ *
+ * Deliberately NOT tolerant. The whole-tile seam algebra in
+ * fv3_gpu_halo_topology.hpp is exact for one rank per tile and is not an
+ * approximation of anything else, so a decomposition it cannot represent is
+ * refused here rather than rounded into it. mpi_size is checked against the six
+ * tiles because a rank owning a sub-tile block has same-tile neighbours on some
+ * edges, which this entry cannot express. */
+extern "C" int fv3_gpu_set_cubed_sphere_topology(fv3_gpu_context *c,int32_t tile,int64_t npx,int64_t npy,
+                                                 const int32_t *rank_of_tile,fv3_gpu_error *e){
+  using namespace fv3::gpu; clear_error(e);
+  if(!c||!rank_of_tile)return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"null context or rank table");
+  if(c->data.phase==ContextPhase::failed)return fail(e,FV3_GPU_STATE_CONFLICT,__func__,"context has failed");
+  if(c->data.create.mpi_size!=halo::cubed_sphere_tiles)
+    return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,
+                "cubed-sphere topology entry supports one rank per tile only; sub-tile decomposition is not yet implemented");
+  TopologyView t{};
+  if(!halo::make_cubed_sphere_topology(tile,npx,npy,rank_of_tile,t))
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"inconsistent cubed-sphere topology arguments");
+  /* The rank we were handed for our own tile must be us, or the seam algebra is
+   * describing somebody else's neighbours. */
+  if(rank_of_tile[tile-1]!=c->data.create.mpi_rank)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"rank_of_tile disagrees with this context's mpi_rank");
+  return set_topology(c,t,e);
 }
 extern "C" int fv3_gpu_sync_to_host(fv3_gpu_context *c,const fv3_gpu_field_mask *m,fv3_gpu_event *ev,fv3_gpu_error *e){
   using namespace fv3::gpu; clear_error(e); if(ev)*ev=0; if(!c||!ev)return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"null context or event"); int rc=validate_mask(m,e,__func__);if(rc)return rc; if(c->data.phase!=ContextPhase::initialized)return fail(e,FV3_GPU_STATE_CONFLICT,__func__,"context is not initialized");

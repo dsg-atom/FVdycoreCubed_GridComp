@@ -223,6 +223,21 @@ module fv3_gpu_interface_mod
       integer(c_int) :: fv3_gpu_sync_from_host
     end function
 
+    ! Milestone 3A.10: describe the cubed-sphere decomposition to the runtime.
+    ! rank_of_tile is a 6-element table, entry n giving the MPI rank that owns
+    ! mosaic tile n.
+    function fv3_gpu_set_cubed_sphere_topology(ctx, tile, npx, npy, rank_of_tile, err) &
+        bind(c, name='fv3_gpu_set_cubed_sphere_topology')
+      import :: c_int, c_ptr, c_int32_t, c_int64_t, fv3_gpu_error_t
+      type(c_ptr), value :: ctx
+      integer(c_int32_t), value :: tile
+      integer(c_int64_t), value :: npx
+      integer(c_int64_t), value :: npy
+      integer(c_int32_t), intent(in) :: rank_of_tile(6)
+      type(fv3_gpu_error_t), intent(out) :: err
+      integer(c_int) :: fv3_gpu_set_cubed_sphere_topology
+    end function
+
     function fv3_gpu_dyn_core_step(ctx, step_desc, event, err) &
         bind(c, name='fv3_gpu_dyn_core_step')
       import :: c_int, c_ptr, c_int64_t, fv3_gpu_step_desc_t, fv3_gpu_error_t
@@ -308,6 +323,8 @@ contains
     type(fv3_gpu_error_t) :: err
     integer(c_int64_t) :: event
     integer :: status
+    integer(c_int32_t) :: rank_of_tile(6)
+    integer :: t
 
     rc = FV3_GPU_SUCCESS
 
@@ -349,6 +366,39 @@ contains
 
     ! Create GPU context
     status = fv3_gpu_create(create_desc, gpu_context, err)
+    if (status /= 0) then
+      rc = err%code
+      return
+    endif
+
+    ! Milestone 3A.10: tell the runtime where this rank's tile sits on the cube.
+    !
+    ! This must happen before any step, because the runtime now refuses to
+    ! declare a halo group ready when it has not been told its own connectivity.
+    ! Before 3A.10 nothing supplied this, and the runtime's default topology was
+    ! read as "no neighbours, nothing to exchange" -- free halo readiness on a
+    ! decomposition that in fact has four panel seams.
+    !
+    ! Only the one-rank-per-tile decomposition is supported. Anything else is
+    ! rejected HERE, before any device state is created or transferred, rather
+    ! than silently mapped onto a connectivity that does not describe it.
+    if (mpi_size /= 6) then
+      rc = FV3_GPU_UNSUPPORTED_CONFIGURATION
+      return
+    endif
+    if (Atm%tile /= mpi_rank + 1) then
+      ! The seam algebra below assumes FMS's one-PE-per-tile assignment,
+      ! pe = tile-1. If this run does not use it, the rank table would be a
+      ! guess, so refuse instead of guessing.
+      rc = FV3_GPU_UNSUPPORTED_CONFIGURATION
+      return
+    endif
+    do t = 1, 6
+      rank_of_tile(t) = int(t - 1, c_int32_t)
+    enddo
+    status = fv3_gpu_set_cubed_sphere_topology(gpu_context, int(Atm%tile, c_int32_t), &
+                                               int(Atm%npx, c_int64_t), int(Atm%npy, c_int64_t), &
+                                               rank_of_tile, err)
     if (status /= 0) then
       rc = err%code
       return

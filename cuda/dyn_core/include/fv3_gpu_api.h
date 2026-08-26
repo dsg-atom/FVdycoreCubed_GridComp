@@ -153,6 +153,34 @@ int fv3_gpu_validate_field(const fv3_gpu_field_desc *, fv3_gpu_error *);
 int fv3_gpu_create(const fv3_gpu_create_desc *, fv3_gpu_context **, fv3_gpu_error *);
 int fv3_gpu_initialize_state(fv3_gpu_context *, const fv3_gpu_state_desc *, fv3_gpu_event *, fv3_gpu_error *);
 int fv3_gpu_sync_from_host(fv3_gpu_context *, const fv3_gpu_field_mask *, fv3_gpu_event *, fv3_gpu_error *);
+/* Milestone 3A.10: supply the cubed-sphere decomposition.
+ *
+ * Until this existed there was NO way for a caller to describe its topology --
+ * set_topology is a C++-only internal setter with no production caller, and the
+ * Fortran bridge never mentioned tile, npx or npy. The runtime consequently ran
+ * with a default-constructed TopologyView, which the halo vacuity test read as
+ * "nothing to exchange" and which therefore produced halo readiness for free.
+ * That is the fail-open defect this milestone closes, so the caller must now be
+ * able to say what its decomposition actually is.
+ *
+ *   tile          1..6, FMS/FV3 mosaic tile numbering (Atm%tile).
+ *   npx, npy      FV3 corner counts (Atm%npx, Atm%npy); owned cells are
+ *                 npx-1 by npy-1. Must be equal -- a cube has square tiles
+ *                 (CubeHalo.F90:103).
+ *   rank_of_tile  6 entries, MPI rank owning tiles 1..6, indexed 0..5.
+ *
+ * This entry describes the ONE-RANK-PER-TILE decomposition. A rank owning only
+ * part of a tile has same-tile neighbours on some edges and panel seams on
+ * others; that case is deliberately not expressible here and is rejected rather
+ * than approximated. See the milestone 3A.10 handoff for what remains for
+ * general multi-rank MPI.
+ *
+ * Returns FV3_GPU_INVALID_ARGUMENT on any inconsistent argument, without
+ * modifying the context. */
+int fv3_gpu_set_cubed_sphere_topology(fv3_gpu_context *, int32_t tile,
+                                      int64_t npx, int64_t npy,
+                                      const int32_t *rank_of_tile,
+                                      fv3_gpu_error *);
 int fv3_gpu_dyn_core_step(fv3_gpu_context *, const fv3_gpu_step_desc *, fv3_gpu_event *, fv3_gpu_error *);
 int fv3_gpu_sync_to_host(fv3_gpu_context *, const fv3_gpu_field_mask *, fv3_gpu_event *, fv3_gpu_error *);
 int fv3_gpu_event_wait(fv3_gpu_context *, fv3_gpu_event, fv3_gpu_error *);

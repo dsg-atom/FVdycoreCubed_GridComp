@@ -440,7 +440,7 @@ fv3_gpu_status launch_divdamp_high_order_finalize_cuda(
 // dir = 1 is FILL=XDir, dir = 2 is FILL=YDir; the Fortran's `case default`
 // is identical to XDir. Corner ownership follows the Fortran predicates
 // exactly: is==1 / ie==npx-1 / js==1 / je==npy-1 (fv_mp_mod.F90:1125-1128).
-// The DGRID variant at :1350-1353 spells the same two conditions as
+// The DGRID variant at :1351-1354 spells the same two conditions as
 // ie+1==npx / je+1==npy; those are arithmetically identical, so the two
 // variants agree on which rank owns which corner and TransportBounds'
 // east_edge/north_edge flags serve both without reinterpretation.
@@ -453,7 +453,15 @@ fv3_gpu_status launch_fill_corners_bgrid_cuda(const TransportBounds &b, int32_t 
 // --- fill_corners, DGRID vector pair (tools/fv_mp_mod.F90:1338-1370) -----
 // `call fill_corners(vc, uc, npx, npy, VECTOR=.true., DGRID=.true.)`, so
 // x = vc, y = uc and mySign = -1, which the Fortran applies to the SW and NE
-// corners only (fv_mp_mod.F90:1350-1353 for x, :1362-1365 for y).
+// corners only (fv_mp_mod.F90:1351-1354 for x, :1363-1366 for y).
+//
+// Those two ranges are the LIVE code. The lines immediately above each of them
+// -- :1347-1350 and :1359-1362 -- are a commented-out D-grid variant that puts
+// the signs on NW/SE instead and reads different indices. It is dead, and it is
+// a genuine trap: its sign placement coincides with the LIVE C-grid routine
+// (fill_corners_cgrid_r8, :1450-1474), so a reader who lands on it can find
+// apparent corroboration for the wrong convention. Cite :1351/:1363, not
+// :1350/:1362.
 //
 // The two Fortran loops are kept as TWO sequential kernel launches on the same
 // stream (fill_corners_dgrid_x_kernel then fill_corners_dgrid_y_kernel), in

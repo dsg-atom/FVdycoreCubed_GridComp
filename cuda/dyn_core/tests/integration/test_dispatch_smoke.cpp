@@ -50,13 +50,17 @@
 #include "fv3_gpu_api.h"
 #include "fv3_gpu_types.hpp"
 #include "fv3_gpu_internal.hpp"
+#include "fv3_gpu_halo_peer.hpp"
+#include "fv3_gpu_halo_topology.hpp"
 #include "fv3_gpu_production_dispatch.hpp"
 
 #include <cassert>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -1117,6 +1121,28 @@ bool run_phase_a() {
   }
   printf("  NumericalConfig installed\n");
 
+  // Milestone 3A.10: this phase used to run with NO topology at all, which the
+  // runtime then read as "no neighbours, nothing to exchange" and rewarded with
+  // free halo readiness. That fail-open behaviour is exactly what this milestone
+  // closed, so the phase now has to say what its decomposition is -- and, since
+  // it performs no exchange itself, has to take explicit responsibility for the
+  // halo contents. It is the TEST that was stale, not the fence; the runtime was
+  // deliberately left strict.
+  rc = install_topology(ctx, &err);
+  if (rc != FV3_GPU_SUCCESS) {
+    printf("  FAIL: set_topology returned %d: %s\n", rc, err.message);
+    fv3_gpu_finalize(&ctx, &err);
+    return false;
+  }
+  printf("  TopologyView installed (whole cube face, all 4 seams connected)\n");
+  if (!declare_caller_managed_halos(ctx, &err)) {
+    fv3_gpu_finalize(&ctx, &err);
+    return false;
+  }
+  printf("  halo groups declared CALLER-MANAGED (this phase performs no\n"
+         "  exchange; the declaration permits execution and does NOT make\n"
+         "  panel-seam values correct -- Gate C1 halo criterion NOT met here)\n");
+
   NumericalDispatch dispatch{};
   dispatch.contract_version = internal_contract_version;
   NumericalDispatch full{};
@@ -2051,6 +2077,433 @@ bool run_phase_d_fence() {
   return pass;
 }
 
+// ===========================================================================
+// Phase E -- Milestone 3A.10 §13/§14/§19: the SIX-TILE integrated run with a
+// REAL halo exchange.
+//
+// Phase C above is the same integrated path with declare_caller_managed_halos(),
+// and its own summary says so plainly: it executes, and its halo values are not
+// physically correct. That declaration is exactly what §14 forbids -- "no manual
+// halo-ready declarations may bypass required exchange" -- so Phase E does not
+// make it. Six contexts, one per cubed-sphere tile, attach to a shared
+// HaloPeerGroup and every one of the nine runtime-resolved groups is resolved by
+// a real pack -> device-to-device transfer -> seam-transforming unpack.
+//
+// -------------------------------------------------------------------------
+// WHY SIX HOST THREADS
+// -------------------------------------------------------------------------
+//
+// A halo exchange is two-sided. Tile 1's west halo is filled from its west
+// neighbour's owned cells AS THEY STAND AT THIS SUBSTEP, so that neighbour must
+// have packed before tile 1's transfer reads its send buffer. Six contexts
+// stepped one after another on one thread cannot express that: tile 1 would copy
+// the previous substep's values, or on the first substep uninitialised memory,
+// and would still produce finite numbers. The reasoning is set out in full in
+// include/fv3_gpu_halo_peer.hpp; the consequence here is six std::threads.
+//
+// SETUP AND TEARDOWN RUN SEQUENTIALLY on the main thread. Only the
+// fv3_gpu_dyn_core_step calls are concurrent. A failure while creating context 4
+// must not leave contexts 1-3 blocked in a barrier, and the CUDA runtime's
+// context/allocation paths are not what this test is trying to exercise.
+//
+// The plain production dispatch is installed, NOT probes::. probes:: keeps its
+// counts in file-scope arrays, which six threads would race on; Phase C already
+// establishes per-stage reachability single-threaded, and re-deriving it here
+// under a data race would weaken both claims rather than strengthen either.
+//
+// -------------------------------------------------------------------------
+// THE CAUSALITY TEST, AND WHY IT IS THE ONE THAT MATTERS
+// -------------------------------------------------------------------------
+//
+// §13 asks for "deliberately asymmetric per-tile data so incorrect neighbor
+// mapping cannot pass". The per-element provenance decode that proves the seam
+// mapping cell by cell lives in tests/integration/test_halo_exchange_multitile.cu
+// and is much stronger than anything an integrated run can assert about a value
+// that has been through d_sw, a Riemann solve and a pressure-gradient stage.
+//
+// What THIS test can prove, and what the multitile test cannot, is that the
+// integrated dyn_core path is actually WIRED to that exchange. So it runs the
+// whole six-tile step twice: once clean, and once with the initial u/v perturbed
+// on tile 1's WEST NEIGHBOUR ONLY -- and asserts that TILE 1's output changed.
+// Tile 1's own input is byte-identical between the two runs. The only route by
+// which its answer can move is the halo exchange. If resolve_halo silently fell
+// back to a declaration, or the transfer copied nothing, or the unpack wrote
+// outside the halo, tile 1's checksum would be identical and this fails.
+//
+// The neighbour is QUERIED from the topology rather than written down as "tile
+// 5", so the test cannot drift out of agreement with the mosaic it is testing.
+// ===========================================================================
+namespace phase_e {
+
+using fv3::gpu::halo::HaloPeerGroup;
+
+constexpr int kTiles = 6;
+
+// Per-tile asymmetry. u/v are the prognostic D-grid winds and carry no
+// consistency constraint with delz/zh (unlike delp/pt, whose perturbation would
+// have to be matched in the hydrostatic column), so a phase shift keyed on the
+// tile is a safe way to make all six tiles genuinely different. Without this,
+// six identical tiles would exchange values indistinguishable from their own and
+// a wrong neighbour mapping would go unnoticed.
+void make_tile_asymmetric(HostState &h, int tile) {
+  const double s = 0.37 * (double)tile;
+  for (int64_t k = 0; k < NPZ; ++k)
+    for (int64_t j = 0; j < h.nj_h; ++j)
+      for (int64_t i = 0; i < h.ni_h; ++i) {
+        const size_t idx = (size_t)(i + j * h.ni_h + k * h.ni_h * h.nj_h);
+        h.u[idx] = (fv_real)((double)h.u[idx] + 0.8 * std::sin(s + 0.11 * (double)i));
+        h.v[idx] = (fv_real)((double)h.v[idx] + 0.6 * std::cos(s + 0.13 * (double)j));
+      }
+}
+
+// The extra kick applied to ONE tile in the second run. Deliberately small
+// enough to stay physical and large enough to survive R4 rounding through a full
+// substep: 1e-2 on a 12 m/s wind is ~1e-3 relative, while float carries ~1e-7.
+void perturb(HostState &h) {
+  for (size_t i = 0; i < h.u.size(); ++i) {
+    h.u[i] = (fv_real)((double)h.u[i] + 1.0e-2);
+    h.v[i] = (fv_real)((double)h.v[i] - 1.0e-2);
+  }
+}
+
+double checksum(const HostState &h) {
+  double s = 0.0;
+  // A weighted sum rather than a plain one, so that two changes of opposite sign
+  // at different indices cannot cancel into an unchanged total.
+  for (size_t i = 0; i < h.u.size(); ++i)
+    s += (double)h.u[i] * (1.0 + 1.0e-6 * (double)i);
+  for (size_t i = 0; i < h.delp.size(); ++i)
+    s += (double)h.delp[i] * (2.0 + 1.0e-6 * (double)i);
+  for (size_t i = 0; i < h.pt.size(); ++i) s += (double)h.pt[i] * 0.5;
+  return s;
+}
+
+int32_t rank_of_tile_table[kTiles] = {0, 1, 2, 3, 4, 5};
+
+// One tile's whole participation, minus the step itself.
+struct Member {
+  fv3_gpu_context *ctx = nullptr;
+  std::unique_ptr<HostState> h;   // heap-held: the registered device field views
+                                  // point into these vectors, so the HostState
+                                  // must not move once fields are registered.
+  std::vector<fv3_gpu_field_desc> fields;
+  TopologyView topo{};
+  std::vector<fv_real> u_h2d, delp_h2d;
+  int rc = FV3_GPU_SUCCESS;
+  bool ok = false;
+};
+
+// Sequential setup for one tile. Returns false on any failure, having cleaned up
+// whatever it created.
+bool setup(Member &m, int tile, HaloPeerGroup &pg, bool perturb_this_tile) {
+  fv3_gpu_error err{};
+  fv3_gpu_create_desc create{};
+  create.abi_version = FV3_GPU_ABI_VERSION;
+  create.struct_bytes = sizeof(create);
+  create.device_ordinal = 0;
+  // A real deployment is one rank per tile, so the rank is the tile's rank and
+  // the size is six. This is nominal in-process, but describing it as rank 0 of 1
+  // would be describing a different decomposition than the topology installs.
+  create.mpi_rank = tile - 1;
+  create.mpi_size = kTiles;
+  create.precision = sizeof(fv_real) == 4 ? FV3_GPU_PRECISION_R4 : FV3_GPU_PRECISION_R8;
+  create.is = 1; create.ie = NI; create.js = 1; create.je = NJ;
+  create.npz = NPZ; create.halo_width = HALO;
+  m.rc = fv3_gpu_create(&create, &m.ctx, &err);
+  if (m.rc != FV3_GPU_SUCCESS) {
+    printf("  FAIL: tile %d fv3_gpu_create returned %d: %s\n", tile, m.rc, err.message);
+    return false;
+  }
+
+  m.h = std::make_unique<HostState>(make_host_state());
+  make_tile_asymmetric(*m.h, tile);
+  if (perturb_this_tile) perturb(*m.h);
+  m.fields = make_fields(*m.h);
+
+  fv3_gpu_state_desc state{};
+  state.abi_version = FV3_GPU_ABI_VERSION;
+  state.struct_bytes = sizeof(state);
+  state.field_count = static_cast<uint32_t>(m.fields.size());
+  state.fields = m.fields.data();
+  fv3_gpu_event ev = 0;
+  m.rc = fv3_gpu_initialize_state(m.ctx, &state, &ev, &err);
+  if (m.rc == FV3_GPU_SUCCESS) m.rc = fv3_gpu_event_wait(m.ctx, ev, &err);
+  if (m.rc != FV3_GPU_SUCCESS) {
+    printf("  FAIL: tile %d H2D returned %d: %s\n", tile, m.rc, err.message);
+    return false;
+  }
+
+  if (install_config(m.ctx, *m.h, &err) != FV3_GPU_SUCCESS) {
+    printf("  FAIL: tile %d install_config: %s\n", tile, err.message);
+    return false;
+  }
+
+  // The REAL mosaic connectivity, not install_topology()'s four nominal
+  // neighbours. make_cubed_sphere_topology is the builder validated against
+  // CubeHalo.F90:213-261 by tests/runtime/test_halo_topology.cpp.
+  if (!fv3::gpu::halo::make_cubed_sphere_topology(tile, NI + 1, NJ + 1,
+                                                  rank_of_tile_table, m.topo)) {
+    printf("  FAIL: tile %d make_cubed_sphere_topology\n", tile);
+    return false;
+  }
+  if (set_topology(m.ctx, m.topo, &err) != FV3_GPU_SUCCESS) {
+    printf("  FAIL: tile %d set_topology: %s\n", tile, err.message);
+    return false;
+  }
+
+  // NOTE the absence of declare_caller_managed_halos(). Nothing here declares a
+  // halo ready. If the exchange does not work, this test does not run.
+  if (attach_halo_peer_group(m.ctx, &pg, tile, &err) != FV3_GPU_SUCCESS) {
+    printf("  FAIL: tile %d attach_halo_peer_group: %s\n", tile, err.message);
+    return false;
+  }
+
+  NumericalDispatch production{};
+  if (fv3_build_production_dispatch(production, &err) != FV3_GPU_SUCCESS ||
+      set_numerical_dispatch(m.ctx, production, &err) != FV3_GPU_SUCCESS) {
+    printf("  FAIL: tile %d dispatch install: %s\n", tile, err.message);
+    return false;
+  }
+
+  m.u_h2d = m.h->u;
+  m.delp_h2d = m.h->delp;
+  m.ok = true;
+  return true;
+}
+
+void teardown(Member &m) {
+  if (!m.ctx) return;
+  fv3_gpu_error err{};
+  detach_halo_peer_group(m.ctx, &err);
+  fv3_gpu_finalize(&m.ctx, &err);
+  m.ctx = nullptr;
+}
+
+// One six-tile run. `perturbed_tile` is 0 for the clean run, or the 1-based tile
+// whose initial winds get the extra kick. On success writes each tile's post-step
+// checksum through `out_checksum` (indexed 1..6).
+bool six_tile_run(int32_t n_split, int perturbed_tile, bool verbose,
+                  double *out_checksum) {
+  HaloPeerGroup pg(kTiles);
+  Member m[kTiles + 1];
+  bool setup_ok = true;
+  for (int t = 1; t <= kTiles && setup_ok; ++t)
+    setup_ok = setup(m[t], t, pg, t == perturbed_tile);
+
+  if (!setup_ok || !pg.complete()) {
+    if (setup_ok) printf("  FAIL: peer group has %d/%d members\n", pg.attached(), kTiles);
+    for (int t = kTiles; t >= 1; --t) teardown(m[t]);
+    return false;
+  }
+  if (verbose) printf("  6 contexts created, real mosaic topology installed,\n"
+                      "  all attached to one peer group, NO caller-managed halos\n");
+
+  // ---- the concurrent part, and only the concurrent part -------------------
+  std::thread th[kTiles + 1];
+  for (int t = 1; t <= kTiles; ++t) {
+    th[t] = std::thread([&m, &pg, t, n_split]() {
+      fv3_gpu_error err{};
+      fv3_gpu_step_desc step{};
+      step.abi_version = FV3_GPU_ABI_VERSION;
+      step.struct_bytes = sizeof(step);
+      step.bdt = 10.0;
+      step.k_split = 1;
+      step.n_split = n_split;
+      step.init_step = 1;
+      step.end_step = 1;
+      step.model_step = 0;
+      step.acoustic_sequence = 1;
+      step.dependency = 0;
+      fv3_gpu_event step_ev = 0;
+      const int rc = fv3_gpu_dyn_core_step(m[t].ctx, &step, &step_ev, &err);
+      m[t].rc = rc;
+      if (rc != FV3_GPU_SUCCESS) {
+        printf("  FAIL: tile %d fv3_gpu_dyn_core_step returned %d\n"
+               "        api=\"%s\" message=\"%s\"\n", t, rc, err.api, err.message);
+        // Release the other five from the rendezvous. Without this they wait for
+        // a pack that is never coming and the test hangs instead of failing.
+        pg.abort_group();
+        m[t].ok = false;
+      }
+    });
+  }
+  for (int t = 1; t <= kTiles; ++t) th[t].join();
+
+  bool pass = true;
+  for (int t = 1; t <= kTiles; ++t) pass &= (m[t].rc == FV3_GPU_SUCCESS);
+  if (!pass) {
+    for (int t = kTiles; t >= 1; --t) teardown(m[t]);
+    return false;
+  }
+  if (verbose) printf("  all 6 tiles completed fv3_gpu_dyn_core_step(n_split=%d)\n",
+                      (int)n_split);
+
+  // ---- §10/§27 provenance: every group must say `exchanged` ----------------
+  // This is the criterion §27 turns on. HaloResolution::caller_declared here
+  // would mean the runtime accepted a declaration in place of data movement, and
+  // it is the difference between Gate C1 PASS and Gate C1 BLOCKED.
+  bool provenance_ok = true;
+  for (int t = 1; t <= kTiles; ++t)
+    for (fv3_gpu_halo_group g : kRuntimeResolvedGroups) {
+      const HaloResolution r = halo_resolution_of(m[t].ctx, g);
+      if (r != HaloResolution::exchanged) {
+        printf("  FAIL: tile %d group %d resolved as %d, not `exchanged`\n",
+               t, (int)g, (int)r);
+        provenance_ok = false;
+      }
+    }
+  if (verbose)
+    printf("  halo provenance: all %zu groups x 6 tiles resolved by EXCHANGE: %s\n",
+           sizeof(kRuntimeResolvedGroups) / sizeof(kRuntimeResolvedGroups[0]),
+           provenance_ok ? "YES" : "NO");
+
+  // ---- §14 residency, per tile, BEFORE the explicit sync ------------------
+  bool residency_ok = true;
+  for (int t = 1; t <= kTiles; ++t)
+    if (!(m[t].h->u == m[t].u_h2d && m[t].h->delp == m[t].delp_h2d)) {
+      printf("  FAIL: tile %d host buffers changed before sync_to_host\n", t);
+      residency_ok = false;
+    }
+  if (verbose)
+    printf("  persistent residency (no implicit D2H on any tile): %s\n",
+           residency_ok ? "YES" : "NO");
+
+  // ---- explicit D2H, then finite + checksum -------------------------------
+  bool finite_ok = true;
+  for (int t = 1; t <= kTiles; ++t) {
+    fv3_gpu_error err{};
+    fv3_gpu_field_mask mask{};
+    mask.abi_version = FV3_GPU_ABI_VERSION;
+    mask.struct_bytes = sizeof(mask);
+    for (FieldId id : {FieldId::u, FieldId::v, FieldId::uc, FieldId::vc,
+                       FieldId::delp, FieldId::pt, FieldId::w, FieldId::delz,
+                       FieldId::zh, FieldId::gz, FieldId::pkc, FieldId::pkz})
+      mask.words[static_cast<uint32_t>(id) / 64] |=
+          (1ULL << (static_cast<uint32_t>(id) % 64));
+    fv3_gpu_event ev = 0;
+    int rc = fv3_gpu_sync_to_host(m[t].ctx, &mask, &ev, &err);
+    if (rc == FV3_GPU_SUCCESS) rc = fv3_gpu_event_wait(m[t].ctx, ev, &err);
+    if (rc != FV3_GPU_SUCCESS) {
+      printf("  FAIL: tile %d D2H returned %d: %s\n", t, rc, err.message);
+      finite_ok = false;
+      continue;
+    }
+    char label[32];
+    std::snprintf(label, sizeof(label), "tile%d u", t);
+    finite_ok &= check_finite(m[t].h->u.data(), m[t].h->u.size(), label);
+    std::snprintf(label, sizeof(label), "tile%d delp", t);
+    finite_ok &= check_finite(m[t].h->delp.data(), m[t].h->delp.size(), label);
+    std::snprintf(label, sizeof(label), "tile%d pt", t);
+    finite_ok &= check_finite(m[t].h->pt.data(), m[t].h->pt.size(), label);
+    if (out_checksum) out_checksum[t] = checksum(*m[t].h);
+  }
+
+  for (int t = kTiles; t >= 1; --t) teardown(m[t]);
+  return pass && provenance_ok && residency_ok && finite_ok;
+}
+
+} // namespace phase_e
+
+bool run_phase_e() {
+  printf("########################################################\n");
+  printf("# Phase E: SIX-TILE integrated run with a REAL halo exchange\n");
+  printf("# Six contexts, real cubed-sphere mosaic, one peer group,\n");
+  printf("# n_split = 3, and NO caller-managed halo declarations.\n");
+  printf("########################################################\n\n");
+
+  double clean[phase_e::kTiles + 1] = {0.0};
+  printf("--- Run 1: clean, n_split = 3 ---\n");
+  const bool clean_pass = phase_e::six_tile_run(3, 0, true, clean);
+  if (!clean_pass) {
+    printf("\nPhase E result: FAIL (clean six-tile run did not complete)\n\n");
+    return false;
+  }
+
+  // ---- §17 ordering stress: the same run twice must agree BITWISE -----------
+  //
+  // Six host threads enqueue into six pairs of non-blocking streams, and the
+  // interleaving differs from run to run -- the OS schedules the threads, and
+  // nothing in this test pins or paces them. If the exchange's ordering were
+  // incomplete at any of its four edges (producer -> pack, donor pack ->
+  // transfer, unpack -> consumer, or the write-after-read guard on the send
+  // buffer), then which side of a race won would vary with that interleaving and
+  // these two runs would differ.
+  //
+  // So a bitwise match is evidence about the EVENTS, not about the arithmetic:
+  // it is the observable that a missing cudaStreamWaitEvent would destroy. The
+  // 3A.9 D2H race is the precedent -- it produced plausible numbers at
+  // n_split = 3 and wrong ones at n_split = 1, and the difference between those
+  // two was exactly a scheduling difference. Comparing two identical runs is how
+  // that class of defect is caught without knowing the right answer.
+  //
+  // Repeated rather than single-shot because one run cannot be non-deterministic
+  // on its own, and it is deliberately BITWISE rather than tolerance-based:
+  // there is no tolerance at which a stream race is acceptable.
+  double repeat[phase_e::kTiles + 1] = {0.0};
+  printf("\n--- Run 2: byte-identical repeat of run 1 (ordering stress) ---\n");
+  const bool repeat_pass = phase_e::six_tile_run(3, 0, false, repeat);
+  if (!repeat_pass) {
+    printf("\nPhase E result: FAIL (repeat six-tile run did not complete)\n\n");
+    return false;
+  }
+  bool deterministic = true;
+  for (int t = 1; t <= phase_e::kTiles; ++t)
+    if (repeat[t] != clean[t]) {
+      printf("  FAIL: tile %d differs between two identical runs:\n"
+             "        %.17e vs %.17e\n", t, clean[t], repeat[t]);
+      deterministic = false;
+    }
+  printf("  two identical six-thread runs agree bitwise on all 6 tiles: %s\n",
+         deterministic ? "YES (stream ordering holds)"
+                       : "NO *** nondeterministic: an ordering edge is missing ***");
+
+  // Which tile actually feeds tile 1's west halo? Ask the mosaic, do not assume.
+  TopologyView t1{};
+  if (!fv3::gpu::halo::make_cubed_sphere_topology(1, NI + 1, NJ + 1,
+                                                  phase_e::rank_of_tile_table, t1)) {
+    printf("  FAIL: could not build tile 1's topology\n");
+    return false;
+  }
+  const int west_donor =
+      (int)t1.neighbors[(size_t)TileEdge::west].tile;
+  printf("\n--- Run 3: identical, except tile %d's initial u/v are kicked ---\n",
+         west_donor);
+  printf("    (tile %d is tile 1's WEST neighbour in the mosaic; tile 1's own\n",
+         west_donor);
+  printf("     input is byte-identical to run 1)\n");
+
+  double kicked[phase_e::kTiles + 1] = {0.0};
+  const bool kick_pass = phase_e::six_tile_run(3, west_donor, false, kicked);
+  if (!kick_pass) {
+    printf("\nPhase E result: FAIL (perturbed six-tile run did not complete)\n\n");
+    return false;
+  }
+
+  // The causality claim. Tile 1 saw no change to its own state; if its answer
+  // moved, the information crossed the panel seam.
+  const double d1 = std::fabs(kicked[1] - clean[1]);
+  const bool causal = d1 > 0.0;
+  printf("\n  Causality across the panel seam:\n");
+  printf("    tile 1 checksum, clean      : %.12e\n", clean[1]);
+  printf("    tile 1 checksum, tile %d kicked: %.12e\n", west_donor, kicked[1]);
+  printf("    |difference|                : %.6e -> %s\n", d1,
+         causal ? "CHANGED (halo data crossed the seam)"
+                : "*** IDENTICAL: no exchange reached tile 1 ***");
+
+  // Control: the kicked tile itself must obviously differ. If it did NOT, the
+  // perturbation never made it into the run at all and the test above would be
+  // vacuously "identical" for an uninteresting reason.
+  const double dk = std::fabs(kicked[west_donor] - clean[west_donor]);
+  const bool kick_landed = dk > 0.0;
+  printf("    control: tile %d itself moved by %.6e -> %s\n", west_donor, dk,
+         kick_landed ? "yes" : "*** NO: the perturbation never applied ***");
+
+  const bool pass = clean_pass && repeat_pass && deterministic && kick_pass &&
+                    causal && kick_landed;
+  printf("\nPhase E result: %s\n\n", pass ? "PASS" : "FAIL");
+  return pass;
+}
+
 int main() {
   printf("=== Milestone 3A.1 Production Dispatch Smoke Test ===\n\n");
   printf("Configuration:\n");
@@ -2072,14 +2525,17 @@ int main() {
   bool phase_b_pass = run_phase_b();
   bool phase_c_pass = run_phase_c();
   bool phase_d_pass = run_phase_d_fence();
+  bool phase_e_pass = run_phase_e();
 
   printf("=== Summary ===\n");
   printf("  Phase A (minimal dispatch, full success + D2H verify):         %s\n", phase_a_pass ? "PASS" : "FAIL");
   printf("  Phase B (full production dispatch, full success + D2H verify): %s\n", phase_b_pass ? "PASS" : "FAIL");
   printf("  Phase C (integrated Gate C1: 9/9 stages, n_split=3, probes):   %s\n", phase_c_pass ? "PASS" : "FAIL");
   printf("  Phase D (production config fence + halo refusal):             %s\n", phase_d_pass ? "PASS" : "FAIL");
+  printf("  Phase E (six tiles, REAL halo exchange, n_split=3):            %s\n", phase_e_pass ? "PASS" : "FAIL");
 
-  const bool all = phase_a_pass && phase_b_pass && phase_c_pass && phase_d_pass;
+  const bool all = phase_a_pass && phase_b_pass && phase_c_pass &&
+                   phase_d_pass && phase_e_pass;
   if (all) {
     printf("\nDispatch smoke test: PASS\n\n");
     printf("What this test now establishes, at the GPU EXECUTED level:\n");
@@ -2104,13 +2560,30 @@ int main() {
     printf("    grid_type=0 production path never REQUESTS it: d_sw and\n");
     printf("    update_dz_c implement their corner semantics inline through\n");
     printf("    CornerFillArgs, not through this generic slot.\n");
+    printf("  * Milestone 3A.10: the integrated path runs on all SIX cubed-\n");
+    printf("    sphere tiles with a REAL halo exchange (Phase E). No group is\n");
+    printf("    declared caller-managed there; all nine runtime-resolved\n");
+    printf("    groups on all six tiles report HaloResolution::exchanged, so\n");
+    printf("    readiness came from data movement and not from a declaration.\n");
+    printf("  * The integrated path is WIRED to that exchange: kicking one\n");
+    printf("    tile's initial winds changes its NEIGHBOUR's answer, while the\n");
+    printf("    neighbour's own input is byte-identical between the two runs.\n");
+    printf("    Information can only reach it across the panel seam.\n");
     printf("\nWhat this test does NOT establish:\n");
-    printf("  * HALO CORRECTNESS. This harness declares the nine runtime-\n");
-    printf("    resolved halo groups caller-managed and then performs NO\n");
-    printf("    exchange, so halo cells hold only what H2D put there. On a\n");
-    printf("    real grid_type=0 rank those cells belong to four neighbouring\n");
-    printf("    cube faces. The integrated path EXECUTES; its halo values are\n");
-    printf("    not physically correct, and no halo transport exists yet.\n");
+    printf("  * Phase C's own halo values remain physically meaningless: it\n");
+    printf("    declares the nine groups caller-managed and performs no\n");
+    printf("    exchange, so its halo cells hold only what H2D put there. It\n");
+    printf("    is a single-tile stage-reachability probe, and Phase E rather\n");
+    printf("    than Phase C is the halo evidence.\n");
+    printf("  * MULTI-RANK MPI. Phase E is one process representing six tiles\n");
+    printf("    (Gate C1 execution model B), exchanging device-to-device. Six\n");
+    printf("    MPI ranks, request lifetime, CUDA-aware MPI and multi-node\n");
+    printf("    scaling remain future work.\n");
+    printf("  * Corner halo BLOCKS. For a cubed sphere FMS never fills the\n");
+    printf("    four tile-vertex diagonals at all (rotated_ninety gates off\n");
+    printf("    fill_corner_contact), and FV3 reconstructs them locally --\n");
+    printf("    copy_corners, fill_corners_dgrid, a2b's vertex extrapolation.\n");
+    printf("    Those are compute kernels in WP-B/C/D, not this exchange.\n");
     printf("  * Numerical validation against authoritative Fortran savepoints:\n");
     printf("    NOT RUN.\n");
     return 0;

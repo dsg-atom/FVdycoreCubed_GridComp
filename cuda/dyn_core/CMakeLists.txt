@@ -6,7 +6,16 @@ set(FV3_DYN_CORE_PRECISION "R8" CACHE STRING "FV precision: R4, R4R8, or R8")
 set_property(CACHE FV3_DYN_CORE_PRECISION PROPERTY STRINGS R4 R4R8 R8)
 
 # Core runtime library (WP-E)
-add_library(fv3_dyn_core_gpu runtime/fv3_gpu_runtime.cpp runtime/fv3_gpu_contract.cpp)
+# Milestone 3A.10 adds runtime/fv3_gpu_halo_topology.cpp: the cubed-sphere
+# mosaic connectivity builder (CubeHalo.F90:213-261 / fv_mp_mod.F90:577-625) and
+# the panel-seam index/vector algebra. It is host-only and CUDA-free so the seam
+# transforms are unit-testable without a GPU; the same inline functions are
+# compiled into the device kernels from the header.
+add_library(fv3_dyn_core_gpu
+  runtime/fv3_gpu_runtime.cpp
+  runtime/fv3_gpu_contract.cpp
+  runtime/fv3_gpu_halo_topology.cpp
+)
 target_include_directories(fv3_dyn_core_gpu PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${CMAKE_CURRENT_SOURCE_DIR}
@@ -129,6 +138,24 @@ if(FV3_DYN_CORE_ENABLE_CUDA)
   target_link_libraries(fv3_wp_b_cuda PUBLIC fv3_wp_b_dgrid fv3_wp_d_cuda CUDA::cudart)
   set_target_properties(fv3_wp_b_cuda PROPERTIES CUDA_STANDARD 17)
 
+  # Milestone 3A.10 (WP-E): the cubed-sphere halo exchange kernels -- device
+  # pack, device-to-device transfer, and the seam-transforming unpack.
+  #
+  # WP-E, not WP-A/B/C/D: project_architecture.md assigns "halo/communication
+  # interfaces" to WP-E, and this is shared infrastructure with no numerical
+  # algorithm of its own. It moves values and applies the panel-seam permutation
+  # and sign; it computes nothing.
+  # These kernels belong to fv3_dyn_core_gpu itself rather than to a separate
+  # library, because the runtime's resolve_halo() calls them: a standalone library
+  # linking PUBLIC against fv3_dyn_core_gpu while fv3_dyn_core_gpu called into it
+  # would be a dependency cycle. Adding the source here also gives it
+  # FV3_GPU_ENABLE_CUDA, which is PRIVATE on this target -- the first attempt used
+  # a separate library WITHOUT that define, so every definition was preprocessed
+  # away and the archive linked empty, surfacing only as an undefined reference at
+  # the first consumer rather than as a compile error.
+  target_sources(fv3_dyn_core_gpu PRIVATE runtime/fv3_gpu_halo_exchange.cu)
+  set_target_properties(fv3_dyn_core_gpu PROPERTIES CUDA_STANDARD 17)
+
   # Milestone 3A.1: production NumericalDispatch (wires WP-A/WP-C/WP-D CUDA
   # adapters into a real dispatch table consumed by fv3_gpu_dyn_core_step).
   # .cu (not .cpp): it transitively includes cgrid/fv3_cgrid_d2a2c.hpp, which
@@ -201,6 +228,14 @@ if(BUILD_TESTING)
   target_link_libraries(fv3_wp_d_contract_test PRIVATE fv3_wp_d_operators)
   add_test(NAME fv3_wp_d_contract COMMAND fv3_wp_d_contract_test)
 
+  # Milestone 3A.10: cubed-sphere connectivity and panel-seam algebra. Host-only
+  # by design -- the seam index map and vector transforms are pure functions, so
+  # they are provable without a GPU, and the same inline code is what the device
+  # kernels compile.
+  add_executable(fv3_halo_topology_test tests/runtime/test_halo_topology.cpp)
+  target_link_libraries(fv3_halo_topology_test PRIVATE fv3_dyn_core_gpu)
+  add_test(NAME fv3_halo_topology COMMAND fv3_halo_topology_test)
+
   # Prompt 5B.1 Integrated smoke test (requires CUDA and GPU)
   if(FV3_DYN_CORE_ENABLE_CUDA)
     add_executable(fv3_integrated_smoke_test tests/integration/test_integrated_smoke.cpp)
@@ -226,14 +261,37 @@ if(BUILD_TESTING)
       ${CMAKE_CURRENT_SOURCE_DIR}
       ${CMAKE_CURRENT_SOURCE_DIR}/runtime
     )
+    # Threads::Threads is for Phase E (Milestone 3A.10 §14), which runs the six
+    # cubed-sphere tiles on six std::threads because a halo exchange is
+    # two-sided: a tile's transfer must not read a neighbour's send buffer
+    # before that neighbour has packed it. See include/fv3_gpu_halo_peer.hpp.
+    find_package(Threads REQUIRED)
     target_link_libraries(fv3_dispatch_smoke_test PRIVATE
       fv3_dyn_core_gpu
       fv3_production_dispatch
       CUDA::cudart
+      Threads::Threads
     )
     # This test requires a GPU to run - mark as needing GPU label
     add_test(NAME fv3_dispatch_smoke COMMAND fv3_dispatch_smoke_test)
     set_tests_properties(fv3_dispatch_smoke PROPERTIES
+      LABELS "gpu"
+      SKIP_RETURN_CODE 77
+    )
+
+    # Milestone 3A.10 §13: permanent integrated MULTI-TILE halo exchange test.
+    # All six cubed-sphere tiles, exchanged on the device through the real
+    # pack -> D2D transfer -> seam-transforming unpack path, with every halo
+    # value decoded back to its originating tile, index and sign.
+    add_executable(fv3_halo_exchange_multitile_test
+                   tests/integration/test_halo_exchange_multitile.cu)
+    target_link_libraries(fv3_halo_exchange_multitile_test PRIVATE
+      fv3_dyn_core_gpu
+      CUDA::cudart
+    )
+    set_target_properties(fv3_halo_exchange_multitile_test PROPERTIES CUDA_STANDARD 17)
+    add_test(NAME fv3_halo_exchange_multitile COMMAND fv3_halo_exchange_multitile_test)
+    set_tests_properties(fv3_halo_exchange_multitile PROPERTIES
       LABELS "gpu"
       SKIP_RETURN_CODE 77
     )
