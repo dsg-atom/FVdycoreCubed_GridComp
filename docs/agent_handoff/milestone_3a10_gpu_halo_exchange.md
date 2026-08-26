@@ -16,6 +16,8 @@ so; nothing here is written in anticipation of a result.
 |---|---|
 | Branch | `cuda/gpu-bringup` |
 | Starting commit | `b35f0dab59d3021bf4ffb6499da1054cd0f7d3ec` |
+| Milestone commit | `b0b1266a15413e997d8f7709446b491ce622bece` — "Implement FV3 GPU cubed-sphere halo exchange" |
+| Pushed | **NO.** One commit ahead of `origin/cuda/gpu-bringup`; push and merge require an explicit request |
 | Working tree at start | clean |
 | Predecessor milestone | 3A.9 (`b5bd177`, handoff `milestone_3a9_gate_c1_closure.md`), verdict `GATE C1 BLOCKED` |
 | Authoritative FV3 revision | `GFDL_atmos_cubed_sphere` tag `geos/v3.0.0`, SHA `ca30e26305fda43831095334c02a3f5e0b8c0c45` |
