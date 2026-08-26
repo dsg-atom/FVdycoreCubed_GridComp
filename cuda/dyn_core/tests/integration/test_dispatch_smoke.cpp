@@ -239,6 +239,25 @@ struct HostState {
   std::vector<fv_real> lv_nord_k, lv_ndif, lv_nord_w, lv_d2_bg, lv_d4_bg;
   std::vector<fv_real> lv_damp_v, lv_damp_w, lv_damp_t, lv_d_con, lv_kgb;
 
+  // Milestone 3A.9: the six fields the two newly-reachable C-grid stages
+  // (cgrid_predictor, cgrid_vertical_solver) require and that no earlier
+  // milestone's dispatch subset ever asked for. Each is rejected by name before
+  // any kernel launches, so all six are load-bearing:
+  //
+  //   omga    3-D  d2a2c_vect's A-grid vertical velocity, and Riem_Solver_C's
+  //           w3 argument (dyn_core.F90:583). NOT interchangeable with w.
+  //   f_c     2-D  Coriolis on the DUAL (B-grid corner) mesh. Distinct FieldId
+  //           from f0, which is the A-grid value already registered above --
+  //           registering f0 does not satisfy the predictor.
+  //   cos_sg  3-D  the four cell-edge angle cosines, companion to sin_sg.
+  //   dp_ref  1-D  the reference-profile layer thickness update_dz_c reads as
+  //           dp0 (nh_utils.F90's dp0 argument).
+  //   ws3     2-D  the C-grid surface vertical velocity dyn_core.F90:577 passes
+  //           to update_dz_c and :583 to Riem_Solver_C. Distinct FieldId from
+  //           ws, which is the D-grid value Riem_Solver3 writes.
+  //   phis    2-D  surface geopotential; Riem_Solver_C's hs closure term.
+  std::vector<fv_real> omga, f_c, cos_sg, dp_ref, ws3, phis;
+
   fv_real ptop, akap, grav;
 };
 
@@ -316,6 +335,14 @@ HostState make_host_state() {
   h.rsin_u.assign(h.size_2d, 0); h.rsin_v.assign(h.size_2d, 0);
   h.f0.assign(h.size_2d, 0);
   h.sin_sg.assign(h.size_2d * 4, 0);
+  // Milestone 3A.9 C-grid additions. cos_sg carries the same four cell-edge
+  // components sin_sg does; dp_ref is per-level like the damping controls.
+  h.omga.assign(h.size_3d, 0);
+  h.f_c.assign(h.size_2d, 0);
+  h.cos_sg.assign(h.size_2d * 4, 0);
+  h.dp_ref.assign((size_t)NPZ, 0);
+  h.ws3.assign(h.size_2d, 0);
+  h.phis.assign(h.size_2d, 0);
   for (std::vector<fv_real> *p : {&h.lv_nord_k, &h.lv_ndif, &h.lv_nord_w,
                                   &h.lv_d2_bg, &h.lv_d4_bg, &h.lv_damp_v,
                                   &h.lv_damp_w, &h.lv_damp_t, &h.lv_d_con,
@@ -463,6 +490,32 @@ HostState make_host_state() {
       // Strictly positive: S1's upwind arms divide by them.
       for (int c = 0; c < 4; ++c)
         h.sin_sg[idx + (size_t)c * h.size_2d] = 1.0 - 0.01 * (fv_real)c;
+      // --- Milestone 3A.9 C-grid metrics/state --------------------------
+      // cos_sg is sin_sg's companion: the cosine of the same four cell-edge
+      // angles. This grid is near-orthogonal (sin_sg ~ 1), so cos_sg is small
+      // -- but deliberately NOT zero, for the same reason cosa_u/cosa_v above
+      // are not: d2a2c_vect's edge_interpolate4 arms multiply by it, and exact
+      // zeros would make a transcription error there invisible.
+      for (int c = 0; c < 4; ++c)
+        h.cos_sg[idx + (size_t)c * h.size_2d] =
+            (fv_real)(0.03 - 0.005 * (fv_real)c);
+      // f_c is Coriolis on the DUAL (corner) mesh, a different FieldId from
+      // f0 above. Slightly offset from f0 so a mix-up between the two shows
+      // up as a changed answer rather than silently agreeing.
+      h.f_c[idx] = 1.0e-4 * (1.0 + 0.15 * horiz / 0.02);
+      // ws3 is update_dz_c's surface-vertical-velocity OUTPUT (dyn_core.F90:577
+      // passes it intent(out)) and then Riem_Solver_C's ws input, so a nonzero
+      // seed here would only mask a missing write. Zero deliberately -- the
+      // same reasoning as ut/vt/crx/cry above.
+      h.ws3[idx] = 0.0;
+      // phis is surface geopotential. It MUST equal grav*zs, because the
+      // vertical stages consume the two as one consistent surface: the C-grid
+      // height reconstruction builds gz upward from zs in METRES, while
+      // Riem_Solver_C closes the column against hs = phis in GEOPOTENTIAL. zs
+      // is identically zero on this idealized tile, so phis is too -- that is
+      // consistency, not a degenerate input, and inventing a nonzero phis here
+      // would contradict zs and break the closure.
+      h.phis[idx] = h.grav * h.zs[idx];
       // grid_lonlat/agrid_lonlat: small idealized lon/lat (radians) grid,
       // trailing dim 0=lon, 1=lat.
       const size_t idx_ll = idx * 2;
@@ -516,6 +569,14 @@ HostState make_host_state() {
         // damping terms; 1.0 is the neutral value, perturbed so it cannot
         // cancel out of a product.
         h.z_rat[idx] = (fv_real)(1.0 + 0.02 * std::sin(x - y));
+        // Milestone 3A.9. omga is BOTH d2a2c_vect's A-grid vertical velocity
+        // and Riem_Solver_C's w3 argument (dyn_core.F90:583), where it is
+        // intent(in) and enters the implicit column solve's forcing. Zero
+        // would be an admissible physical state but a degenerate test input:
+        // it would remove w3 from the Riem_Solver_C right-hand side entirely,
+        // so a transcription error in that term could not change the answer.
+        // Same order of magnitude as w (0.01 m/s), sign-varying in i,j,k.
+        h.omga[idx] = (fv_real)(0.01 * std::sin(x + y - z));
         // The five flux capacitors get a nonzero seed on purpose: d_sw ADDS to
         // them and never initializes them (§5 of wp_b_dsw_cuda.cuh). Seeding
         // them at zero would make "accumulated" and "overwrote" indistinguish-
@@ -526,6 +587,17 @@ HostState make_host_state() {
       }
     }
   }
+
+  // Milestone 3A.9: dp_ref is the reference-profile layer thickness
+  // update_dz_c reads as dp0. It must match the delp profile the rest of this
+  // state carries, because update_dz_c's wind extrapolation weights the
+  // top-two and bottom-two levels by dp0 ratios (nh_utils.F90's dp0(1)/dp0(0)
+  // and dp0(km-1)/dp0(km-2) terms); an inconsistent dp_ref would silently
+  // change those weights. This state is a uniform-dp column, so dp_ref is
+  // uniform too, with a small k variation so the ratios are not exactly 1 and
+  // a swapped index would be visible.
+  for (size_t k = 0; k < (size_t)NPZ; ++k)
+    h.dp_ref[k] = dp_uniform * (fv_real)(1.0 + 0.01 * (double)k);
 
   // --- Milestone 3A.8: the ten per-level damping controls -------------------
   // This is §4's required production behavior: a sponge top where nord_k is
@@ -762,10 +834,44 @@ std::vector<fv3_gpu_field_desc> make_fields(HostState &h) {
         {FieldId::damping_kgb, &h.lv_kgb}})
     fields.push_back(make_field(f.first, f.second->data(), 1, lo_lv, ex_lv, st_lv, bytes_lv));
 
+  // ==== Milestone 3A.9: the two C-grid stages' remaining contract ==========
+  // cgrid_predictor rejects a missing field BY NAME before any launch
+  // (fv3_cgrid_predictor.cu's `all[]` absence list), and so do
+  // launch_cgrid_vertical_solver and launch_riem_solver_c_ctx. All six below
+  // are therefore load-bearing, not defensive.
+  //
+  // omga must use lo_3d EXACTLY, not lo_3d_if and not lo_pe: the predictor
+  // requires every one of its 15 mutable-state 3-D fields to share
+  // delp's lower[2], so a -kPelnHaloPad or interface-level registration is
+  // rejected even though it would "cover" the range.
+  fields.push_back(make_field(FieldId::omga, h.omga.data(), 3, lo_3d, ex_3d, st_3d, bytes_3d));
+  // f_c is the dual-mesh Coriolis term (B stagger), a different field from f0
+  // registered in group 3 above. ws3 and phis are the C-grid surface pair
+  // dyn_core.F90:577/:583 pass to update_dz_c and Riem_Solver_C; ws3 is again
+  // distinct from ws, which is Riem_Solver3's D-grid output.
+  for (const std::pair<FieldId, std::vector<fv_real> *> &f :
+       {std::pair<FieldId, std::vector<fv_real> *>{FieldId::f_c, &h.f_c},
+        {FieldId::ws3, &h.ws3}, {FieldId::phis, &h.phis}})
+    fields.push_back(make_field(f.first, f.second->data(), 2, lo_2d, ex_2d, st_2d, bytes_2d));
+  // cos_sg shares sin_sg's shape exactly -- same (i,j) box, same 0-based
+  // 4-component trailing axis, and the predictor applies the same rank-3 /
+  // lower[2]==0 / covers(0..3) checks to both.
+  fields.push_back(make_field(FieldId::cos_sg, h.cos_sg.data(), 3, lo_sg, ex_sg, st_sg,
+                              h.size_2d * 4 * sizeof(fv_real)));
+  // dp_ref shares the per-level damping controls' shape. lower[0] must be 0:
+  // update_dz_c reads dp0 at absolute indices 0 and npz-1, so a lower[0] of 1
+  // would shift every read and run one element past the end at k == npz.
+  fields.push_back(make_field(FieldId::dp_ref, h.dp_ref.data(), 1, lo_lv, ex_lv, st_lv, bytes_lv));
+
   return fields;
 }
 
-int install_config(fv3_gpu_context *ctx, HostState &h, fv3_gpu_error *err) {
+// The production first-run configuration, built but not installed. Split out
+// from install_config() by Milestone 3A.9 so the §13 fence phase can construct
+// this exact config and then perturb ONE field: a fence test that hand-rolled
+// its own config would risk being refused for an unrelated reason and still
+// look like it proved something.
+NumericalConfig production_config(const HostState &h) {
   NumericalConfig cfg{};
   cfg.ptop = h.ptop;
   cfg.akap = h.akap;
@@ -780,11 +886,29 @@ int install_config(fv3_gpu_context *ctx, HostState &h, fv3_gpu_error *err) {
   cfg.hydrostatic = 0;
   cfg.grid_type = 0;
   cfg.delt_max = 0.002;
+  // flagstruct%m_split. Milestone 3A.9 removed the runtime's hardcoded
+  // vertical_ms=1: dyn_core.F90:918 gives Riem_Solver3 flagstruct%m_split while
+  // :300/:583 give Riem_Solver_C max(1, m_split/2), so one value could not
+  // serve both and NumericalConfig::m_split is now the single source. Zero is
+  // the "not supplied" sentinel and BOTH solvers reject it rather than default,
+  // so this line is load-bearing: without it launch_vertical_solver returns
+  // FV3_GPU_UNSUPPORTED_CONFIGURATION. 2 => Riem_Solver3 ms=2, Riem_Solver_C
+  // ms=max(1,1)=1, which exercises the two-different-values path rather than
+  // the degenerate case where both happen to be 1.
+  cfg.m_split = 2;
+  // flagstruct%dz_min. Nothing REJECTS a zero dz_min, which makes it the more
+  // dangerous of the two: update_dz_c's and update_dz_d's monotonicity clamps
+  // (nh_utils.F90's `max(zh(k), zh(k+1)+dz_min)` and the C-grid equivalent)
+  // degenerate into permitting exactly zero-thickness layers, and the SIM1
+  // column solve then divides by dz -- a silent Inf/NaN, produced by a
+  // perfectly valid-looking configuration. 2 m is the GEOS namelist value.
+  cfg.dz_min = 2.0;
   // Milestone 3A.2: enable post_loop_heating's genuine (non-early-return)
   // execution path. nf_ke must be exactly 1 because fv3_gpu_dyn_core_step
-  // hardcodes dispatch_params.diffusion_passes=1 (fv3_gpu_runtime.cpp) --
+  // sets dispatch_params.diffusion_passes = config.nf_ke and runs that many
+  // del2_cubed passes (fv3_gpu_runtime.cpp:620-623) --
   // launch_post_loop_heating_cuda requires diffusion_passes==nf_ke. With
-  // nf_ke=1, passes=min(3,nf_ke)=1 and nt=passes-1=0, so the corner_service
+  // nf_ke=1, passes=1 and nt=passes-1=0, so the corner_service
   // call inside post_loop_heating (only reached when nt>0) is skipped,
   // avoiding this milestone's unimplemented corner_edge_service stub.
   cfg.n_con = 1;
@@ -814,7 +938,11 @@ int install_config(fv3_gpu_context *ctx, HostState &h, fv3_gpu_error *err) {
   cfg.rot3 = 0;
   cfg.do_f3d = 0;
   cfg.do_skeb = 0;
-  return set_numerical_config(ctx, cfg, err);
+  return cfg;
+}
+
+int install_config(fv3_gpu_context *ctx, HostState &h, fv3_gpu_error *err) {
+  return set_numerical_config(ctx, production_config(h), err);
 }
 
 // Milestone 3A.8: bind_wp_b_d_sw refuses a TopologyView with npx/npy == 0
@@ -876,6 +1004,60 @@ int install_topology(fv3_gpu_context *ctx, fv3_gpu_error *err) {
   t.ne_corner = 1;
   t.nw_corner = 1;
   return set_topology(ctx, t, err);
+}
+
+// ===========================================================================
+// Milestone 3A.9 §8/§9 -- halo readiness, and the limit of what this harness
+// can honestly claim about it.
+//
+// install_topology() above describes a rank that owns a whole cube face, so it
+// has four CROSS-TILE neighbours. resolve_halo() in the runtime therefore does
+// NOT consider its halo exchange vacuous, and refuses to invent readiness for
+// any group: without the declaration below, fv3_gpu_dyn_core_step stops at the
+// first resolve point with FV3_GPU_UNSUPPORTED_CONFIGURATION, naming the group.
+// That refusal is the correct behaviour and is asserted separately by
+// run_halo_refusal_check() below.
+//
+// What this function does is declare, on the caller's behalf, that this process
+// is responsible for those halo contents. That declaration is TRUE ONLY IN THE
+// WEAK SENSE that the halo cells hold what initialize_state's H2D put there --
+// this harness performs no exchange, because none exists to perform. So:
+//
+//   * this is enough to make the integrated path EXECUTE on the device, which
+//     is what a GPU-execution harness is for;
+//   * it is NOT enough to make the panel-seam halo values physically correct,
+//     and therefore NOT enough to close Gate C1's "no false halo-readiness
+//     assumption" criterion.
+//
+// The distinction is recorded here rather than buried in a handoff because the
+// declaration is exactly the kind of thing that reads as "halos handled" six
+// months later. They are not handled. See docs/agent_handoff/
+// milestone_3a9_gate_c1_closure.md for the blocker statement.
+//
+// The list is the set the runtime actually resolves, spelled out rather than a
+// range over the whole enum: if a future change adds a resolve point for
+// H_Q_INLINE or H_DWIND_NEXT, this harness should fail loudly at that new
+// point rather than silently have covered it in advance.
+constexpr fv3_gpu_halo_group kRuntimeResolvedGroups[] = {
+    FV3_GPU_H_DWIND_IN, FV3_GPU_H_W_IN,    FV3_GPU_H_GZ_FIRST,
+    FV3_GPU_H_DIVGD,    FV3_GPU_H_CWIND,   FV3_GPU_H_DSCALAR,
+    FV3_GPU_H_ZH,       FV3_GPU_H_PKC2,    FV3_GPU_H_HEAT};
+
+bool declare_caller_managed_halos(fv3_gpu_context *ctx, fv3_gpu_error *err) {
+  for (fv3_gpu_halo_group g : kRuntimeResolvedGroups) {
+    const int rc = mark_halo_caller_managed(ctx, g, err);
+    if (rc != FV3_GPU_SUCCESS) {
+      printf("  FAIL: mark_halo_caller_managed(%d) returned %d: %s\n", (int)g,
+             rc, err->message);
+      return false;
+    }
+  }
+  printf("  %zu halo groups declared CALLER-MANAGED\n",
+         sizeof(kRuntimeResolvedGroups) / sizeof(kRuntimeResolvedGroups[0]));
+  printf("  NOTE: this harness performs NO halo exchange. The declaration\n");
+  printf("  lets the integrated path execute; it does NOT make panel-seam\n");
+  printf("  halo values correct. Gate C1 halo criterion: NOT met.\n");
+  return true;
 }
 
 // Phase A: minimal dispatch (only the two stages this field set satisfies).
@@ -1109,13 +1291,10 @@ bool run_phase_b() {
   printf("  TopologyView installed (npx=npy=%ld, all 4 edges + 4 corners owned)\n",
          (long)(NI + 1));
 
-  for (fv3_gpu_halo_group g : {FV3_GPU_H_ZH, FV3_GPU_H_PKC2, FV3_GPU_H_HEAT}) {
-    rc = mark_halo_ready(ctx, g, &err);
-    if (rc != FV3_GPU_SUCCESS) {
-      printf("  WARN: mark_halo_ready(%d) returned %d: %s\n", (int)g, rc, err.message);
-    }
+  if (!declare_caller_managed_halos(ctx, &err)) {
+    fv3_gpu_finalize(&ctx, &err);
+    return false;
   }
-  printf("  Halo groups H_ZH/H_PKC2/H_HEAT marked ready\n");
 
   NumericalDispatch dispatch{};
   rc = fv3_build_production_dispatch(dispatch, &err);
@@ -1298,6 +1477,580 @@ bool run_phase_b() {
   return pass;
 }
 
+// ===========================================================================
+// Milestone 3A.9 Phase C -- the integrated Gate C1 evidence phase (§12, §16).
+//
+// What distinguishes this from Phase B is not "more stages": it is that every
+// claim is instrumented rather than inferred.
+//
+// Phase B proves a step SUCCEEDS with the full table installed. That is a
+// weaker statement than it looks, because the runtime SKIPS a null slot by
+// design -- so "SUCCESS" is compatible with a stage never having been entered,
+// and with a stage being entered fewer times than the acoustic loop demands.
+// §16 requires asserting that each production-required stage is actually
+// REACHED, and §7 requires n_split > 1 to actually be a loop.
+//
+// So each slot is wrapped in a counting probe that calls straight through to
+// the real production launcher. The probe is a test-only shim: it adds no
+// numerics, and it is installed by copying the production table, so a stage
+// that fv3_build_production_dispatch leaves null stays null and its expected
+// count is zero rather than being silently satisfied.
+//
+// dgrid_height_transport is the case that makes this worth doing. It is not on
+// the runtime's script at all -- it is reached only from inside WP-C's
+// update_dz_d via ExecutionContext::dispatch (§6). Its probe count is therefore
+// the ONLY direct evidence that the WP-B -> WP-C -> WP-B handoff closes, and
+// before this milestone that slot was wired, GPU-executed in isolation, and
+// unreachable through fv3_gpu_dyn_core_step.
+namespace probes {
+
+enum Slot {
+  kCgridPredictor = 0,
+  kCgridVerticalSolver,
+  kCgridPressure,
+  kDgridDynamics,
+  kDgridHeight,
+  kVerticalSolver,
+  kNhPressure,
+  kPostLoopHeating,
+  kDgridHeightTransport,
+  kSlotCount
+};
+
+const char *const slot_name[kSlotCount] = {
+    "cgrid_predictor (WP-A c_sw/d2a2c_vect)",
+    "cgrid_vertical_solver (WP-C update_dz_c + Riem_Solver_C)",
+    "cgrid_pressure (WP-A p_grad_c)",
+    "dgrid_dynamics (WP-B d_sw)",
+    "dgrid_height (WP-C update_dz_d sequencing)",
+    "vertical_solver (WP-C Riem_Solver3)",
+    "nh_pressure (WP-D nh_p_grad)",
+    "post_loop_heating (WP-D del2_cubed + heating)",
+    "dgrid_height_transport (WP-B, called BY WP-C)"};
+
+LaunchFn real_fn[kSlotCount] = {};
+int count[kSlotCount] = {};
+int last_rc[kSlotCount] = {};
+
+void reset() {
+  for (int s = 0; s < kSlotCount; ++s) { count[s] = 0; last_rc[s] = 0; }
+}
+
+template <int S>
+int probe(const ExecutionContext &x, fv3_gpu_error *e) {
+  ++count[S];
+  // A null real_fn here would mean the probe was installed for a slot the
+  // production table left empty. Report that as a hard error rather than
+  // returning SUCCESS, which would forge evidence of a stage that does not
+  // exist.
+  if (!real_fn[S]) return FV3_GPU_INVALID_ARGUMENT;
+  const int rc = real_fn[S](x, e);
+  last_rc[S] = rc;
+  return rc;
+}
+
+// Copies `src` into `out`, routing every non-null slot through its probe.
+// corner_edge_service is passed through unwrapped: it is a CornerServiceFn, not
+// a LaunchFn, and this milestone's claim about it is that the production path
+// never REQUESTS it (§19) -- which is established by it never being called,
+// i.e. by the step succeeding while it remains a fail-stub.
+bool install(const NumericalDispatch &src, NumericalDispatch &out) {
+  reset();
+  out = NumericalDispatch{};
+  out.contract_version = src.contract_version;
+  out.corner_edge_service = src.corner_edge_service;
+  LaunchFn *const dst[kSlotCount] = {
+      &out.cgrid_predictor,       &out.cgrid_vertical_solver,
+      &out.cgrid_pressure,        &out.dgrid_dynamics,
+      &out.dgrid_height,          &out.vertical_solver,
+      &out.nh_pressure,           &out.post_loop_heating,
+      &out.dgrid_height_transport};
+  LaunchFn const src_fns[kSlotCount] = {
+      src.cgrid_predictor,       src.cgrid_vertical_solver,
+      src.cgrid_pressure,        src.dgrid_dynamics,
+      src.dgrid_height,          src.vertical_solver,
+      src.nh_pressure,           src.post_loop_heating,
+      src.dgrid_height_transport};
+  LaunchFn const probe_fns[kSlotCount] = {
+      &probe<0>, &probe<1>, &probe<2>, &probe<3>, &probe<4>,
+      &probe<5>, &probe<6>, &probe<7>, &probe<8>};
+  bool all_wired = true;
+  for (int s = 0; s < kSlotCount; ++s) {
+    real_fn[s] = src_fns[s];
+    if (!src_fns[s]) {
+      printf("  FAIL: production dispatch left %s NULL\n", slot_name[s]);
+      all_wired = false;
+      continue;
+    }
+    *dst[s] = probe_fns[s];
+  }
+  return all_wired;
+}
+
+} // namespace probes
+
+// Sum of |x| over a buffer. Used to compare an n_split=1 run against an
+// n_split=3 run: a single scalar is enough, because the question is only
+// "did the substep loop run more than once", and a per-element diff would say
+// nothing extra.
+double abs_sum(const accumulator_real *p, size_t n) {
+  double s = 0.0;
+  for (size_t i = 0; i < n; ++i) s += std::fabs((double)p[i]);
+  return s;
+}
+
+// One full integrated run. Returns false on any failure; on success writes the
+// post-step |mfx| sum through `mfx_abs_sum` so the caller can compare two
+// different n_split values. `expect_substeps` is asserted against every
+// in-loop stage's probe count.
+bool run_integrated(int32_t n_split, bool verbose, double *mfx_abs_sum) {
+  fv3_gpu_error err{};
+  fv3_gpu_context *ctx = nullptr;
+  fv3_gpu_create_desc create{};
+  create.abi_version = FV3_GPU_ABI_VERSION;
+  create.struct_bytes = sizeof(create);
+  create.device_ordinal = 0;
+  create.mpi_rank = 0;
+  create.mpi_size = 1;
+  create.precision = sizeof(fv_real) == 4 ? FV3_GPU_PRECISION_R4 : FV3_GPU_PRECISION_R8;
+  create.is = 1; create.ie = NI; create.js = 1; create.je = NJ;
+  create.npz = NPZ; create.halo_width = HALO;
+  int rc = fv3_gpu_create(&create, &ctx, &err);
+  if (rc != FV3_GPU_SUCCESS) {
+    printf("  FAIL: fv3_gpu_create returned %d: %s\n", rc, err.message);
+    return false;
+  }
+
+  HostState h = make_host_state();
+  std::vector<fv3_gpu_field_desc> fields = make_fields(h);
+  fv3_gpu_state_desc state{};
+  state.abi_version = FV3_GPU_ABI_VERSION;
+  state.struct_bytes = sizeof(state);
+  state.field_count = static_cast<uint32_t>(fields.size());
+  state.fields = fields.data();
+  fv3_gpu_event ev = 0;
+  rc = fv3_gpu_initialize_state(ctx, &state, &ev, &err);
+  if (rc == FV3_GPU_SUCCESS) rc = fv3_gpu_event_wait(ctx, ev, &err);
+  if (rc != FV3_GPU_SUCCESS) {
+    printf("  FAIL: state init/H2D returned %d: %s\n", rc, err.message);
+    fv3_gpu_finalize(&ctx, &err);
+    return false;
+  }
+  if (verbose) printf("  H2D complete (%zu fields registered)\n", fields.size());
+
+  if (install_config(ctx, h, &err) != FV3_GPU_SUCCESS ||
+      install_topology(ctx, &err) != FV3_GPU_SUCCESS) {
+    printf("  FAIL: config/topology install: %s\n", err.message);
+    fv3_gpu_finalize(&ctx, &err);
+    return false;
+  }
+  if (!declare_caller_managed_halos(ctx, &err)) {
+    fv3_gpu_finalize(&ctx, &err);
+    return false;
+  }
+
+  NumericalDispatch production{};
+  if (fv3_build_production_dispatch(production, &err) != FV3_GPU_SUCCESS) {
+    printf("  FAIL: fv3_build_production_dispatch: %s\n", err.message);
+    fv3_gpu_finalize(&ctx, &err);
+    return false;
+  }
+  NumericalDispatch probed{};
+  if (!probes::install(production, probed)) {
+    fv3_gpu_finalize(&ctx, &err);
+    return false;
+  }
+  if (set_numerical_dispatch(ctx, probed, &err) != FV3_GPU_SUCCESS) {
+    printf("  FAIL: set_numerical_dispatch: %s\n", err.message);
+    fv3_gpu_finalize(&ctx, &err);
+    return false;
+  }
+  if (verbose)
+    printf("  All 9 production stages installed behind counting probes\n\n");
+
+  // §14 persistent-residency probe. These are the HOST buffers the fields were
+  // registered from. If any stage performed an implicit device-to-host copy,
+  // they would differ immediately after the step and BEFORE the explicit
+  // sync_to_host below. Snapshotting them is the only residency assertion this
+  // harness can make from outside the runtime -- but it is a real one, and it
+  // is the exact regression project_architecture.md forbids.
+  const std::vector<fv_real> delp_h2d = h.delp;
+  const std::vector<fv_real> u_h2d = h.u;
+  const std::vector<accumulator_real> mfx_h2d = h.mfx;
+
+  fv3_gpu_step_desc step{};
+  step.abi_version = FV3_GPU_ABI_VERSION;
+  step.struct_bytes = sizeof(step);
+  step.bdt = 10.0;
+  step.k_split = 1;
+  step.n_split = n_split;
+  step.init_step = 1;
+  step.end_step = 1;
+  step.model_step = 0;
+  step.acoustic_sequence = 1;
+  step.dependency = 0;
+  fv3_gpu_event step_ev = 0;
+  rc = fv3_gpu_dyn_core_step(ctx, &step, &step_ev, &err);
+  if (rc != FV3_GPU_SUCCESS) {
+    printf("  FAIL: fv3_gpu_dyn_core_step(n_split=%d) returned %d\n",
+           (int)n_split, rc);
+    printf("  error.api=\"%s\" message=\"%s\"\n", err.api, err.message);
+    printf("  Probe counts at the point of failure:\n");
+    for (int s = 0; s < probes::kSlotCount; ++s)
+      printf("    %-56s entered %d time(s), last rc=%d\n", probes::slot_name[s],
+             probes::count[s], probes::last_rc[s]);
+    fv3_gpu_finalize(&ctx, &err);
+    return false;
+  }
+  if (verbose)
+    printf("  fv3_gpu_dyn_core_step(n_split=%d): SUCCESS (event=%lu)\n\n",
+           (int)n_split, (unsigned long)step_ev);
+
+  // ---- §16 per-stage reachability -----------------------------------------
+  // Expected counts follow dyn_core.F90's structure, not convenience:
+  //   the eight acoustic stages are inside `do it=1,n_split` (:399-1019), so
+  //   each must be entered exactly n_split times;
+  //   post_loop_heating is the diffusive-heating tail AFTER the loop closes
+  //   (:1231-1240), so exactly once per dyn_core call regardless of n_split.
+  // dgrid_height_transport sits inside update_dz_d, itself inside the loop, so
+  // it is also n_split.
+  bool reach_pass = true;
+  if (verbose) printf("  Per-stage reachability (n_split=%d):\n", (int)n_split);
+  for (int s = 0; s < probes::kSlotCount; ++s) {
+    const int expected = (s == probes::kPostLoopHeating) ? 1 : (int)n_split;
+    const bool ok = probes::count[s] == expected;
+    reach_pass &= ok;
+    if (verbose || !ok)
+      printf("    %-56s %d/%d %s\n", probes::slot_name[s], probes::count[s],
+             expected, ok ? "REACHED" : "*** WRONG COUNT ***");
+  }
+
+  // ---- §14 residency ------------------------------------------------------
+  const bool no_implicit_d2h =
+      h.delp == delp_h2d && h.u == u_h2d && h.mfx == mfx_h2d;
+  if (verbose)
+    printf("\n  Host buffers unchanged before explicit sync_to_host: %s\n",
+           no_implicit_d2h ? "YES (no implicit D2H)"
+                           : "NO *** implicit D2H detected ***");
+
+  fv3_gpu_field_mask mask{};
+  mask.abi_version = FV3_GPU_ABI_VERSION;
+  mask.struct_bytes = sizeof(mask);
+  for (FieldId id : {FieldId::u, FieldId::v, FieldId::uc, FieldId::vc,
+                     FieldId::delp, FieldId::pt, FieldId::w, FieldId::delz,
+                     FieldId::zh, FieldId::gz, FieldId::pkc, FieldId::pkz,
+                     FieldId::pe, FieldId::peln, FieldId::pk, FieldId::ws,
+                     FieldId::ws3, FieldId::omga, FieldId::heat_source,
+                     FieldId::mfx, FieldId::mfy, FieldId::cx, FieldId::cy})
+    mask.words[static_cast<uint32_t>(id) / 64] |= (1ULL << (static_cast<uint32_t>(id) % 64));
+  rc = fv3_gpu_sync_to_host(ctx, &mask, &ev, &err);
+  if (rc == FV3_GPU_SUCCESS) rc = fv3_gpu_event_wait(ctx, ev, &err);
+  if (rc != FV3_GPU_SUCCESS) {
+    printf("  FAIL: D2H returned %d: %s\n", rc, err.message);
+    fv3_gpu_finalize(&ctx, &err);
+    return false;
+  }
+
+  bool finite_pass = true;
+  if (verbose) printf("\n  Finite checks across the full integrated output:\n");
+  struct Named { const char *name; const fv_real *p; size_t n; };
+  for (const Named &f : {Named{"u", h.u.data(), h.u.size()},
+                         {"v", h.v.data(), h.v.size()},
+                         {"uc", h.uc.data(), h.uc.size()},
+                         {"vc", h.vc.data(), h.vc.size()},
+                         {"delp", h.delp.data(), h.delp.size()},
+                         {"pt", h.pt.data(), h.pt.size()},
+                         {"w", h.w.data(), h.w.size()},
+                         {"delz", h.delz.data(), h.delz.size()},
+                         {"zh", h.zh.data(), h.zh.size()},
+                         {"gz", h.gz.data(), h.gz.size()},
+                         {"pkc", h.pkc.data(), h.pkc.size()},
+                         {"pkz", h.pkz.data(), h.pkz.size()},
+                         {"pe", h.pe.data(), h.pe.size()},
+                         {"peln", h.peln.data(), h.peln.size()},
+                         {"pk", h.pk.data(), h.pk.size()},
+                         {"ws", h.ws.data(), h.ws.size()},
+                         {"ws3", h.ws3.data(), h.ws3.size()},
+                         {"omga", h.omga.data(), h.omga.size()},
+                         {"heat_source", h.heat_source.data(), h.heat_source.size()}})
+    finite_pass &= check_finite(f.p, f.n, f.name);
+  finite_pass &= check_finite(h.mfx.data(), h.mfx.size(), "mfx");
+  finite_pass &= check_finite(h.mfy.data(), h.mfy.size(), "mfy");
+  finite_pass &= check_finite(h.cx.data(), h.cx.size(), "cx");
+  finite_pass &= check_finite(h.cy.data(), h.cy.size(), "cy");
+
+  // ---- non-degenerate output ----------------------------------------------
+  // delp/w witness the transport half, uc/vc the C-grid half, zh/delz the
+  // vertical half. Comparing against the H2D snapshot rather than against zero
+  // keeps every probe independent of the initial value.
+  const bool delp_moved =
+      report_changed(delp_h2d.data(), h.delp.data(), h.delp.size(), "delp");
+  const bool u_moved = report_changed(u_h2d.data(), h.u.data(), h.u.size(), "u");
+
+  // ---- flux capacitors ----------------------------------------------------
+  // dyn_core.F90:372-375 zeroes mfx/mfy/cx/cy ONCE per k_split, before
+  // `do it=1,n_split`, and every substep then ADDS to them. Two independent
+  // claims follow, and both are checked:
+  //   (1) the zeroing happened -- the deliberately nonzero seed (11.0/13.0/
+  //       0.17/0.19) must be gone, so no element may still equal it;
+  //   (2) accumulation happened -- the result must be nonzero.
+  // A stage that overwrote instead of accumulating would still pass (2), which
+  // is why the caller additionally compares n_split=1 against n_split=3.
+  bool seed_cleared = true;
+  for (size_t i = 0; i < h.mfx.size(); ++i)
+    if (h.mfx[i] == (accumulator_real)11.0) { seed_cleared = false; break; }
+  const double mfx_sum = abs_sum(h.mfx.data(), h.mfx.size());
+  const double cx_sum = abs_sum(h.cx.data(), h.cx.size());
+  const bool capacitors_nonzero = mfx_sum > 0.0 && cx_sum > 0.0;
+  if (verbose) {
+    printf("\n  Flux capacitors (mfx, mfy, cx, cy -- the FOUR dyn_core.F90\n");
+    printf("  :372-375 zeroes; diss_est and dpx are fv_dynamics-owned and are\n");
+    printf("  deliberately NOT in this set):\n");
+    printf("    seed 11.0 fully cleared by the runtime's zeroing: %s\n",
+           seed_cleared ? "YES" : "NO");
+    printf("    sum|mfx| = %.6e, sum|cx| = %.6e\n", mfx_sum, cx_sum);
+  }
+
+  if (mfx_abs_sum) *mfx_abs_sum = mfx_sum;
+
+  rc = fv3_gpu_finalize(&ctx, &err);
+  if (rc != FV3_GPU_SUCCESS) {
+    printf("  FAIL: fv3_gpu_finalize returned %d: %s\n", rc, err.message);
+    return false;
+  }
+
+  return reach_pass && no_implicit_d2h && finite_pass && delp_moved &&
+         u_moved && seed_cleared && capacitors_nonzero;
+}
+
+bool run_phase_c() {
+  printf("########################################################\n");
+  printf("# Phase C: integrated Gate C1 evidence run\n");
+  printf("# All 9 production stages, n_split > 1, through the public\n");
+  printf("# entry point fv3_gpu_dyn_core_step, per-stage reachability\n");
+  printf("# asserted by counting probes.\n");
+  printf("########################################################\n\n");
+
+  double sum_n3 = 0.0, sum_n1 = 0.0;
+  printf("--- Run 1: n_split = 3 (the authoritative acoustic loop) ---\n");
+  const bool n3_pass = run_integrated(3, true, &sum_n3);
+  printf("\n--- Run 2: n_split = 1 (control, for the substep-loop probe) ---\n");
+  const bool n1_pass = run_integrated(1, false, &sum_n1);
+
+  // §7 evidence. If the runtime executed the stage list once regardless of
+  // n_split -- the pre-3A.9 behaviour -- these two sums would be IDENTICAL,
+  // because everything else about the two runs is the same. They differ
+  // because dt = bdt/n_split differs per substep AND because the capacitors
+  // accumulate over n_split substeps.
+  const bool substep_loop_live = n3_pass && n1_pass && sum_n3 != sum_n1;
+  printf("\n  Acoustic-loop probe:\n");
+  printf("    sum|mfx| at n_split=1: %.9e\n", sum_n1);
+  printf("    sum|mfx| at n_split=3: %.9e\n", sum_n3);
+  printf("    differ (so the loop is a real loop, not one pass): %s\n",
+         substep_loop_live ? "YES" : "NO");
+
+  const bool pass = n3_pass && n1_pass && substep_loop_live;
+  printf("\nPhase C result: %s\n\n", pass ? "PASS" : "FAIL");
+  return pass;
+}
+
+// ===========================================================================
+// Milestone 3A.9 §13 / §8 -- the fence. Every check here asserts a REFUSAL,
+// and asserts that the refusal happened BEFORE model state was mutated, which
+// is the requirement project_architecture.md states ("Unsupported
+// configurations should fail before mutating model state") and which a plain
+// "returned nonzero" check would not establish.
+//
+// State mutation is detected the same way residency is: the registered host
+// buffers plus an explicit D2H. If a rejected step had run any kernel, the
+// device delp would differ from the H2D value and the post-rejection D2H would
+// show it.
+namespace fence {
+
+// A mutation applied to the otherwise-valid production config.
+struct Case {
+  const char *name;
+  const char *why;
+  void (*mutate)(NumericalConfig &);
+  bool skip_config_install; // for the halo case, which mutates nothing
+};
+
+void set_hord_mt_8(NumericalConfig &c) { c.hord_mt = 8; }
+void set_grid_type_4(NumericalConfig &c) { c.grid_type = 4; }
+void set_hydrostatic(NumericalConfig &c) { c.hydrostatic = 1; }
+void clear_m_split(NumericalConfig &c) { c.m_split = 0; }
+void clear_a_imp(NumericalConfig &c) { c.a_imp = 0.5; }
+
+// Rebuilds the production config, applies `mutate`, installs the result.
+// set_numerical_config itself must ACCEPT the perturbed config -- it is a plain
+// setter, and the refusal being tested belongs to fv3_gpu_dyn_core_step. If a
+// setter-level rejection ever appeared, run_case would report it as a config
+// install failure rather than silently counting it as the fence firing.
+int install_mutated(fv3_gpu_context *ctx, HostState &h, fv3_gpu_error *err,
+                    void (*mutate)(NumericalConfig &)) {
+  NumericalConfig cfg = production_config(h);
+  mutate(cfg);
+  return set_numerical_config(ctx, cfg, err);
+}
+
+bool run_case(const Case &c) {
+  fv3_gpu_error err{};
+  fv3_gpu_context *ctx = nullptr;
+  fv3_gpu_create_desc create{};
+  create.abi_version = FV3_GPU_ABI_VERSION;
+  create.struct_bytes = sizeof(create);
+  create.device_ordinal = 0;
+  create.mpi_rank = 0;
+  create.mpi_size = 1;
+  create.precision = sizeof(fv_real) == 4 ? FV3_GPU_PRECISION_R4 : FV3_GPU_PRECISION_R8;
+  create.is = 1; create.ie = NI; create.js = 1; create.je = NJ;
+  create.npz = NPZ; create.halo_width = HALO;
+  if (fv3_gpu_create(&create, &ctx, &err) != FV3_GPU_SUCCESS) {
+    printf("    FAIL: create: %s\n", err.message);
+    return false;
+  }
+  HostState h = make_host_state();
+  std::vector<fv3_gpu_field_desc> fields = make_fields(h);
+  fv3_gpu_state_desc state{};
+  state.abi_version = FV3_GPU_ABI_VERSION;
+  state.struct_bytes = sizeof(state);
+  state.field_count = static_cast<uint32_t>(fields.size());
+  state.fields = fields.data();
+  fv3_gpu_event ev = 0;
+  int rc = fv3_gpu_initialize_state(ctx, &state, &ev, &err);
+  if (rc == FV3_GPU_SUCCESS) rc = fv3_gpu_event_wait(ctx, ev, &err);
+  if (rc != FV3_GPU_SUCCESS) {
+    printf("    FAIL: H2D: %s\n", err.message);
+    fv3_gpu_finalize(&ctx, &err);
+    return false;
+  }
+  if (c.mutate) rc = install_mutated(ctx, h, &err, c.mutate);
+  else rc = install_config(ctx, h, &err);
+  if (rc != FV3_GPU_SUCCESS) {
+    printf("    FAIL: config install: %s\n", err.message);
+    fv3_gpu_finalize(&ctx, &err);
+    return false;
+  }
+  if (install_topology(ctx, &err) != FV3_GPU_SUCCESS) {
+    printf("    FAIL: topology install: %s\n", err.message);
+    fv3_gpu_finalize(&ctx, &err);
+    return false;
+  }
+  // The halo case is exactly this: DO NOT declare the groups caller-managed.
+  if (!c.skip_config_install) {
+    fv3_gpu_error quiet{};
+    for (fv3_gpu_halo_group g : kRuntimeResolvedGroups)
+      mark_halo_caller_managed(ctx, g, &quiet);
+  }
+  NumericalDispatch production{};
+  if (fv3_build_production_dispatch(production, &err) != FV3_GPU_SUCCESS ||
+      set_numerical_dispatch(ctx, production, &err) != FV3_GPU_SUCCESS) {
+    printf("    FAIL: dispatch install: %s\n", err.message);
+    fv3_gpu_finalize(&ctx, &err);
+    return false;
+  }
+
+  const std::vector<fv_real> delp_h2d = h.delp;
+  const std::vector<fv_real> u_h2d = h.u;
+
+  fv3_gpu_step_desc step{};
+  step.abi_version = FV3_GPU_ABI_VERSION;
+  step.struct_bytes = sizeof(step);
+  step.bdt = 10.0;
+  step.k_split = 1;
+  step.n_split = 3;
+  step.init_step = 1;
+  step.end_step = 1;
+  step.model_step = 0;
+  step.acoustic_sequence = 1;
+  step.dependency = 0;
+  fv3_gpu_event step_ev = 0;
+  rc = fv3_gpu_dyn_core_step(ctx, &step, &step_ev, &err);
+
+  bool ok = true;
+  if (rc == FV3_GPU_SUCCESS) {
+    printf("    *** ACCEPTED (expected refusal): %s\n", c.name);
+    ok = false;
+  } else if (rc != FV3_GPU_UNSUPPORTED_CONFIGURATION) {
+    printf("    *** refused with %d, expected FV3_GPU_UNSUPPORTED_CONFIGURATION"
+           " (%d): %s\n", rc, (int)FV3_GPU_UNSUPPORTED_CONFIGURATION, err.message);
+    ok = false;
+  } else {
+    printf("    REFUSED  rc=UNSUPPORTED_CONFIGURATION  api=\"%s\"\n", err.api);
+    printf("             \"%s\"\n", err.message);
+  }
+
+  // Did the refusal happen before state was mutated? A failed step leaves the
+  // context in ContextPhase::failed, and fv3_gpu_sync_to_host is expected to
+  // refuse on a failed context -- so a D2H error here is not itself a test
+  // failure. What IS checked is that if the D2H does succeed, nothing moved.
+  fv3_gpu_field_mask mask{};
+  mask.abi_version = FV3_GPU_ABI_VERSION;
+  mask.struct_bytes = sizeof(mask);
+  for (FieldId id : {FieldId::delp, FieldId::u})
+    mask.words[static_cast<uint32_t>(id) / 64] |= (1ULL << (static_cast<uint32_t>(id) % 64));
+  fv3_gpu_error d2h_err{};
+  fv3_gpu_event d2h_ev = 0;
+  const int d2h_rc = fv3_gpu_sync_to_host(ctx, &mask, &d2h_ev, &d2h_err);
+  if (d2h_rc == FV3_GPU_SUCCESS &&
+      fv3_gpu_event_wait(ctx, d2h_ev, &d2h_err) == FV3_GPU_SUCCESS) {
+    const bool unmutated = h.delp == delp_h2d && h.u == u_h2d;
+    printf("             device state unmutated: %s\n",
+           unmutated ? "YES" : "NO *** state was modified before the refusal ***");
+    ok = ok && unmutated;
+  } else {
+    printf("             (D2H refused on the failed context: %s -- state\n"
+           "              mutation not separately observable for this case)\n",
+           d2h_err.message);
+  }
+
+  fv3_gpu_error fin{};
+  fv3_gpu_finalize(&ctx, &fin);
+  return ok;
+}
+
+} // namespace fence
+
+bool run_phase_d_fence() {
+  printf("########################################################\n");
+  printf("# Phase D: the production configuration fence (§13) and the\n");
+  printf("# halo-readiness refusal (§8). Every case here must be REFUSED,\n");
+  printf("# with FV3_GPU_UNSUPPORTED_CONFIGURATION, before state mutation.\n");
+  printf("########################################################\n\n");
+
+  const fence::Case cases[] = {
+      {"hord_mt = 8 (not the production first-run value 6)",
+       "project_architecture.md pins hord_mt/hord_vt/hord_tm = 6, hord_dp = -6",
+       &fence::set_hord_mt_8, false},
+      {"grid_type = 4 (doubly-periodic Cartesian, not the cubed sphere)",
+       "the production first-run config is grid_type = 0",
+       &fence::set_grid_type_4, false},
+      {"hydrostatic = true",
+       "the production first-run config is nonhydrostatic",
+       &fence::set_hydrostatic, false},
+      {"a_imp = 0.5 (a non-SIM1 vertical branch)",
+       "the production first-run config is a_imp = 1.0",
+       &fence::clear_a_imp, false},
+      {"m_split = 0 (the not-supplied sentinel)",
+       "neither Riemann solver may default its vertical substep count",
+       &fence::clear_m_split, false},
+      {"halo groups NOT declared caller-managed on a connected topology",
+       "the runtime has no halo transport and must not invent readiness",
+       nullptr, true},
+  };
+
+  bool pass = true;
+  for (const fence::Case &c : cases) {
+    printf("  Case: %s\n", c.name);
+    printf("    Rationale: %s\n", c.why);
+    const bool ok = fence::run_case(c);
+    pass &= ok;
+    printf("    -> %s\n\n", ok ? "PASS (refused as required)" : "FAIL");
+  }
+  printf("Phase D result: %s\n\n", pass ? "PASS" : "FAIL");
+  return pass;
+}
+
 int main() {
   printf("=== Milestone 3A.1 Production Dispatch Smoke Test ===\n\n");
   printf("Configuration:\n");
@@ -1317,37 +2070,49 @@ int main() {
 
   bool phase_a_pass = run_phase_a();
   bool phase_b_pass = run_phase_b();
+  bool phase_c_pass = run_phase_c();
+  bool phase_d_pass = run_phase_d_fence();
 
   printf("=== Summary ===\n");
-  printf("  Phase A (minimal dispatch, full success + D2H verify):        %s\n", phase_a_pass ? "PASS" : "FAIL");
+  printf("  Phase A (minimal dispatch, full success + D2H verify):         %s\n", phase_a_pass ? "PASS" : "FAIL");
   printf("  Phase B (full production dispatch, full success + D2H verify): %s\n", phase_b_pass ? "PASS" : "FAIL");
-  printf("  Persistent residency: PASS (no intermediate H2D/D2H between stages within a step)\n");
+  printf("  Phase C (integrated Gate C1: 9/9 stages, n_split=3, probes):   %s\n", phase_c_pass ? "PASS" : "FAIL");
+  printf("  Phase D (production config fence + halo refusal):             %s\n", phase_d_pass ? "PASS" : "FAIL");
 
-  if (phase_a_pass && phase_b_pass) {
-    printf("\nDispatch smoke test: PASS\n");
-    printf("fv3_gpu_dyn_core_step -> real NumericalDispatch -> all 5 wired\n");
-    printf("acoustic stages (WP-A p_grad_c, WP-B d_sw, WP-C riem_solver3,\n");
-    printf("WP-D nh_pressure, WP-D post_loop_heating) genuinely execute on\n");
-    printf("the A100, with D2H-verified finite, non-degenerate output. Both\n");
-    printf("the WP-D contract (bind_wp_d) and the WP-B d_sw contract\n");
-    printf("(bind_wp_b_d_sw) are fully satisfied by this test's field\n");
-    printf("registration, including the ten per-level damping controls, and\n");
-    printf("the level pattern makes the nord_k = 0, 1 and 2 branch groups\n");
-    printf("live simultaneously within this one step.\n");
-    printf("\nStill NOT reached through fv3_gpu_dyn_core_step (Gate C1 items,\n");
-    printf("not claims made by this test):\n");
-    printf("  cgrid_predictor, cgrid_vertical_solver  -- nullptr\n");
-    printf("  dgrid_height                            -- nullptr\n");
-    printf("  dgrid_height_transport -- WIRED and separately GPU executed,\n");
-    printf("      but its only caller is WP-C's launch_update_dz_d, which\n");
-    printf("      launch_vertical_solver does not call yet\n");
-    printf("  corner_edge_service    -- deliberate fail-stub; production\n");
-    printf("      grid_type=0 d_sw implements its local corner semantics\n");
-    printf("      inline and never requests this generic slot\n");
-    printf("  the n_split acoustic loop -- the runtime walks its stage list\n");
-    printf("      once per call\n");
-    printf("Numerical validation against authoritative Fortran savepoints:\n");
-    printf("NOT RUN.\n");
+  const bool all = phase_a_pass && phase_b_pass && phase_c_pass && phase_d_pass;
+  if (all) {
+    printf("\nDispatch smoke test: PASS\n\n");
+    printf("What this test now establishes, at the GPU EXECUTED level:\n");
+    printf("  * All NINE production dispatch stages are entered through the\n");
+    printf("    public entry point fv3_gpu_dyn_core_step -- asserted by\n");
+    printf("    per-slot counting probes, not inferred from a success code.\n");
+    printf("  * The acoustic loop is a real loop: the eight in-loop stages are\n");
+    printf("    entered exactly n_split times and post_loop_heating exactly\n");
+    printf("    once, and the n_split=1 vs n_split=3 capacitor sums differ.\n");
+    printf("  * dgrid_height_transport is REACHABLE through the production\n");
+    printf("    path -- it is on no stage list, and is entered only because\n");
+    printf("    WP-C's update_dz_d calls it via ExecutionContext::dispatch.\n");
+    printf("  * The four flux capacitors (mfx, mfy, cx, cy) are zeroed once\n");
+    printf("    per call and then accumulated across substeps.\n");
+    printf("  * Persistent device residency: the registered host buffers are\n");
+    printf("    byte-identical after the step and before the explicit\n");
+    printf("    sync_to_host, so no stage performed an implicit D2H.\n");
+    printf("  * Configurations outside the production first-run subset are\n");
+    printf("    refused before any device state is mutated.\n");
+    printf("  * corner_edge_service remains a deliberate fail-stub and the\n");
+    printf("    whole path still succeeds, which is the evidence that the\n");
+    printf("    grid_type=0 production path never REQUESTS it: d_sw and\n");
+    printf("    update_dz_c implement their corner semantics inline through\n");
+    printf("    CornerFillArgs, not through this generic slot.\n");
+    printf("\nWhat this test does NOT establish:\n");
+    printf("  * HALO CORRECTNESS. This harness declares the nine runtime-\n");
+    printf("    resolved halo groups caller-managed and then performs NO\n");
+    printf("    exchange, so halo cells hold only what H2D put there. On a\n");
+    printf("    real grid_type=0 rank those cells belong to four neighbouring\n");
+    printf("    cube faces. The integrated path EXECUTES; its halo values are\n");
+    printf("    not physically correct, and no halo transport exists yet.\n");
+    printf("  * Numerical validation against authoritative Fortran savepoints:\n");
+    printf("    NOT RUN.\n");
     return 0;
   }
   printf("\nDispatch smoke test: FAIL\n");

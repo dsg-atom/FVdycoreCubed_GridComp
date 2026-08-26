@@ -73,10 +73,38 @@ struct CSwArgs {
   FieldView<fv_real, 3> fy2;    // w y flux (nonhydrostatic)
 };
 
-// Launch c_sw for one vertical level.
-// Assumes d2a2c_vect and divergence_corner (if nord>0) already called.
-// Corner fills must be invoked via corner_service by caller.
-fv3_gpu_status launch_csw_fluxes_level(const CSwArgs &args, int64_t k, void *stream);
+/* Launch c_sw for one vertical level. Assumes d2a2c_vect and, when nord > 0,
+ * divergence_corner have already been called for this level.
+ *
+ * Milestone 3A.9: the former single launch_csw_fluxes_level is split into the
+ * three phases below, because sw_core.F90 interleaves the delp/pt/w corner
+ * fills BETWEEN the two flux directions and the two directions write the same
+ * corner cells with different values. See the block comment at
+ * launch_csw_scale_level in fv3_cgrid_csw.cu for the full defect analysis.
+ *
+ * The authoritative per-level order the caller must emit is:
+ *
+ *   launch_csw_scale_level                (:183-200)
+ *   fill2_4corners(delp, pt, X)           (:206)   } grid_type < 3 and
+ *   fill_4corners(w, X)                   (:237)   } corner-flag guarded
+ *   launch_csw_x_flux_level               (:238-253)
+ *   fill2_4corners(delp, pt, Y)           (:257)
+ *   fill_4corners(w, Y)                   (:284)
+ *   launch_csw_y_flux_scalars_level       (:285-309)
+ *   launch_csw_ke_vort_level              (:321-498)
+ *   launch_csw_cwind_update_level         (:500-510)
+ *
+ * The corner fills are the WP-A-local kernels in fv3_cgrid_corners.hpp, NOT the
+ * WP-E corner_service dispatch slot (an earlier comment here said otherwise;
+ * fv3_cgrid_corners.hpp:8-13 records why the local kernels are correct).
+ *
+ * Both flux launchers reject a hydrostatic config: the hydrostatic flux arms
+ * (:208-234, :258-282) are not translated, and silently skipping them would
+ * leave delpc/ptc unwritten. */
+fv3_gpu_status launch_csw_scale_level(const CSwArgs &args, int64_t k, void *stream);
+fv3_gpu_status launch_csw_x_flux_level(const CSwArgs &args, int64_t k, void *stream);
+fv3_gpu_status launch_csw_y_flux_scalars_level(const CSwArgs &args, int64_t k,
+                                              void *stream);
 fv3_gpu_status launch_csw_ke_vort_level(const CSwArgs &args, int64_t k, void *stream);
 fv3_gpu_status launch_csw_cwind_update_level(const CSwArgs &args, int64_t k, void *stream);
 

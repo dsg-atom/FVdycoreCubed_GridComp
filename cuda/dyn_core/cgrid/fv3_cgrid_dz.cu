@@ -128,29 +128,57 @@ __global__ void update_dz_c_update_gz(UpdateDzCArgs a, int64_t k) {
                       (area_ij + xfx_diff + yfx_diff);
 }
 
-// Finalize: ws output and monotonicity (lines 196-205)
+// Finalize: monotonicity then ws output (nh_utils.F90:195-205)
+//
+// Milestone 3A.9 semantics repair. The previous body had THREE independent
+// inversions against the authoritative update_dz_c closure -- it had been
+// written with update_dz_d's (nh_utils.F90:310-321) closure instead:
+//
+//   1. ws was computed BEFORE the monotonicity clamp. Fortran clamps first
+//      (:196-200) and only then forms ws from the CLAMPED gz(km+1) (:202-204),
+//      so ws must see the post-clamp surface height.
+//   2. The sweep ran bottom-up (k=km-1 down to 0). Fortran sweeps TOP-DOWN,
+//      `do k=2, km+1`, so each level is limited against the level ABOVE it
+//      after that level has itself been limited.
+//   3. The sense was `max(gz(k), gz(k+1) + dz_min)` -- a floor pushing layers
+//      up from below. Fortran applies `min( gz(k), gz(k-1) - dz_min )`, a
+//      ceiling that enforces a minimum layer thickness measured DOWNWARD from
+//      the level above. gz here is geopotential, which DECREASES with k.
+//
+// update_dz_d's tail legitimately does the opposite (ws from the unclamped
+// zh(km+1), then a bottom-up `max` floor) -- see
+// vertical/fv3_vertical_kernels.cu:height_boundary_v2_kernel, which is correct
+// for that routine. The two closures are genuinely different and must stay so.
+//
+// Numerical semantics changed: NO -- restores authoritative nh_utils.F90:195-205.
+// (The prior code was numerically wrong, not a validated alternative; nothing
+// had ever executed it, because launch_cgrid_predictor_v3 was a fail-stub.)
+//
+// k index convention in this file: CUDA index = Fortran level - 1, so Fortran
+// gz(:,:,km+1) is a.gz(i,j,km) and the Fortran k=2..km+1 loop is kk=1..km.
 __global__ void update_dz_c_finalize(UpdateDzCArgs a) {
   const int64_t i = a.bounds.is - 1 + blockIdx.x * blockDim.x + threadIdx.x;
   const int64_t j = a.bounds.js - 1 + blockIdx.y * blockDim.y + threadIdx.y;
 
   if (i > a.bounds.ie + 1 || j > a.bounds.je + 1) return;
 
-  const fv_real rdt = fv_real(1) / a.dt;
   const int32_t km = a.km;
 
-  // ws = (zs - gz(:,:,km+1)) * rdt
-  a.ws(i, j) = (a.zs(i, j) - a.gz(i, j, km)) * rdt;
-
-  // Monotonicity: gz(k) = max(gz(k), gz(k+1) + dz_min)
-  for (int64_t kk = km - 1; kk >= 0; --kk) {
-    a.gz(i, j, kk) = max(a.gz(i, j, kk), a.gz(i, j, kk + 1) + a.dz_min);
+  // :196-200  do k=2, km+1 : gz(k) = min( gz(k), gz(k-1) - dz_min )
+  for (int64_t kk = 1; kk <= km; ++kk) {
+    a.gz(i, j, kk) = min(a.gz(i, j, kk), a.gz(i, j, kk - 1) - a.dz_min);
   }
+
+  // :202-204  ws = ( zs - gz(km+1) ) * rdt, using the CLAMPED gz(km+1)
+  const fv_real rdt = fv_real(1) / a.dt;
+  a.ws(i, j) = (a.zs(i, j) - a.gz(i, j, km)) * rdt;
 }
 
 }  // namespace
 
-fv3_gpu_status launch_update_dz_c_interface(const UpdateDzCArgs &a, int64_t k,
-                                            void *stream) {
+fv3_gpu_status launch_update_dz_c_interface(const UpdateDzCArgs &a,
+                                            const CornerFillArgs &corners,
+                                            int64_t k, void *stream) {
   if (!stream || k < 1 || k > a.km + 1) return FV3_GPU_INVALID_ARGUMENT;
 
   auto cuda_stream = static_cast<cudaStream_t>(stream);
@@ -160,27 +188,42 @@ fv3_gpu_status launch_update_dz_c_interface(const UpdateDzCArgs &a, int64_t k,
   const auto ny = static_cast<unsigned>(a.bounds.je - a.bounds.js + 5);
   dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
 
-  // Compute interface winds
+  // Compute interface winds (:115-154)
   update_dz_c_winds<<<grid, block, 0, cuda_stream>>>(a, k);
   if (cudaPeekAtLastError() != cudaSuccess) return FV3_GPU_CUDA_ERROR;
 
-  // Copy gz to gz2
+  // Copy gz to gz2 (:156-160)
   update_dz_c_copy_gz<<<grid, block, 0, cuda_stream>>>(a, k);
   if (cudaPeekAtLastError() != cudaSuccess) return FV3_GPU_CUDA_ERROR;
 
-  // Note: caller must invoke corner_service for gz2 direction 1 here
+  /* :162  if (grid_type < 3) call fill_4corners(gz2, 1, ...)
+   *
+   * Milestone 3A.9: previously a comment telling the caller to do this, which
+   * made a numerically incomplete level body callable. The fill has to happen
+   * here, between the gz2 copy and the x flux, and it has to happen once per
+   * level, so it belongs inside this launcher. */
+  if (a.grid_type < 3) {
+    const fv3_gpu_status s =
+        launch_fill_4corners(corners, a.gz2, kCornerFillDirX, stream);
+    if (s != FV3_GPU_SUCCESS) return s;
+  }
 
-  // X flux
+  // X flux (:163-172)
   update_dz_c_x_flux<<<grid, block, 0, cuda_stream>>>(a, k);
   if (cudaPeekAtLastError() != cudaSuccess) return FV3_GPU_CUDA_ERROR;
 
-  // Note: caller must invoke corner_service for gz2 direction 2 here
+  // :174  if (grid_type < 3) call fill_4corners(gz2, 2, ...)
+  if (a.grid_type < 3) {
+    const fv3_gpu_status s =
+        launch_fill_4corners(corners, a.gz2, kCornerFillDirY, stream);
+    if (s != FV3_GPU_SUCCESS) return s;
+  }
 
-  // Y flux
+  // Y flux (:175-184)
   update_dz_c_y_flux<<<grid, block, 0, cuda_stream>>>(a, k);
   if (cudaPeekAtLastError() != cudaSuccess) return FV3_GPU_CUDA_ERROR;
 
-  // Update gz
+  // Update gz (:186-191)
   const auto nx2 = static_cast<unsigned>(a.bounds.ie - a.bounds.is + 3);
   const auto ny2 = static_cast<unsigned>(a.bounds.je - a.bounds.js + 3);
   dim3 grid2((nx2 + block.x - 1) / block.x, (ny2 + block.y - 1) / block.y);

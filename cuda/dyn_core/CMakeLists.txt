@@ -53,6 +53,10 @@ if(FV3_DYN_CORE_ENABLE_CUDA)
     cgrid/fv3_cgrid_divergence.cu
     cgrid/fv3_cgrid_dz.cu
     cgrid/fv3_cgrid_predictor.cu
+    # Milestone 3A.9: sw_core.F90's fill_4corners / fill2_4corners, the A-grid
+    # scalar corner halo fills c_sw and update_dz_c need between their x and y
+    # flux phases (sw_core.F90:206/237/257/284, nh_utils.F90:162/174).
+    cgrid/fv3_cgrid_corners.cu
   )
   target_include_directories(fv3_wp_a_cgrid PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -62,12 +66,31 @@ if(FV3_DYN_CORE_ENABLE_CUDA)
   set_target_properties(fv3_wp_a_cgrid PROPERTIES CUDA_STANDARD 17)
 
   # WP-C vertical CUDA sources
-  add_library(fv3_wp_c_vertical STATIC vertical/fv3_vertical_kernels.cu)
+  # Milestone 3A.9 adds vertical/fv3_riem_solver_c.cu: nh_utils.F90's
+  # Riem_Solver_c, the C-grid Riemann solve (dyn_core.F90:583, dt2). It is a
+  # genuinely distinct routine from Riem_Solver3, not an alias, but it reuses the
+  # shared sim1_column device solver rather than forking it.
+  add_library(fv3_wp_c_vertical STATIC
+    vertical/fv3_vertical_kernels.cu
+    vertical/fv3_riem_solver_c.cu
+  )
   target_include_directories(fv3_wp_c_vertical PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/vertical
+    # Milestone 3A.9 §4: WP-C owns the C-grid vertical ENTRY sequencing
+    # (dyn_core.F90:543-583), but the update_dz_c kernels and the A-grid corner
+    # fills that sequence drives are WP-A property -- project_architecture.md
+    # gives WP-A "C-grid dz updates". WP-C therefore CALLS
+    # cgrid::launch_update_dz_c_interface / launch_fill_4corners instead of
+    # transcribing a second copy, exactly as WP-B's smag_corner calls WP-D's
+    # a2b_ord4 (see fv3_wp_b_cuda below). No cycle: fv3_wp_a_cgrid depends only
+    # on the WP-E runtime, never on fv3_wp_c_vertical.
+    ${CMAKE_CURRENT_SOURCE_DIR}/cgrid
   )
-  target_link_libraries(fv3_wp_c_vertical PUBLIC fv3_dyn_core_gpu CUDA::cudart)
+  target_link_libraries(fv3_wp_c_vertical PUBLIC
+    fv3_dyn_core_gpu
+    fv3_wp_a_cgrid
+    CUDA::cudart)
   set_target_properties(fv3_wp_c_vertical PROPERTIES CUDA_STANDARD 17)
 
   # WP-D operators CUDA sources

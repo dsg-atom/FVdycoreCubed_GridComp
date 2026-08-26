@@ -130,7 +130,13 @@ struct FieldRegistry {
 
 struct DomainBounds { int64_t is,ie,js,je,npz; uint32_t halo_width; };
 struct NumericalConfig {
-  double ptop=0, akap=0, a_imp=1, p_fac=0, scale_m=1, dz_min=0;
+  /* scale_m is flagstruct%scale_z (dyn_core.F90:583/:922 pass it under that
+   * name). fv_arrays.F90:337 defaults scale_z to 0., so the previous default of
+   * 1 here was a silent disagreement with the authoritative namelist default for
+   * any caller that did not set it. It is unused on the a_imp>0.999 SIM1 branch
+   * that the supported configuration takes, so this changes no executed
+   * arithmetic today -- it removes a trap for the SIM3p0 branch later. */
+  double ptop=0, akap=0, a_imp=1, p_fac=0, scale_m=0, dz_min=0;
   double rdgas=0, grav=0;
   double beta=0, d_ext=0, dddmp=0, d_con=0, lim_fac=0, zvir=0;
   double da_min=0, da_min_c=0, delt_max=0;
@@ -139,6 +145,15 @@ struct NumericalConfig {
   int32_t hord_height=0, a2b_order=4;
   int32_t nord=0, nord_v=0, nord_w=0, nord_t=0;
   int32_t nf_ke=0, n_con=0, vertical_solver=0;
+  /* flagstruct%m_split. Milestone 3A.9: the two Riemann solvers do NOT receive
+   * the same value, and DispatchParams::vertical_ms alone could not express
+   * both -- dyn_core.F90:918 hands Riem_Solver3 `flagstruct%m_split`, while
+   * :583 hands Riem_Solver_C `ms`, which :300 defines as
+   * max(1, flagstruct%m_split/2). Both are derived from this one member at
+   * their call sites; neither is hard-coded. Zero is treated as "not supplied"
+   * and both consumers reject it rather than substitute a value, because the
+   * substep count controls the vertical implicit integration. */
+  int32_t m_split=0;
   uint8_t use_cond=0, moist_cappa=0, use_logp=0, inline_q=0;
   uint8_t hydrostatic=0, rot3=0, do_f3d=0, do_skeb=0;
   uint8_t use_sg=0, rayleigh_enabled=0, grid_type=0, reserved=0;
@@ -172,7 +187,27 @@ struct ImmutableViews {
 
 struct DispatchParams {
   uint32_t contract_version=internal_contract_version;
-  double dt=0, dt2=0, rdt=0;
+  /* dt/dt2/rdt are the ACOUSTIC SUBSTEP controls: dyn_core.F90:296-298 sets
+   *   dt = bdt/real(n_split);  dt2 = 0.5*dt;  rdt = 1.0/dt
+   * once, before `do it=1,n_split` (:399). Every stage inside the acoustic loop
+   * -- c_sw, update_dz_c, Riem_Solver_c, p_grad_c, d_sw, update_dz_d,
+   * Riem_Solver3, nh_p_grad -- consumes these.
+   *
+   * Milestone 3A.9 addition: `bdt` is the BIG Lagrangian timestep, the runtime's
+   * fv3_gpu_step_desc::bdt, i.e. dt*n_split. It exists because exactly one
+   * authoritative consumer needs it instead of the substep dt: the diffusive
+   * heating tail after the acoustic loop closes (dyn_core.F90:1231 and :1240 use
+   * `bdt*flagstruct%delt_max` to bound the temperature increment).
+   *
+   * Recomputing bdt as dt*n_split inside that consumer would be wrong in the
+   * last bit -- (bdt/n)*n is not bdt in floating point -- and delt_max feeds a
+   * threshold comparison, so it is carried explicitly rather than reconstructed.
+   *
+   * This member is appended at the end of the struct. DispatchParams is an
+   * internal C++ contract compiled into every consumer from this one header, not
+   * a cross-ABI record, so an additive member does not move
+   * internal_contract_version. */
+  double dt=0, dt2=0, rdt=0, bdt=0;
   uint64_t model_step=0, acoustic_sequence=0;
   int32_t acoustic_index=0, n_split=1, k_split=1, vertical_ms=1;
   int32_t diffusion_pass=0, diffusion_passes=0;
@@ -230,6 +265,7 @@ struct CornerServiceRequest {
 };
 
 struct ExecutionContext;
+struct NumericalDispatch;  // defined below; ExecutionContext holds a borrowed pointer
 using CornerServiceFn = int (*)(const ExecutionContext &, const CornerServiceRequest &, fv3_gpu_error *);
 
 struct ExecutionContext {
@@ -241,6 +277,22 @@ struct ExecutionContext {
   Submission submission{};
   DependencyState *dependencies=nullptr;
   CornerServiceFn corner_service=nullptr;  // borrowed; integration retains ownership
+  /* Milestone 3A.9 §6. A stage sometimes has to call a SERVICE owned by another
+   * work package: nh_utils.F90's update_dz_d body is WP-C sequencing around
+   * WP-B's horizontal transport, exactly as dyn_core.F90:905 shows. LaunchFn
+   * takes no NumericalDispatch, so before this member the only way WP-C could
+   * reach dispatch.dgrid_height_transport was a non-LaunchFn signature
+   * (launch_update_dz_d) that no dispatch slot could hold -- which is precisely
+   * why dgrid_height_transport was IMPLEMENTED, WIRED and yet UNREACHABLE
+   * through fv3_gpu_dyn_core_step.
+   *
+   * The runtime points this at the table it is currently walking. It is
+   * borrowed, non-owning, and may be nullptr when a test drives a launcher
+   * directly; a stage that needs it must fail explicitly rather than deref.
+   * Additive tail member on an internal C++ contract (not a cross-ABI record),
+   * compiled into every consumer from this one header, so it does not move
+   * internal_contract_version -- same argument as DispatchParams::bdt. */
+  const NumericalDispatch *dispatch=nullptr;  // borrowed; runtime retains ownership
 };
 
 int validate_corner_request(const ExecutionContext &, const CornerServiceRequest &, fv3_gpu_error *) noexcept;
@@ -273,6 +325,10 @@ int validate_dispatch(const NumericalDispatch &, fv3_gpu_error *) noexcept;
 int set_numerical_dispatch(fv3_gpu_context *, const NumericalDispatch &, fv3_gpu_error *) noexcept;
 int set_numerical_config(fv3_gpu_context *, const NumericalConfig &, fv3_gpu_error *) noexcept;
 int mark_halo_ready(fv3_gpu_context *, fv3_gpu_halo_group, fv3_gpu_error *) noexcept;
+/* Milestone 3A.9 §8: declare that the CALLER fills this halo group. Not a
+ * readiness flag -- see the definition in runtime/fv3_gpu_runtime.cpp and
+ * resolve_halo()'s three outcomes for what it does and does not assert. */
+int mark_halo_caller_managed(fv3_gpu_context *, fv3_gpu_halo_group, fv3_gpu_error *) noexcept;
 /* Milestone 3A.4 addition to the same C++-only setter family: TopologyView now
  * carries npx/npy, which nothing in the public C ABI can write. */
 int set_topology(fv3_gpu_context *, const TopologyView &, fv3_gpu_error *) noexcept;

@@ -498,18 +498,19 @@ int launch_dgrid_dynamics_cuda(const ExecutionContext &x, fv3_gpu_error *error) 
   // d_sw's dt is the ACOUSTIC SUBSTEP dt, not the big timestep:
   //   fv_dynamics -> dyn_core(bdt, n_split)
   //   dyn_core.F90:297   dt = bdt / real(n_split)
-  //   dyn_core.F90:798   call d_sw(... dt ...)
-  // DispatchParams::dt carries fv3_gpu_step_desc::bdt verbatim
-  // (runtime/fv3_gpu_runtime.cpp), and n_split arrives beside it, so the
-  // division belongs here -- the same place Fortran puts it.
+  //   dyn_core.F90:789   call d_sw(... dt ...)
   //
-  // NOTE for integration: fv3_gpu_dyn_core_step currently walks its stage list
-  // ONCE per call, so one call advances one acoustic substep. The n_split
-  // acoustic loop itself is not yet implemented in the runtime; that is
-  // recorded as a Gate C1 item, not papered over here by pretending dt is
-  // something it is not.
-  const int32_t n_split = dp.n_split > 0 ? dp.n_split : 1;
-  opt.dt = static_cast<fv_real>(dp.dt / static_cast<double>(n_split));
+  // Milestone 3A.9 removes the 3A.8 stopgap that performed that division HERE.
+  // At 3A.8 the runtime walked its stage list once per fv3_gpu_dyn_core_step
+  // call and DispatchParams::dt carried fv3_gpu_step_desc::bdt verbatim, so
+  // this binder divided by dp.n_split itself. fv3_gpu_dyn_core_step now owns
+  // the authoritative acoustic loop and sets DispatchParams::dt to the substep
+  // dt (bdt/n_split) exactly once, before the loop, as dyn_core.F90:297 does.
+  // Dividing again here would give every substep dt/n_split and silently
+  // shorten the integration by a factor of n_split.
+  //
+  // So dp.dt is consumed verbatim, and dp.n_split is deliberately NOT read.
+  opt.dt = static_cast<fv_real>(dp.dt);
   opt.hord_mt = cfg.hord_mt;
   opt.hord_vt = cfg.hord_vt;
   opt.hord_tm = cfg.hord_tm;

@@ -30,6 +30,15 @@ int launch_dgrid_height_v2(const ExecutionContext &, fv3_gpu_error *);
 int launch_update_dz_d(const ExecutionContext &, const NumericalDispatch &,
                        fv3_gpu_error *);
 
+/* Milestone 3A.9 §5/§6: the dgrid_height dispatch slot. update_dz_d
+ * (dyn_core.F90:905-906) as a LaunchFn, taking the dispatch table it needs for
+ * the WP-B transport service from ExecutionContext::dispatch instead of an
+ * extra parameter no dispatch slot could supply. Adds no numerical content --
+ * see the block comment at its definition for the full §5 ownership resolution
+ * (dgrid_height = update_dz_d; dgrid_height_transport = the WP-B body it calls;
+ * launch_dgrid_height_v2 = not production, must never be wired). */
+int launch_dgrid_height_stage(const ExecutionContext &, fv3_gpu_error *);
+
 // Vertical Riemann solver dispatch. Uses a_imp from NumericalConfig to select:
 // a_imp > 0.999: SIM1, a_imp <= 0.5: RIM_2D, etc.
 // Requires WorkspaceId::vertical slice with sufficient capacity.

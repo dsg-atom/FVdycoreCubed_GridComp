@@ -210,9 +210,19 @@ __global__ void csw_ke_cubed(CSwArgs a, int64_t k) {
 }
 
 // C-grid circulation: fx = uc*dxc, fy = vc*dyc (lines 396-406)
+//
+// Milestone 3A.9 origin repair. The index base was (is, js), so the `j >= js-1`
+// and `i >= is-1` guards below were unreachable and fx(i,js-1) / fy(is-1,j)
+// were never written -- yet csw_vorticity reads fx(i,j-1) at j=js and
+// fy(i-1,j) at i=is, consuming whatever the shared workspace held from the
+// preceding pt-flux phase. Base moved to (is-1, js-1) and the launcher gives
+// this kernel its own (ie-is+4, je-js+4) grid instead of sharing
+// launch_csw_ke_vort_level's narrower (ie-is+3, je-js+3). The guards were
+// already the authoritative sw_core.F90:396-406 loop bounds and are unchanged.
+// Numerical semantics changed: NO -- restores authoritative coverage.
 __global__ void csw_circulation(CSwArgs a, int64_t k) {
-  const int64_t i = a.bounds.is + blockIdx.x * blockDim.x + threadIdx.x;
-  const int64_t j = a.bounds.js + blockIdx.y * blockDim.y + threadIdx.y;
+  const int64_t i = a.bounds.is - 1 + blockIdx.x * blockDim.x + threadIdx.x;
+  const int64_t j = a.bounds.js - 1 + blockIdx.y * blockDim.y + threadIdx.y;
 
   // fx: (is:ie+1, js-1:je+1)
   if (i >= a.bounds.is && i <= a.bounds.ie + 1 &&
@@ -347,7 +357,41 @@ __global__ void csw_cwind_update(CSwArgs a, int64_t k) {
 
 }  // namespace
 
-fv3_gpu_status launch_csw_fluxes_level(const CSwArgs &a, int64_t k, void *stream) {
+/* Milestone 3A.9 §3 SEMANTICS REPAIR -- launch_csw_fluxes_level is split.
+ *
+ * It used to enqueue the ut/vt scaling, BOTH flux directions and the scalar
+ * update as one indivisible sequence. That made the authoritative c_sw
+ * impossible to express, because sw_core.F90 interleaves corner fills between
+ * the two flux directions:
+ *
+ *   :206  fill2_4corners(delp, pt, 1)     :257  fill2_4corners(delp, pt, 2)
+ *   :237  fill_4corners(w, 1)             :284  fill_4corners(w, 2)
+ *   :238-253  x fluxes  fx1/fx/fx2        :285-300  y fluxes  fy1/fy/fy2
+ *
+ * and the two directions write the SAME corner halo cells with DIFFERENT
+ * values -- fill_4corners dir 1 sets q(0,0)=q(0,1) (:3312) where dir 2 sets
+ * q(0,0)=q(1,0) (:3329), and identically at the other three corners
+ * (:3316/:3333, :3319/:3337, :3323/:3341); fill2_4corners the same at
+ * :3250 vs :3268. No single fill state satisfies both phases.
+ *
+ * With the fused launcher the caller could only apply both fills up front, so
+ * the x fluxes read the dir-2 corner values: fx1(is-1,js-1) and fx1(is,js-1)
+ * are wrong, hence delpc/ptc/wc at those cells, and delpc feeds Riem_Solver_C
+ * and then p_grad_c's vc update -- the error reaches the prognostic C winds.
+ * Calling the fused launcher twice is not a workaround either, because the
+ * ut/vt scaling (:183-200) is in-place and not idempotent.
+ *
+ * The three launchers below give the caller exactly the two seams the Fortran
+ * has. Kernel bodies, launch configuration and stream are unchanged; this is a
+ * pure regrouping of the same launches in the same order.
+ *
+ * Numerical semantics changed: NO for any rank owning no panel corner (the
+ * fills are no-ops there, so the fused and split forms enqueue identically).
+ * For a rank that DOES own a panel corner the split is what makes the
+ * authoritative semantics reachable at all -- the fused form had no correct
+ * caller, and its only caller refused to run rather than execute it wrongly.
+ */
+fv3_gpu_status launch_csw_scale_level(const CSwArgs &a, int64_t k, void *stream) {
   if (!stream) return FV3_GPU_INVALID_ARGUMENT;
 
   auto cuda_stream = static_cast<cudaStream_t>(stream);
@@ -357,24 +401,55 @@ fv3_gpu_status launch_csw_fluxes_level(const CSwArgs &a, int64_t k, void *stream
   const auto ny = static_cast<unsigned>(a.bounds.je - a.bounds.js + 4);
   dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
 
-  // Scale ut/vt
+  // :183-191  ut scaling by dy / sin_sg
   csw_scale_ut<<<grid, block, 0, cuda_stream>>>(a, k);
   if (cudaPeekAtLastError() != cudaSuccess) return FV3_GPU_CUDA_ERROR;
 
+  // :192-200  vt scaling by dx / sin_sg
   csw_scale_vt<<<grid, block, 0, cuda_stream>>>(a, k);
   if (cudaPeekAtLastError() != cudaSuccess) return FV3_GPU_CUDA_ERROR;
 
-  // Nonhydrostatic fluxes and scalars
-  if (!a.hydrostatic) {
-    csw_x_flux_nh<<<grid, block, 0, cuda_stream>>>(a, k);
-    if (cudaPeekAtLastError() != cudaSuccess) return FV3_GPU_CUDA_ERROR;
+  return FV3_GPU_SUCCESS;
+}
 
-    csw_y_flux_nh<<<grid, block, 0, cuda_stream>>>(a, k);
-    if (cudaPeekAtLastError() != cudaSuccess) return FV3_GPU_CUDA_ERROR;
+fv3_gpu_status launch_csw_x_flux_level(const CSwArgs &a, int64_t k, void *stream) {
+  if (!stream) return FV3_GPU_INVALID_ARGUMENT;
+  if (a.hydrostatic) return FV3_GPU_UNSUPPORTED_CONFIGURATION;
 
-    csw_scalars_nh<<<grid, block, 0, cuda_stream>>>(a, k);
-    if (cudaPeekAtLastError() != cudaSuccess) return FV3_GPU_CUDA_ERROR;
-  }
+  auto cuda_stream = static_cast<cudaStream_t>(stream);
+  constexpr dim3 block(16, 8);
+
+  const auto nx = static_cast<unsigned>(a.bounds.ie - a.bounds.is + 4);
+  const auto ny = static_cast<unsigned>(a.bounds.je - a.bounds.js + 4);
+  dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
+
+  // :238-253  fx1 (delp), fx (pt), fx2 (w)
+  csw_x_flux_nh<<<grid, block, 0, cuda_stream>>>(a, k);
+  if (cudaPeekAtLastError() != cudaSuccess) return FV3_GPU_CUDA_ERROR;
+
+  return FV3_GPU_SUCCESS;
+}
+
+fv3_gpu_status launch_csw_y_flux_scalars_level(const CSwArgs &a, int64_t k,
+                                              void *stream) {
+  if (!stream) return FV3_GPU_INVALID_ARGUMENT;
+  if (a.hydrostatic) return FV3_GPU_UNSUPPORTED_CONFIGURATION;
+
+  auto cuda_stream = static_cast<cudaStream_t>(stream);
+  constexpr dim3 block(16, 8);
+
+  const auto nx = static_cast<unsigned>(a.bounds.ie - a.bounds.is + 4);
+  const auto ny = static_cast<unsigned>(a.bounds.je - a.bounds.js + 4);
+  dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
+
+  // :285-300  fy1 (delp), fy (pt), fy2 (w)
+  csw_y_flux_nh<<<grid, block, 0, cuda_stream>>>(a, k);
+  if (cudaPeekAtLastError() != cudaSuccess) return FV3_GPU_CUDA_ERROR;
+
+  // :301-309  delpc / ptc / wc. Kept with the y fluxes because no corner fill
+  // separates them in the Fortran and it reads fy* immediately.
+  csw_scalars_nh<<<grid, block, 0, cuda_stream>>>(a, k);
+  if (cudaPeekAtLastError() != cudaSuccess) return FV3_GPU_CUDA_ERROR;
 
   return FV3_GPU_SUCCESS;
 }
@@ -393,8 +468,12 @@ fv3_gpu_status launch_csw_ke_vort_level(const CSwArgs &a, int64_t k, void *strea
   csw_ke_cubed<<<grid, block, 0, cuda_stream>>>(a, k);
   if (cudaPeekAtLastError() != cudaSuccess) return FV3_GPU_CUDA_ERROR;
 
-  // Circulation
-  csw_circulation<<<grid, block, 0, cuda_stream>>>(a, k);
+  // Circulation. Its own grid: the fx/fy loops span is-1..ie+1 / js-1..je+1
+  // (sw_core.F90:396-406), one ring wider on the low side than csw_ke_cubed.
+  const auto nxc = static_cast<unsigned>(a.bounds.ie - a.bounds.is + 4);
+  const auto nyc = static_cast<unsigned>(a.bounds.je - a.bounds.js + 4);
+  dim3 grid_circ((nxc + block.x - 1) / block.x, (nyc + block.y - 1) / block.y);
+  csw_circulation<<<grid_circ, block, 0, cuda_stream>>>(a, k);
   if (cudaPeekAtLastError() != cudaSuccess) return FV3_GPU_CUDA_ERROR;
 
   // Vorticity

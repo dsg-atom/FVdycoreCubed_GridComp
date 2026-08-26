@@ -128,8 +128,29 @@ int launch_post_loop_heating_cuda(const ExecutionContext &x, fv3_gpu_error *e) n
   const int32_t nt = ntimes - 1 - pass;
   const int halo_band = static_cast<int>(nt);
   HorizontalBounds hb{b.is, b.ie, b.js, b.je, b.npz};
-  const fv_real dt = static_cast<fv_real>(x.dispatch_params->dt);
-  const accumulator_real cd = static_cast<accumulator_real>(cfg.d_con) * dt;
+  /* Milestone 3A.9 semantics repair (§18 DISCREPANCY -> resolved).
+   *
+   * del2_cubed's `cd` dummy is documented at dyn_core.F90:2253 as
+   *   real(kind=R_GRID), intent(in):: cd   !< cd = K * da_min;   0 < K < 0.25
+   * and the one and only heat_source call site (dyn_core.F90:1214) passes
+   *   cnst_0p20 * gridstruct%da_min
+   * with cnst_0p20 = 0.20d0 declared at dyn_core.F90:147. `cd` is therefore a
+   * hyperdiffusion coefficient carrying units of AREA, and it is independent of
+   * the timestep.
+   *
+   * The previous expression, d_con * dt, was dimensionally wrong and tied the
+   * filter strength to the acoustic substep length, which the authoritative
+   * routine never does. d_con*dt is a real FV3 quantity, but it belongs where
+   * heat_source is FORMED inside d_sw (sw_core.F90), not to the del2 filter that
+   * smooths heat_source afterwards. The mistake was latent because
+   * post_loop_heating had never executed through fv3_gpu_dyn_core_step with a
+   * physically populated da_min.
+   *
+   * Numerical semantics changed: NO -- restores dyn_core.F90:1214 with the
+   * coefficient definition at :2253.
+   */
+  constexpr accumulator_real cnst_0p20 = accumulator_real(0.20);  // dyn_core.F90:147
+  const accumulator_real cd = cnst_0p20 * static_cast<accumulator_real>(cfg.da_min);
   auto *fx = static_cast<fv_real*>(arena.arrays[8]);
   auto *fy = static_cast<fv_real*>(arena.arrays[9]);
   const uint64_t ni = static_cast<uint64_t>(b.ie - b.is + 1) + 2 * b.halo_width;
@@ -166,7 +187,17 @@ int launch_post_loop_heating_cuda(const ExecutionContext &x, fv3_gpu_error *e) n
   if (s != FV3_GPU_SUCCESS) return fail(e, s, __func__, "del2 update CUDA launch failed");
 
   if (pass == ntimes - 1) {
-    const fv_real bdt = static_cast<fv_real>(x.dispatch_params->dt);
+    /* Milestone 3A.9: this really is the BIG timestep. dyn_core.F90:1231
+     * (hydrostatic) and :1240 (nonhydrostatic) bound the increment with
+     * abs(bdt*flagstruct%delt_max), where bdt is the argument dyn_core itself
+     * received -- not the acoustic substep dt. The local name was already `bdt`,
+     * but it was being read from dispatch_params->dt, which is now authoritatively
+     * the SUBSTEP dt (bdt/n_split). Read the explicit bdt member instead.
+     *
+     * Numerical semantics changed: NO -- restores dyn_core.F90:1231/:1240. Before
+     * the 3A.9 n_split loop existed, dispatch_params->dt happened to carry the big
+     * timestep, so this read was correct then and would have become wrong now. */
+    const fv_real bdt = static_cast<fv_real>(x.dispatch_params->bdt);
     const fv_real delt_max = static_cast<fv_real>(cfg.delt_max);
     const fv_real cv_air = static_cast<fv_real>(cfg.rdgas / cfg.akap);
     const fv_real rdg = static_cast<fv_real>(-cfg.rdgas / cfg.grav);

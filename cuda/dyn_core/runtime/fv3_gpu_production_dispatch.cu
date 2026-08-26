@@ -19,8 +19,22 @@ int fv3_build_production_dispatch(NumericalDispatch &out, fv3_gpu_error *e) noex
   clear_error(e);
   NumericalDispatch d{};
   d.contract_version = internal_contract_version;
-  d.cgrid_predictor = nullptr;
-  d.cgrid_vertical_solver = nullptr;
+  // Milestone 3A.9 §3: the complete per-level c_sw group of dyn_core.F90:514-524
+  // -- d2a2c_vect, the nord>0 divergence_corner, the interleaved
+  // fill2_4corners/fill_4corners direction pairs, the ut/vt scaling, both flux
+  // directions, delpc/ptc/wc, the kinetic-energy and vorticity chain, and the
+  // time-centred uc/vc update. It was a fail-stub through 3A.8.
+  d.cgrid_predictor = &fv3::gpu::cgrid::launch_cgrid_predictor_v3;
+  // Milestone 3A.9 §4: the C-grid vertical group, a COMPOSITE, not an alias.
+  // Through 3A.8 this slot's implementation delegated to launch_vertical_solver
+  // (Riem_Solver3); dyn_core.F90:583 calls Riem_Solver_C, a different routine
+  // with a different argument list and dt2 rather than dt, so wiring the old body
+  // would have been numerically wrong rather than merely redundant.
+  // It now runs: gz from delz/zs on the first substep (:445-455), the gz<->zh
+  // sync over the full halo box (:557-573), update_dz_c per interface level
+  // (:577, dt2) with both fill_4corners(gz2) inside the level body, and
+  // Riem_Solver_C (:583, dt2).
+  d.cgrid_vertical_solver = &fv3::gpu::vertical::launch_cgrid_vertical_solver;
   d.cgrid_pressure = &fv3::gpu::cgrid::launch_cgrid_pressure_v3;
   // Milestone 3A.8 (WP-B.5) populates this slot. It was deliberately nullptr
   // through 3A.7, when only d_sw's individual slices existed:
@@ -65,7 +79,18 @@ int fv3_build_production_dispatch(NumericalDispatch &out, fv3_gpu_error *e) noex
   // never invoked from the height path -- the two damping operators stay
   // distinct, exactly as the Fortran keeps them distinct.
   d.dgrid_height_transport = &fv3::gpu::dgrid::launch_dgrid_height_transport_cuda;
-  d.dgrid_height = nullptr;
+  // Milestone 3A.9 §5/§6: dgrid_height IS update_dz_d (dyn_core.F90:905-906),
+  // the WP-C sequencer that CONSUMES the WP-B dgrid_height_transport service
+  // above. Wiring it is what finally makes that service reachable through
+  // fv3_gpu_dyn_core_step -- it was implemented and wired but had no caller on
+  // the production path, because its only caller (launch_update_dz_d) needed the
+  // dispatch table and so could not itself be a LaunchFn.
+  //
+  // NOT launch_dgrid_height_v2. That launcher recomputes delz, which
+  // authoritatively belongs to Riem_Solver3 (nh_core.F90:181); wiring it here
+  // would write delz a substep early. See the §5 block comment in
+  // vertical/fv3_vertical_kernels.cu.
+  d.dgrid_height = &fv3::gpu::vertical::launch_dgrid_height_stage;
   d.vertical_solver = &fv3::gpu::vertical::launch_vertical_solver;
   d.nh_pressure = &fv3::gpu::operators::launch_nh_pressure_cuda;
   d.post_loop_heating = &fv3::gpu::operators::launch_post_loop_heating_cuda;

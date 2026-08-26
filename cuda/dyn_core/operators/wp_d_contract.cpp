@@ -289,8 +289,19 @@ int launch_post_loop_heating(const ExecutionContext &x, fv3_gpu_error *e) noexce
   const int32_t nt = ntimes - 1 - pass;
   const uint32_t halo_band = static_cast<uint32_t>(nt);
   HorizontalBounds hb{b.is, b.ie, b.js, b.je, b.npz};
-  const fv_real dt = static_cast<fv_real>(x.dispatch_params->dt);
-  const accumulator_real cd = static_cast<accumulator_real>(cfg.d_con) * dt;
+  /* Milestone 3A.9 semantics repair -- identical to the CUDA twin in
+   * wp_d_contract_cuda.cpp; see the full rationale there.
+   *
+   * del2_cubed's `cd` is "K * da_min, 0 < K < 0.25" (dyn_core.F90:2253) and the
+   * heat_source call site passes cnst_0p20*da_min (dyn_core.F90:1214, with
+   * cnst_0p20 = 0.20d0 at :147). It is a timestep-independent hyperdiffusion
+   * coefficient with units of area; the previous d_con*dt was dimensionally
+   * wrong and belongs to heat_source's FORMATION inside d_sw, not to this filter.
+   *
+   * Numerical semantics changed: NO -- restores dyn_core.F90:1214/:2253.
+   */
+  constexpr accumulator_real cnst_0p20 = accumulator_real(0.20);  // dyn_core.F90:147
+  const accumulator_real cd = cnst_0p20 * static_cast<accumulator_real>(cfg.da_min);
   auto *fx = static_cast<fv_real*>(arena.arrays[8]);
   auto *fy = static_cast<fv_real*>(arena.arrays[9]);
   const uint64_t ni = static_cast<uint64_t>(b.ie - b.is + 1) + 2 * b.halo_width;
@@ -318,7 +329,11 @@ int launch_post_loop_heating(const ExecutionContext &x, fv3_gpu_error *e) noexce
     del2_pass(hb, static_cast<int>(nt), cd, view3<fv_real>(views.heat_source), m, fx_v, fy_v);
   }
   if (pass == ntimes - 1) {
-    const fv_real bdt = static_cast<fv_real>(x.dispatch_params->dt);
+    /* Milestone 3A.9: the BIG timestep, per dyn_core.F90:1231/:1240
+     * (abs(bdt*flagstruct%delt_max)). dispatch_params->dt is now authoritatively
+     * the acoustic SUBSTEP dt, so read the explicit bdt member.
+     * Numerical semantics changed: NO. */
+    const fv_real bdt = static_cast<fv_real>(x.dispatch_params->bdt);
     const fv_real delt_max = static_cast<fv_real>(cfg.delt_max);
     const fv_real cv_air = static_cast<fv_real>(cfg.rdgas / cfg.akap);
     const fv_real rdg = static_cast<fv_real>(-cfg.rdgas / cfg.grav);

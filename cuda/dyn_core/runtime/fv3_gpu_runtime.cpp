@@ -32,7 +32,317 @@ int cuda_fail(cudaError_t rc, fv3_gpu_error *e, const char *api, ContextData *d 
   return fail(e, FV3_GPU_CUDA_ERROR, api, cudaGetErrorString(rc), (int)rc,
               d ? d->create.mpi_rank : -1, d ? d->create.device_ordinal : -1);
 }
+
+/* Milestone 3A.9: make `waiter` wait for everything already enqueued on
+ * `signaler`, using the context-owned event `ev`.
+ *
+ * Both streams are cudaStreamNonBlocking, so this is the ONLY thing that orders
+ * them; see ContextData::event_compute_done for the race this closes and how it
+ * was found. This is a dependency, not a synchronization: the host does not
+ * block, which is what keeps the persistent-residency model intact. Introducing
+ * a cudaStreamSynchronize here instead would have been a hidden host sync of
+ * exactly the kind project_architecture.md forbids. */
+cudaError_t order_after(void *signaler, void *waiter, void *ev) {
+  if (!signaler || !waiter || !ev) return cudaSuccess;  // CPU-only build path
+  const cudaError_t rc =
+      cudaEventRecord(static_cast<cudaEvent_t>(ev), static_cast<cudaStream_t>(signaler));
+  if (rc != cudaSuccess) return rc;
+  return cudaStreamWaitEvent(static_cast<cudaStream_t>(waiter),
+                             static_cast<cudaEvent_t>(ev), 0);
+}
+
+/* "Empty the flux capacitors" -- dyn_core.F90:368-379, executed ONCE per
+ * dyn_core call, before `do it=1,n_split` (:399).
+ *
+ * The authoritative code is four whole-array assignments,
+ *
+ *     mfx(:,:,:) = 0.0        ! :372
+ *     mfy(:,:,:) = 0.0        ! :373
+ *      cx(:,:,:) = 0.0        ! :374
+ *      cy(:,:,:) = 0.0        ! :375
+ *
+ * and then, ONLY when d_con exceeds the 1.0E-5 activation threshold, a freshly
+ * allocated heat_source zeroed over its full (isd:ied, jsd:jed, npz) extent
+ * (:377-379). Whole-array syntax covers the entire allocation including halo,
+ * which is exactly a memset of allocation_bytes.
+ *
+ * Three deliberate non-actions, each traced:
+ *   - diss_est is NOT zeroed here. It is owned by fv_dynamics
+ *     (fv_dynamics.F90:607-614), not dyn_core, and dyn_core only accumulates
+ *     into it (:819-826). Zeroing it per dyn_core call would destroy the
+ *     k_split accumulation.
+ *   - dpx is NOT zeroed here either, for the same reason (fv_dynamics.F90).
+ *   - When d_con <= 1.0E-5 the Fortran never allocates heat_source at all, so
+ *     there is nothing to zero and no stage reads it (the del2_cubed tail is
+ *     gated on the same threshold at :1212). A caller that registers the field
+ *     anyway simply gets it left alone, matching "not allocated".
+ *
+ * Only registered fields are touched: a production caller that does not use the
+ * tracer capacitors need not register them, and their absence is not an error.
+ *
+ * Device epochs are intentionally left alone. Every numerical stage in this
+ * runtime mutates device memory without touching host_epoch/device_epoch --
+ * those counters track explicit sync_from_host/sync_to_host transfers -- and
+ * inventing a different convention for this one memset would make the epoch
+ * pair mean two different things depending on which code path ran.
+ */
+int zero_accumulators(ContextData &d, fv3_gpu_error *e, const char *api) {
+  auto stream = static_cast<cudaStream_t>(d.compute_stream);
+  const bool zero_heat = d.immutable.config.d_con > 1.0e-5;  // dyn_core.F90:377
+  for (auto &x : d.state.fields) {
+    const FieldId id = field_id_from_abi(x.host.field_id);
+    const bool capacitor = id == FieldId::mfx || id == FieldId::mfy ||
+                           id == FieldId::cx  || id == FieldId::cy;
+    if (!capacitor && !(zero_heat && id == FieldId::heat_source)) continue;
+    const cudaError_t rc =
+        cudaMemsetAsync(x.device, 0, x.host.allocation_bytes, stream);
+    if (rc != cudaSuccess) return cuda_fail(rc, e, api, &d);
+  }
+  return FV3_GPU_SUCCESS;
+}
 #endif
+
+/* ---------------------------------------------------------------------------
+ * Milestone 3A.9 §8/§9: halo readiness for the supported single-rank path.
+ *
+ * dyn_core.F90 drives its halos through mpp/fv_mp_mod: for each group it starts
+ * a pack (`start_group_halo_update`) and later completes it
+ * (`complete_group_halo_update`) at the point the consumer needs the data. This
+ * runtime models the same thing with DependencyState: a stage calls
+ * require(group) and refuses to run unless the group is `ready`.
+ *
+ * Nothing in the tree ever produced that readiness. `fv3_gpu_halo_callbacks`
+ * (include/fv3_gpu_communication.h) declares the transport interface, but there
+ * is no registration API, no storage for it in ContextData, and no consumer --
+ * so a real exchange cannot be performed by this runtime at all. The only
+ * existing producer is mark_halo_ready(), a C++-only setter a test can poke.
+ *
+ * The declared callback signature is host-staged pack/unpack -- begin() is
+ * handed a send buffer and a recv buffer -- so honouring it requires per-group
+ * halo PACKING (which fields, which strips, which rotation at a panel seam),
+ * and none of that machinery exists. Building it is a halo-exchange
+ * implementation, which §8 explicitly defers ("do NOT implement MPI in this
+ * milestone unless truly unavoidable"). So this milestone does not pretend to
+ * consume that interface.
+ *
+ * §8 forbids two shortcuts explicitly: do not implement MPI here, and do not
+ * simply mark all halos ready. resolve_halo() therefore has exactly three
+ * outcomes, and none of them lets the RUNTIME invent readiness:
+ *
+ *   1. The topology has no connected neighbour on any of the four tile edges,
+ *      no corner owner, and no periodic/nested/regional wrap. Fortran's
+ *      mpp_update_domains on such a domain copies nothing -- the update is
+ *      genuinely vacuous -- so marking the group ready skips no operation.
+ *
+ *   2. The caller has explicitly declared the group caller-managed
+ *      (mark_halo_caller_managed). Readiness is then the CALLER's assertion,
+ *      re-established at the authoritative exchange point because a stage may
+ *      have marked the group stale mid-substep and the caller cannot reach in
+ *      to re-declare. The runtime asserts nothing about the data; it records
+ *      whose claim it is.
+ *
+ *   3. Otherwise. A real exchange IS required, nothing in this runtime can
+ *      perform one, no caller has claimed it, and pretending otherwise is
+ *      exactly the false readiness §8 prohibits. Return
+ *      FV3_GPU_UNSUPPORTED_CONFIGURATION naming the group, before any state is
+ *      mutated.
+ *
+ * Consequence that MUST be stated plainly wherever this path is reported: a
+ * true global cubed sphere puts a neighbouring tile on every edge, so a
+ * production topology reaches outcome 1 for no group and depends entirely on
+ * outcome 2. An integrated run under outcome 2 exercises the real stage graph,
+ * the real dispatch table and the real device kernels -- it is genuine GPU
+ * EXECUTION -- but its halo cells hold whatever the caller put there. It is NOT
+ * a numerically meaningful cubed-sphere integration, and a caller whose
+ * "management" of a group is a no-op has a falsely-ready halo in substance even
+ * though the runtime never claimed otherwise.
+ *
+ * mark_stale stays fully live. Groups are re-resolved at the authoritative
+ * exchange points on every substep, so a stage that invalidates a group
+ * (cgrid_predictor -> H_CWIND/H_DIVGD, cgrid_pressure -> H_CWIND) still forces
+ * the group back through resolve_halo before its next consumer.
+ * ------------------------------------------------------------------------- */
+const char *halo_group_name(fv3_gpu_halo_group g) noexcept {
+  switch (g) {
+    case FV3_GPU_H_DWIND_IN:   return "H_DWIND_IN (u,v DGRID_NE, dyn_core.F90:402/:504)";
+    case FV3_GPU_H_W_IN:       return "H_W_IN (w, :427/:507)";
+    case FV3_GPU_H_GZ_FIRST:   return "H_GZ_FIRST (gz, :459/:552)";
+    case FV3_GPU_H_Q_INLINE:   return "H_Q_INLINE (inline_q tracers, :419/:631)";
+    case FV3_GPU_H_DIVGD:      return "H_DIVGD (divgd CORNER, :528/:636)";
+    case FV3_GPU_H_CWIND:      return "H_CWIND (uc,vc CGRID_NE, :618/:640)";
+    case FV3_GPU_H_DSCALAR:    return "H_DSCALAR (q_con,delp,pt, :844/:878)";
+    case FV3_GPU_H_ZH:         return "H_ZH (zh, :931/:967)";
+    case FV3_GPU_H_PKC2:       return "H_PKC2 (pkc, :931/:967)";
+    case FV3_GPU_H_HEAT:       return "H_HEAT (heat_source, del2_cubed :2288)";
+    case FV3_GPU_H_DWIND_NEXT: return "H_DWIND_NEXT (u,v for the next substep, :1109)";
+    default:                   return "unknown halo group";
+  }
+}
+
+/* True when mpp_update_domains would copy nothing for this decomposition, so
+ * that "ready" claims no data this runtime did not produce. */
+bool halo_exchange_is_vacuous(const TopologyView &t) noexcept {
+  for (const auto &nb : t.neighbors)
+    if (nb.rank >= 0 || nb.tile >= 0) return false;
+  for (const auto owner : t.corner_owner_rank)
+    if (owner >= 0) return false;
+  return !(t.nested || t.regional || t.periodic_x || t.periodic_y);
+}
+
+int resolve_halo(ContextData &d, fv3_gpu_halo_group g, fv3_gpu_error *e,
+                 const char *api) {
+  const auto slot = static_cast<size_t>(g);
+  if (slot >= d.halo_caller_managed.size())
+    return fail(e, FV3_GPU_INVALID_ARGUMENT, api, "invalid halo group");
+  const bool caller_managed = d.halo_caller_managed[slot] != 0;
+  if (!caller_managed && !halo_exchange_is_vacuous(d.topology))
+    return fail(e, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                std::string("halo group ") + halo_group_name(g) +
+                    " requires a real domain exchange; this runtime has no halo "
+                    "transport, and the caller has not declared this group "
+                    "caller-managed, so readiness cannot be established for a "
+                    "connected, periodic, nested or regional topology");
+  const fv3_gpu_event ev = issue_event(d);
+  const int rc = d.dependencies.mark_ready(g, ev);
+  if (rc != 0)
+    return fail(e, static_cast<fv3_gpu_status>(rc), api,
+                std::string("could not mark halo group ") + halo_group_name(g) +
+                    " ready");
+  return FV3_GPU_SUCCESS;
+}
+
+/* ---------------------------------------------------------------------------
+ * Milestone 3A.9 §13 -- the production configuration fence, at the runtime
+ * level.
+ *
+ * Every individual launcher already fences its own configuration: d_sw refuses
+ * a non-6 hord (dgrid/wp_b_dsw_cuda.cu:895-901), Riem_Solver_C refuses
+ * a_imp <= 0.999 (vertical/fv3_riem_solver_c.cu:212), the C-grid predictor
+ * refuses hydrostatic (cgrid/fv3_cgrid_predictor.cu:196), and so on. Those
+ * fences are the numerically meaningful ones and are not being replaced.
+ *
+ * They are not, however, sufficient for the requirement in
+ * project_architecture.md that an unsupported configuration "should fail before
+ * mutating model state". A per-stage fence fires at the stage that cares, and
+ * the stages that do not care have already run by then. Concretely: with
+ * grid_type = 4 the C-grid predictor takes its `grid_type >= 3` BRANCH rather
+ * than refusing (cgrid/fv3_cgrid_csw.cu:151), so on the pre-3A.9 path the whole
+ * C-grid half of the substep executed and wrote uc/vc/delpc/ptc/divgd to device
+ * memory before WP-B's d_sw returned UNSUPPORTED_CONFIGURATION. The call failed,
+ * but the state was already torn: the caller cannot retry, and cannot trust a
+ * D2H either.
+ *
+ * So the supported subset is checked once, here, before zero_accumulators and
+ * before the first launch. This is a whitelist of the documented production
+ * first-run configuration, not a guess at what the kernels happen to accept.
+ *
+ * What is deliberately NOT checked here:
+ *
+ *   vtdm4 > 0  -- §13 lists it, but NumericalConfig has no vtdm4 member and
+ *                 should not gain one: vtdm4 reaches the kernels already
+ *                 resolved into the per-level damp_vt array (FieldId::damping_v)
+ *                 and the per-level nord_v array (FieldId::damping_ndif), which
+ *                 is how dyn_core.F90:699-765 itself hands it to d_sw. A scalar
+ *                 vtdm4 check here would either duplicate that or contradict
+ *                 the sponge levels, where the authoritative code forces the
+ *                 vorticity-damping controls to zero. The live consequence of
+ *                 vtdm4 > 0 -- that the do_vort_damp arms are exercised -- is
+ *                 asserted by the harness through those fields instead.
+ *
+ *   nord/nord_t/nord_w ranges, dddmp, da_min, p_fac, delt_max -- these are
+ *                 tuning parameters, not the configuration IDENTITY. They are
+ *                 range-checked by the stages that consume them, and a wrong
+ *                 value there does not change which code path runs.
+ *
+ * The fence is intentionally narrow in the other direction too: it names only
+ * conditions this project has explicitly declared unsupported. It must never
+ * grow into a general "reject anything unfamiliar" check, because that would
+ * silently prevent a future milestone's widened subset from running while
+ * looking like a correctness guarantee.
+ * ------------------------------------------------------------------------- */
+int fence_production_config(const NumericalConfig &cfg, const TopologyView *topo,
+                           fv3_gpu_error *e, const char *api) {
+  const auto reject = [&](const std::string &what) {
+    return fail(e, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                "configuration outside the implemented production first-run "
+                "subset: " + what +
+                    " (see project_architecture.md, Production First-Run "
+                    "Configuration); refused before any state was mutated");
+  };
+
+  if (cfg.grid_type != 0)
+    return reject("grid_type must be 0 (gnomonic cubed sphere); grid_type >= 3 "
+                  "selects different Cartesian edge/corner semantics that are "
+                  "branched on but not implemented");
+  if (cfg.hydrostatic)
+    return reject("hydrostatic must be false; the hydrostatic path removes w, "
+                  "delz and the Riemann solvers entirely");
+  if (!(cfg.a_imp > 0.999))
+    return reject("a_imp must be > 0.999 (the SIM1 vertical branch); the "
+                  "RIM_2D, SIM3, SIM3p0 and SIM branches are not implemented");
+  {
+    const int32_t hord[4] = {cfg.hord_mt, cfg.hord_vt, cfg.hord_tm, cfg.hord_dp};
+    const char *const name[4] = {"hord_mt", "hord_vt", "hord_tm", "hord_dp"};
+    for (int i = 0; i < 4; ++i) {
+      const int32_t a = hord[i] < 0 ? -hord[i] : hord[i];
+      if (a != 6)
+        return reject(std::string(name[i]) + " must be +/-6 (the order-6 "
+                      "transport path); no other PPM order is implemented");
+    }
+    /* The SIGN matters and is not interchangeable: hord_dp < 0 selects the
+     * positive-definite-off variant in tp_core.F90's fv_tp_2d, so hord_dp = +6
+     * is a different scheme, not the same one written differently. */
+    if (cfg.hord_dp > 0)
+      return reject("hord_dp must be negative (-6); a positive hord_dp selects "
+                    "a different fv_tp_2d variant");
+  }
+  if (cfg.use_cond || cfg.moist_cappa)
+    return reject("use_cond / moist_cappa are not implemented in this subset "
+                  "(a documented divergence from the real GEOS FV3 build, "
+                  "where both are on; see the milestone 3A.9 handoff)");
+  if (cfg.inline_q)
+    return reject("inline_q is not implemented; tracer advection is not part "
+                  "of the dyn_core subsystem in this subset");
+  if (cfg.do_f3d || cfg.do_skeb || cfg.rot3)
+    return reject("do_f3d / do_skeb / rot3 are not implemented");
+  if (cfg.beta != 0.0)
+    return reject("beta must be 0; a nonzero beta selects the backward-in-time "
+                  "nh_p_grad variant and changes fp_out");
+  /* m_split is checked here rather than at its old site below so that every
+   * configuration refusal happens in one place, before mutation. */
+  if (cfg.m_split < 1)
+    return reject("m_split is not supplied; the vertical Riemann substep count "
+                  "cannot be defaulted (dyn_core.F90:300 derives Riem_Solver_C's "
+                  "ms = max(1, m_split/2) and :918 hands Riem_Solver3 m_split "
+                  "itself, so a default would silently pick both)");
+  if (!(cfg.dz_min > 0.0))
+    return reject("dz_min must be > 0; the update_dz_c/update_dz_d monotonicity "
+                  "clamps would otherwise admit zero-thickness layers and the "
+                  "SIM1 column solve divides by dz");
+
+  if (topo) {
+    if (topo->nested || topo->regional)
+      return reject("nested / regional domains are not implemented; the "
+                    "nest_halo_nh path is dead code in this subset");
+    if (!topo->global_cubed_sphere)
+      return reject("global_cubed_sphere must be set; the supported subset is "
+                    "the global gnomonic cubed sphere");
+    /* npx/npy == 0 is deliberately NOT fenced here. It is a missing INPUT, not
+     * an unsupported configuration -- the difference matters, because the two
+     * consumers that need panel geometry (bind_wp_b_d_sw, and WP-D's
+     * physical_edges feeding a2b_ord4) already refuse zero at their binders,
+     * with the correct FV3_GPU_INVALID_ARGUMENT, and stages that need no panel
+     * semantics are legitimately drivable without it.
+     *
+     * Those refusals are not pre-mutation, so a dispatch table containing a
+     * panel-geometry consumer plus an npx == 0 topology can still tear device
+     * state -- a residual gap recorded in the milestone 3A.9 handoff rather
+     * than papered over here. Fencing it at this level would have required
+     * every minimal-dispatch driver to describe a full tile geometry it does
+     * not use, which trades a narrow real gap for a broad false requirement. */
+  }
+  return FV3_GPU_SUCCESS;
+}
 }
 
 namespace fv3::gpu {
@@ -79,6 +389,29 @@ int mark_halo_ready(fv3_gpu_context *c, fv3_gpu_halo_group g, fv3_gpu_error *e) 
   if (rc!=0) return fail(e,static_cast<fv3_gpu_status>(rc),__func__,"invalid halo group or event");
   return FV3_GPU_SUCCESS;
 }
+/* Milestone 3A.9 §8: the caller takes responsibility for one halo group.
+ *
+ * This does NOT mark the group ready and it is not a weaker mark_halo_ready. It
+ * records that the CALLER -- GEOS/FV3, which owns mpp_update_domains, or a test
+ * harness that has declared what it does -- will fill this group's halo cells,
+ * so that fv3_gpu_dyn_core_step's resolve_halo() may re-establish readiness at
+ * the authoritative exchange point of each substep after a stage has marked the
+ * group stale. Without a declaration, and on any topology whose halo exchange is
+ * not provably vacuous, resolve_halo refuses rather than invent readiness.
+ *
+ * Declaring a group and then not filling it is a falsely-ready halo. The
+ * runtime cannot detect that; the declaration is exactly where the
+ * responsibility is placed, and a caller that stubs it must say so. */
+int mark_halo_caller_managed(fv3_gpu_context *c, fv3_gpu_halo_group g, fv3_gpu_error *e) noexcept {
+  clear_error(e);
+  if (!c) return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"null context");
+  if (c->data.phase==ContextPhase::failed) return fail(e,FV3_GPU_STATE_CONFLICT,__func__,"context has failed");
+  const auto slot=static_cast<size_t>(g);
+  if (g<FV3_GPU_H_DWIND_IN || slot>=c->data.halo_caller_managed.size())
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"invalid halo group");
+  c->data.halo_caller_managed[slot]=1;
+  return FV3_GPU_SUCCESS;
+}
 }
 
 extern "C" int fv3_gpu_validate_field(const fv3_gpu_field_desc *f, fv3_gpu_error *e) {
@@ -123,7 +456,20 @@ extern "C" int fv3_gpu_create(const fv3_gpu_create_desc *d, fv3_gpu_context **ou
   cudaStream_t compute{}, transfer{};
   rc=cudaStreamCreateWithFlags(&compute,cudaStreamNonBlocking); if(rc==cudaSuccess) rc=cudaStreamCreateWithFlags(&transfer,cudaStreamNonBlocking);
   if(rc!=cudaSuccess){ if(compute) cudaStreamDestroy(compute); delete ctx; return cuda_fail(rc,e,__func__); }
-  ctx->data.compute_stream=compute; ctx->data.transfer_stream=transfer; *out=ctx; return FV3_GPU_SUCCESS;
+  /* cudaEventDisableTiming: these exist only to order the two non-blocking
+   * streams against each other (see ContextData::event_compute_done). Timing
+   * support would add measurable record overhead for a capability nothing uses. */
+  cudaEvent_t compute_done{}, transfer_done{};
+  rc=cudaEventCreateWithFlags(&compute_done,cudaEventDisableTiming);
+  if(rc==cudaSuccess) rc=cudaEventCreateWithFlags(&transfer_done,cudaEventDisableTiming);
+  if(rc!=cudaSuccess){
+    if(compute_done) cudaEventDestroy(compute_done);
+    cudaStreamDestroy(compute); cudaStreamDestroy(transfer); delete ctx;
+    return cuda_fail(rc,e,__func__);
+  }
+  ctx->data.compute_stream=compute; ctx->data.transfer_stream=transfer;
+  ctx->data.event_compute_done=compute_done; ctx->data.event_transfer_done=transfer_done;
+  *out=ctx; return FV3_GPU_SUCCESS;
 #endif
 }
 
@@ -173,7 +519,13 @@ extern "C" int fv3_gpu_sync_from_host(fv3_gpu_context *c,const fv3_gpu_field_mas
 extern "C" int fv3_gpu_sync_to_host(fv3_gpu_context *c,const fv3_gpu_field_mask *m,fv3_gpu_event *ev,fv3_gpu_error *e){
   using namespace fv3::gpu; clear_error(e); if(ev)*ev=0; if(!c||!ev)return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"null context or event"); int rc=validate_mask(m,e,__func__);if(rc)return rc; if(c->data.phase!=ContextPhase::initialized)return fail(e,FV3_GPU_STATE_CONFLICT,__func__,"context is not initialized");
 #ifdef FV3_GPU_ENABLE_CUDA
-  auto stream=(cudaStream_t)c->data.transfer_stream; for(auto &x:c->data.state.fields){if(x.host.field_id>=256)return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"field id exceeds mask");if((m->words[x.host.field_id/64]>>(x.host.field_id%64))&1u && x.host.memory_location==FV3_GPU_MEMORY_HOST){auto z=cudaMemcpyAsync(x.host.base,x.device,x.host.allocation_bytes,cudaMemcpyDeviceToHost,stream);if(z!=cudaSuccess)return cuda_fail(z,e,__func__,&c->data);x.host_epoch=x.device_epoch;}} *ev=issue_event(c->data);return 0;
+  auto stream=(cudaStream_t)c->data.transfer_stream;
+  /* Milestone 3A.9: this is an EXPLICIT D2H boundary, so it must read the
+   * results of the compute work already enqueued -- not whatever happens to be
+   * in device memory when the copy engine gets there. */
+  {auto z=order_after(c->data.compute_stream,c->data.transfer_stream,c->data.event_compute_done);
+   if(z!=cudaSuccess)return cuda_fail(z,e,__func__,&c->data);}
+  for(auto &x:c->data.state.fields){if(x.host.field_id>=256)return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"field id exceeds mask");if((m->words[x.host.field_id/64]>>(x.host.field_id%64))&1u && x.host.memory_location==FV3_GPU_MEMORY_HOST){auto z=cudaMemcpyAsync(x.host.base,x.device,x.host.allocation_bytes,cudaMemcpyDeviceToHost,stream);if(z!=cudaSuccess)return cuda_fail(z,e,__func__,&c->data);x.host_epoch=x.device_epoch;}} *ev=issue_event(c->data);return 0;
 #else
   return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,"runtime was built without CUDA");
 #endif
@@ -194,17 +546,81 @@ extern "C" int fv3_gpu_dyn_core_step(fv3_gpu_context *c,const fv3_gpu_step_desc 
   if(!any_stage||!dispatch.corner_edge_service)
     return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,"numerical dispatch table has no usable stages wired");
 
-  // Milestone 3A.1: dispatch_params carries only what fv3_gpu_step_desc
-  // actually provides. Multi-pass hyperdiffusion (diffusion_pass/passes) is
-  // not exposed by the current ABI, so a single pass is assumed here; any
-  // NumericalConfig requesting more passes will be rejected by the stage
-  // itself (launch_post_loop_heating requires diffusion_passes==config.nf_ke).
+  const NumericalConfig &config=c->data.immutable.config;
+  const int32_t n_split=s->n_split>0?s->n_split:1;
+
+  /* Milestone 3A.9 §13. FIRST, before zero_accumulators and before any launch,
+   * so an unsupported configuration cannot leave the caller with half-updated
+   * device state. See fence_production_config above for what it checks, what it
+   * deliberately does not, and why a per-stage fence alone was not enough.
+   *
+   * Note this does NOT set ContextPhase::failed. A configuration refusal is a
+   * caller error that mutated nothing, so the context is still usable -- the
+   * caller can install a supported configuration and step again. Marking it
+   * failed would conflate "you asked for something unimplemented" with "the
+   * device state is now untrustworthy", and the whole point of fencing before
+   * mutation is that those are different situations. */
+  if(const int rc_cfg=fence_production_config(config,c->data.immutable.topology,e,__func__))
+    return rc_cfg;
+
+  /* -------------------------------------------------------------------------
+   * Milestone 3A.9 (§7): once-per-call controls.
+   *
+   * dyn_core.F90:296-298, inside the `if (init_step)` block that runs before the
+   * acoustic loop:
+   *     dt  = bdt / real(n_split)
+   *     dt2 = 0.5*dt
+   *     rdt = 1.0/dt
+   * The division by n_split happens HERE and nowhere else. Milestone 3A.8 had a
+   * stopgap in the d_sw binder (dgrid/wp_b_dsw_contract_cuda.cpp) that divided
+   * dispatch_params->dt by n_split itself, because this runtime was handing it
+   * the big timestep and walking the stage list once. That stopgap has been
+   * removed in this milestone; dividing in both places would have shortened the
+   * integration by a factor of n_split.
+   *
+   * `bdt` is retained explicitly (see DispatchParams in fv3_gpu_internal.hpp):
+   * the diffusive-heating tail bounds its increment with bdt*delt_max
+   * (dyn_core.F90:1231/:1240) and must not reconstruct it as dt*n_split.
+   * ------------------------------------------------------------------------- */
   DispatchParams &p=c->data.dispatch_params;
-  p.contract_version=internal_contract_version; p.dt=s->bdt; p.dt2=s->bdt*0.5;
-  p.rdt=(s->bdt!=0.0)?1.0/s->bdt:0.0; p.model_step=s->model_step; p.acoustic_sequence=s->acoustic_sequence;
-  p.acoustic_index=0; p.n_split=s->n_split>0?s->n_split:1; p.k_split=s->k_split>0?s->k_split:1; p.vertical_ms=1;
-  p.diffusion_pass=0; p.diffusion_passes=1;
-  p.init_step=s->init_step; p.end_step=s->end_step; p.last_call=s->end_step; p.fp_out=0; p.remap_step=0;
+  p.contract_version=internal_contract_version;
+  p.bdt=s->bdt;
+  p.dt=s->bdt/static_cast<double>(n_split);           // dyn_core.F90:296
+  p.dt2=0.5*p.dt;                                     // dyn_core.F90:297
+  p.rdt=(p.dt!=0.0)?1.0/p.dt:0.0;                     // dyn_core.F90:298
+  p.model_step=s->model_step; p.acoustic_sequence=s->acoustic_sequence;
+  p.n_split=n_split; p.k_split=s->k_split>0?s->k_split:1;
+  /* dyn_core.F90:918 -- Riem_Solver3 receives flagstruct%m_split itself.
+   * Riem_Solver_C's ms is DIFFERENT (max(1, m_split/2), :300) and is derived at
+   * that call site from config.m_split; it is deliberately not carried here,
+   * because one DispatchParams member cannot hold both. The previous hardcoded
+   * `p.vertical_ms=1` silently forced a single vertical substep on the D-grid
+   * Riemann solver regardless of the namelist.
+   *
+   * m_split >= 1 is guaranteed by fence_production_config above, which now owns
+   * every configuration refusal so that all of them happen before mutation and
+   * with one consistent message. */
+  p.vertical_ms=config.m_split;
+  p.init_step=s->init_step; p.end_step=s->end_step;
+  /* Reset so a step whose heating gate is closed cannot leave a previous call's
+   * pass counters visible to anything. The post-loop block below sets them. */
+  p.diffusion_pass=0; p.diffusion_passes=0;
+
+  /* fp_out. dyn_core.F90:924 passes `beta<-0.1` into Riem_Solver3's fp_out
+   * dummy (nh_core.F90:69), which selects ppe = pe2+pem instead of ppe = pe2
+   * (fv3_vertical_column.hpp:189). launch_nh_pressure_cuda rejects any config
+   * with beta != 0 (operators/wp_d_contract_cuda.cpp:21), so within the
+   * supported production subset beta == 0 and fp_out is constantly false. It is
+   * still computed from config rather than hard-coded, so that widening the beta
+   * fence cannot silently leave fp_out wrong. */
+  p.fp_out=(config.beta < -0.1)?1:0;                  // dyn_core.F90:924
+
+  /* beta_d has no DispatchParams member and needs none. dyn_core.F90:474-481
+   * sets beta_d = 0 on the first substep and beta thereafter, and beta_d is
+   * consumed only by nh_p_grad. With the beta==0 fence above, beta_d is 0 for
+   * every substep, so the it==1 special case is a no-op in the supported subset.
+   * A consumer that ever needs it can derive it without a contract change:
+   * beta_d = (acoustic_index == 0) ? 0 : config.beta. */
 
   ExecutionContext x{};
   x.contract_version=internal_contract_version;
@@ -215,46 +631,191 @@ extern "C" int fv3_gpu_dyn_core_step(fv3_gpu_context *c,const fv3_gpu_step_desc 
   x.submission=Submission{internal_contract_version,c->data.compute_stream,StreamId::compute,s->acoustic_sequence};
   x.dependencies=&c->data.dependencies;
   x.corner_service=dispatch.corner_edge_service;
+  /* Milestone 3A.9 §6: the table being walked, so a stage that sequences another
+   * work package's service can reach it. `dispatch` is a reference to
+   * c->data.dispatch, owned by the context, so the pointer outlives this step.
+   * See ExecutionContext::dispatch for why this exists at all. */
+  x.dispatch=&dispatch;
 
   int rc=validate_execution_context(x,e);
   if(rc){ c->data.phase=ContextPhase::failed; return rc; }
 
-  // Stage order follows dyn_core.F90's acoustic body: the C-grid predictor
-  // group, then the D-grid dynamics (d_sw), then the vertical/nonhydrostatic
-  // solve, then the pressure and post-loop operators. Only stages with a real,
-  // wired CUDA implementation are invoked; a null slot is skipped rather than
-  // treated as an orchestration error. Any stage that IS wired must fully
-  // succeed or the step fails -- there is no silent host fallback inside this
-  // CUDA path.
-  //
-  // Milestone 3A.8 adds dispatch.dgrid_dynamics (WP-B.5's complete d_sw
-  // driver). Still intentionally null in the production table:
-  //   cgrid_predictor, cgrid_vertical_solver -- no CUDA adapter integrated yet
-  //   dgrid_height                           -- ditto
-  // dgrid_height_transport IS wired, but it is not a free-standing acoustic
-  // stage: it is the horizontal-transport body of WP-C's update_dz_d, and the
-  // only caller is launch_update_dz_d (vertical/fv3_vertical_kernels.cu:172),
-  // which takes the dispatch table as an argument. Listing it here would
-  // transport zh a second time per substep, so it stays out.
-  //
-  // Be precise about what that means today: launch_vertical_solver does NOT
-  // call launch_update_dz_d, so nothing on this list reaches
-  // dgrid_height_transport. The slot is IMPLEMENTED and separately GPU
-  // EXECUTED (Milestone 3A.4's focused test), but it is not yet reached
-  // through fv3_gpu_dyn_core_step. That is a Gate C1 item, not a claim to
-  // make here.
-  //
-  // NOTE: this list is walked ONCE per fv3_gpu_dyn_core_step call, so one call
-  // advances one acoustic substep. The n_split acoustic loop is not implemented
-  // in the runtime yet (the d_sw binder divides dispatch_params->dt by n_split
-  // exactly as dyn_core.F90:297 does). That remains a Gate C1 item.
-  const LaunchFn stages[]={dispatch.cgrid_predictor,dispatch.cgrid_vertical_solver,dispatch.cgrid_pressure,
-                           dispatch.dgrid_dynamics,dispatch.vertical_solver,dispatch.nh_pressure,
-                           dispatch.post_loop_heating};
-  for(LaunchFn stage:stages){
-    if(!stage) continue;
+#ifdef FV3_GPU_ENABLE_CUDA
+  /* Milestone 3A.9: the mirror of the ordering in fv3_gpu_sync_to_host. Any H2D
+   * the caller enqueued (fv3_gpu_initialize_state / fv3_gpu_sync_to_device) is
+   * on the transfer stream, and the kernels below run on the compute stream, so
+   * without this the first substep could read un-copied device memory. Today's
+   * harnesses happen to host-block on the H2D event first, which hid it; a
+   * caller following the persistent-residency model has no reason to. */
+  {auto z=order_after(c->data.transfer_stream,c->data.compute_stream,c->data.event_transfer_done);
+   if(z!=cudaSuccess){ return cuda_fail(z,e,__func__,&c->data); }}
+  // dyn_core.F90:368-379, once per call, BEFORE the acoustic loop.
+  rc=zero_accumulators(c->data,e,__func__);
+  if(rc){ c->data.phase=ContextPhase::failed; return rc; }
+#endif
+
+  /* -------------------------------------------------------------------------
+   * The acoustic loop: dyn_core.F90:399 `do it=1,n_split` .. :1196 `enddo`.
+   *
+   * PER-SUBSTEP stages, in authoritative order:
+   *
+   *   cgrid_predictor       d2a2c_vect + divergence_corner + c_sw over k=1..npz
+   *                         (:515-523, with the nord>0 divgd corner exchange
+   *                         started at :525-531)
+   *   cgrid_vertical_solver gz<->zh sync (:548-575), update_dz_c (:577, dt2),
+   *                         Riem_Solver_C (:583, dt2)
+   *   cgrid_pressure        p_grad_c (:614, dt2)
+   *   dgrid_dynamics        d_sw over k=1..npz (:700-829) and the divg2 block
+   *   dgrid_height          update_dz_d (:905-906, rdt) -- WP-C sequencing over
+   *                         WP-B's dgrid_height_transport service
+   *   vertical_solver       Riem_Solver3 (:918-923, dt, ms=m_split)
+   *   nh_pressure           pk3_halo/pe_halo, gz=zh*grav, nh_p_grad (:940-1019)
+   *
+   * post_loop_heating is deliberately NOT on this list. Its numerical content is
+   * del2_cubed(heat_source, ...) followed by the diffusive-heating update, and
+   * dyn_core runs that ONCE at :1212-1214, AFTER `enddo` at :1196 -- not per
+   * substep. Looping the whole 3A.8 stage array n_split times would apply the
+   * heat-source filter n_split times to a heat_source that had only partially
+   * accumulated, which is why §7 forbids exactly that shortcut.
+   *
+   * A null slot is skipped rather than treated as an orchestration error, so a
+   * partially wired dispatch table still runs what it has; a wired stage that
+   * fails aborts the step, with no silent host fallback.
+   *
+   * dgrid_height_transport is NOT a stage on this list and must never become
+   * one. It is a SERVICE: nh_utils.F90 has no standalone call to it, and
+   * dyn_core.F90 reaches it only through update_dz_d (:905). It is now reached
+   * per substep, but as a callee of dgrid_height -- see §5/§6 in
+   * vertical/fv3_vertical_kernels.cu:launch_dgrid_height_stage.
+   * ------------------------------------------------------------------------- */
+  /* Milestone 3A.9 §8/§9: the substep script is now an explicit ordered
+   * sequence rather than an array walk, because the authoritative halo
+   * resolution points are INTERLEAVED with the stages and cannot be expressed
+   * as a stage list. See resolve_halo() above for what "resolved" is allowed to
+   * mean on this path.
+   *
+   *   HALO STATE TRANSITION TABLE (per substep it)
+   *
+   *   Fortran      group        entry state          producer of readiness         made stale by            next consumer
+   *   :402/:504    H_DWIND_IN   unknown | ready      resolve_halo, top of substep  (never)                  cgrid_predictor  (fv3_cgrid_predictor.cu:539)
+   *   :427/:507    H_W_IN       unknown | ready      resolve_halo, top of substep  (never)                  cgrid_predictor  (:549)
+   *   :459/:552    H_GZ_FIRST   unknown              resolve_halo, it==1 only      (never)                  cgrid_vertical_solver (fv3_vertical_kernels.cu:604, acoustic_index==0)
+   *   :528/:636    H_DIVGD      stale after predictor resolve_halo, post-predictor cgrid_predictor (:831)    dgrid_dynamics   (wp_b_contract.cpp:66)
+   *   :618/:640    H_CWIND      stale after pressure resolve_halo, post-pressure   cgrid_predictor (:844),   dgrid_dynamics   (wp_b_contract.cpp:63)
+   *                                                                                cgrid_pressure (fv3_cgrid.cu:122)
+   *   :844/:878    H_DSCALAR    unknown | ready      resolve_halo, post-dynamics   (never)                  dgrid_height     (fv3_vertical_kernels.cu:140)
+   *   :931/:967    H_ZH         unknown | ready      resolve_halo, post-Riemann    (never)                  nh_pressure      (wp_d_contract_cuda.cpp:26)
+   *   :931/:967    H_PKC2       unknown | ready      resolve_halo, post-Riemann    (never)                  nh_pressure      (wp_d_contract_cuda.cpp:27)
+   *   :2288        H_HEAT       unknown | ready      resolve_halo, after the loop  (never)                  post_loop_heating pass 0 (wp_d_contract_cuda.cpp:114)
+   *
+   *   Two groups are deliberately never resolved:
+   *     H_Q_INLINE     -- inline_q is outside the supported subset (:419/:631),
+   *                       so no stage requires it and no exchange occurs.
+   *     H_DWIND_NEXT   -- :1109 starts i_pack(8) for the NEXT substep; that is
+   *                       the same physical exchange whose completion is
+   *                       H_DWIND_IN at the top of the next iteration, which the
+   *                       loop already resolves. Resolving it separately would
+   *                       double-count one exchange, and nothing require()s it.
+   *
+   * H_GZ_FIRST is the one group whose require() site cannot be reached from
+   * here: it lives INSIDE launch_cgrid_vertical_solver, between the gz
+   * reconstruction and the gz<->zh sync, matching Fortran's :459 -> :552 split
+   * across the C-grid vertical group. So it is resolved immediately before that
+   * stage. On the only topology resolve_halo will accept, the exchange copies
+   * nothing, so resolving before rather than inside the stage skips no
+   * operation; on any other topology resolve_halo refuses outright, so the
+   * earlier placement can never manufacture a readiness claim that is false.
+   */
+  auto resolve=[&](fv3_gpu_halo_group g)->bool{
+    rc=resolve_halo(c->data,g,e,__func__);
+    if(rc!=FV3_GPU_SUCCESS){ c->data.phase=ContextPhase::failed; return false; }
+    return true;
+  };
+  auto run=[&](LaunchFn stage)->bool{
+    if(!stage) return true;   // a null slot is skipped, not an orchestration error
     rc=stage(x,e);
-    if(rc!=FV3_GPU_SUCCESS){ c->data.phase=ContextPhase::failed; return rc; }
+    if(rc!=FV3_GPU_SUCCESS){ c->data.phase=ContextPhase::failed; return false; }
+    return true;
+  };
+
+  for(int32_t it=1;it<=n_split;++it){
+    p.acoustic_index=it-1;
+
+    /* remap_step: dyn_core.F90:404-408
+     *   remap_step = (breed_vortex_inline .or. it==n_split)
+     * breed_vortex_inline is a vortex-breeding option outside the supported
+     * production subset, so it reduces to it==n_split here. */
+    p.remap_step=(it==n_split)?1:0;
+
+    /* last_call: dyn_core.F90:924 passes `remap_step` -- NOT `last_step` -- into
+     * Riem_Solver3's last_call dummy (nh_core.F90:69), which gates the
+     * peln/pk/pe writeback (fv3_vertical_column.hpp:188).
+     *
+     * This corrects a real defect: the previous code set last_call from
+     * step_desc::end_step. end_step is dyn_core's `end_step` argument and feeds
+     * `last_step = (it==n_split .and. end_step)` at :483, which controls the
+     * omega finalization and diagnostics -- a DIFFERENT quantity. With
+     * end_step=1 the old value made every substep write peln/pk/pe; with
+     * end_step=0 it made none of them do so, including the final substep on
+     * which the remap stage depends. */
+    p.last_call=p.remap_step;
+
+    if(!resolve(FV3_GPU_H_DWIND_IN)) return rc;               // :402 -> :504
+    if(!resolve(FV3_GPU_H_W_IN)) return rc;                   // :427 -> :507
+    if(!run(dispatch.cgrid_predictor)) return rc;             // :515-523
+    /* :525-531 is gated on `nord > 0`; when nord == 0 the Fortran neither packs
+     * nor completes the divgd corner update, and cgrid_predictor correspondingly
+     * leaves H_DIVGD alone (fv3_cgrid_predictor.cu:831). The WP-B binder
+     * require()s H_DIVGD unconditionally, so an nord == 0 config fails loudly at
+     * dgrid_dynamics rather than running with an unproduced halo. That is the
+     * correct outcome: with nord == 0 divgd has no producer at all. */
+    if(config.nord>0 && !resolve(FV3_GPU_H_DIVGD)) return rc; // :528 -> :636
+    if(it==1 && !resolve(FV3_GPU_H_GZ_FIRST)) return rc;      // :459 -> :552
+    if(!run(dispatch.cgrid_vertical_solver)) return rc;       // :543-583
+    if(!run(dispatch.cgrid_pressure)) return rc;              // :614
+    if(!resolve(FV3_GPU_H_CWIND)) return rc;                  // :618 -> :640
+    if(!run(dispatch.dgrid_dynamics)) return rc;              // :700-829
+    if(!resolve(FV3_GPU_H_DSCALAR)) return rc;                // :844 -> :878
+    if(!run(dispatch.dgrid_height)) return rc;                // :905-906
+    if(!run(dispatch.vertical_solver)) return rc;             // :918-923
+    if(!resolve(FV3_GPU_H_ZH)) return rc;                     // :931 -> :967
+    if(!resolve(FV3_GPU_H_PKC2)) return rc;                   // :931 -> :967
+    if(!run(dispatch.nh_pressure)) return rc;                 // :940-1019
+  }
+
+  /* -------------------------------------------------------------------------
+   * After the loop: dyn_core.F90:1212-1214
+   *
+   *   if ( n_con/=0 .and. flagstruct%d_con > 1.e-5 ) then
+   *     nf_ke = min(3, flagstruct%nord+1)
+   *     call del2_cubed(heat_source, cnst_0p20*gridstruct%da_min, ..., nf_ke, bd)
+   *
+   * and then the diffusive-heating update over k=1..n_con (:1220-1265).
+   *
+   * del2_cubed's own `ntimes = min(3, nmax)` (dyn_core.F90:2288) with nmax=nf_ke
+   * makes the pass count exactly nf_ke, since nf_ke is already <= 3.
+   * launch_post_loop_heating implements ONE pass per call and requires
+   * diffusion_passes == config.nf_ke, so the pass loop lives here. The heating
+   * update is emitted by the final pass (pass == ntimes-1), matching the Fortran
+   * ordering: all del2 passes complete, then the temperature update.
+   *
+   * The caller owns nf_ke = min(3, nord+1); it is validated to 1..3 by the
+   * stage. Both halves of the gate are checked here rather than inside the
+   * stage, because when the gate is closed the Fortran never allocates
+   * heat_source at all and the stage has nothing legitimate to read.
+   * ------------------------------------------------------------------------- */
+  if(dispatch.post_loop_heating && config.n_con!=0 && config.d_con>1.0e-5){
+    /* del2_cubed updates heat_source's halo before each of its passes
+     * (dyn_core.F90:2288 onwards). launch_post_loop_heating require()s H_HEAT on
+     * pass 0 only (wp_d_contract_cuda.cpp:114), so resolve it once here. */
+    if(!resolve(FV3_GPU_H_HEAT)) return rc;
+    const int32_t passes=config.nf_ke;
+    p.diffusion_passes=passes;
+    for(int32_t pass=0;pass<passes;++pass){
+      p.diffusion_pass=pass;
+      rc=dispatch.post_loop_heating(x,e);
+      if(rc!=FV3_GPU_SUCCESS){ c->data.phase=ContextPhase::failed; return rc; }
+    }
   }
 
   *ev=issue_event(c->data);
@@ -262,7 +823,21 @@ extern "C" int fv3_gpu_dyn_core_step(fv3_gpu_context *c,const fv3_gpu_step_desc 
 }
 extern "C" int fv3_gpu_event_wait(fv3_gpu_context *c,fv3_gpu_event ev,fv3_gpu_error *e){using namespace fv3::gpu;clear_error(e);if(!c||!ev||ev>c->data.last_event)return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"unknown event");
 #ifdef FV3_GPU_ENABLE_CUDA
-  return cuda_fail(cudaStreamSynchronize((cudaStream_t)c->data.transfer_stream),e,__func__,&c->data);
+  /* Milestone 3A.9: wait for BOTH streams. This is the host's only blocking
+   * wait, and callers use it to mean "the work up to this event is done and I
+   * may touch host memory". Synchronizing only the transfer stream made that
+   * false for a step event: fv3_gpu_dyn_core_step's kernels are on the compute
+   * stream, so waiting on a step event returned immediately while the acoustic
+   * loop was still running. Ordering the copies (above) fixes device-side
+   * correctness; this fixes what the host is entitled to conclude.
+   *
+   * Neither stream is looked up by event id -- the public event handle is a
+   * host-side monotonic counter, not a device object, so it cannot select a
+   * stream. The wait is therefore conservative by construction; the check
+   * against last_event above is what makes an unknown event an error. */
+  cudaError_t wrc=cudaStreamSynchronize((cudaStream_t)c->data.compute_stream);
+  if(wrc==cudaSuccess) wrc=cudaStreamSynchronize((cudaStream_t)c->data.transfer_stream);
+  return cuda_fail(wrc,e,__func__,&c->data);
 #else
   return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,"runtime was built without CUDA");
 #endif
@@ -276,6 +851,6 @@ extern "C" int fv3_gpu_get_capabilities(fv3_gpu_context*,fv3_gpu_capabilities *p
   p->precision_mask=(1u<<fv3::gpu::active_precision);p->communication_stage=1;p->feature_mask=0;return 0;}
 extern "C" int fv3_gpu_finalize(fv3_gpu_context **pc,fv3_gpu_error *e){using namespace fv3::gpu;clear_error(e);if(!pc||!*pc)return 0;auto*c=*pc;
 #ifdef FV3_GPU_ENABLE_CUDA
-  cudaSetDevice(c->data.create.device_ordinal);cudaStreamSynchronize((cudaStream_t)c->data.compute_stream);cudaStreamSynchronize((cudaStream_t)c->data.transfer_stream);for(auto &x:c->data.state.fields)cudaFree(x.device);if(c->data.workspace.allocation)cudaFree(c->data.workspace.allocation);cudaStreamDestroy((cudaStream_t)c->data.compute_stream);cudaStreamDestroy((cudaStream_t)c->data.transfer_stream);
+  cudaSetDevice(c->data.create.device_ordinal);cudaStreamSynchronize((cudaStream_t)c->data.compute_stream);cudaStreamSynchronize((cudaStream_t)c->data.transfer_stream);for(auto &x:c->data.state.fields)cudaFree(x.device);if(c->data.workspace.allocation)cudaFree(c->data.workspace.allocation);if(c->data.event_compute_done)cudaEventDestroy((cudaEvent_t)c->data.event_compute_done);if(c->data.event_transfer_done)cudaEventDestroy((cudaEvent_t)c->data.event_transfer_done);cudaStreamDestroy((cudaStream_t)c->data.compute_stream);cudaStreamDestroy((cudaStream_t)c->data.transfer_stream);
 #endif
   delete c;*pc=nullptr;return 0;}

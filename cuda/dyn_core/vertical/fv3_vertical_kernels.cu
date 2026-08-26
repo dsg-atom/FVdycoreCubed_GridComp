@@ -1,5 +1,15 @@
 #include "fv3_vertical_kernels.cuh"
 #include "fv3_vertical_column.hpp"
+#include "fv3_riem_solver_c.cuh"
+#include "fv3_gpu_errors.hpp"
+// Milestone 3A.9 §4: the C-grid vertical entry is WP-C sequencing, but the
+// update_dz_c kernels and the A-grid corner fills it drives are WP-A property
+// (project_architecture.md: WP-A owns "C-grid dz updates"). WP-C calls them
+// rather than transcribing a second copy, exactly as WP-B's smag_corner calls
+// WP-D's a2b_ord4. fv3_wp_c_vertical therefore links fv3_wp_a_cgrid; there is
+// no cycle, because fv3_wp_a_cgrid depends only on the WP-E runtime.
+#include "fv3_cgrid_dz.hpp"
+#include "fv3_cgrid_corners.hpp"
 #include <cuda_runtime.h>
 #include <cstdint>
 
@@ -87,35 +97,32 @@ int launch_dgrid_height_v2(const ExecutionContext &x,fv3_gpu_error *error) {
   return cudaGetLastError()==cudaSuccess?FV3_GPU_SUCCESS:FV3_GPU_CUDA_ERROR;
 }
 
-// Complete update_dz_d sequence kernel: post-transport boundary/monotonicity
-__global__ void update_dz_d_post_transport_kernel(
-    View3 zh, View3 delz, View2 ws, CView2 zs, CView3 flux_x, CView3 flux_y,
-    CView2 rarea, int64_t is, int64_t ie, int64_t js, int64_t je, int km,
-    fv_real rdt, fv_real dz_min) {
-  const int64_t i = is + blockIdx.x * blockDim.x + threadIdx.x;
-  const int64_t j = js + blockIdx.y * blockDim.y + threadIdx.y;
-  if (i > ie || j > je) return;
-
-  // Apply horizontal flux divergence to zh (height transport result)
-  // This follows tp_core.F90 update_dz_d pattern:
-  // zh = zh + rdt * rarea * (flux_x(i) - flux_x(i+1) + flux_y(j) - flux_y(j+1))
-  for (int k = 0; k < km; ++k) {
-    const fv_real div = rarea.at(i, j) *
-        (flux_x.at(i, j, k) - flux_x.at(i + 1, j, k) +
-         flux_y.at(i, j, k) - flux_y.at(i, j + 1, k));
-    zh.at(i, j, k) = zh.at(i, j, k) + rdt * div;
-  }
-
-  // Surface vertical velocity ws = (zs - zh_bottom) * rdt
-  ws.at(i, j) = (zs.at(i, j) - zh.at(i, j, km)) * rdt;
-
-  // Bottom-to-top monotonic height enforcement: zh[k] >= zh[k+1] + dz_min
-  for (int k = km - 1; k >= 0; --k) {
-    const fv_real floor = zh.at(i, j, k + 1) + dz_min;
-    if (zh.at(i, j, k) < floor) zh.at(i, j, k) = floor;
-    delz.at(i, j, k) = zh.at(i, j, k + 1) - zh.at(i, j, k);
-  }
-}
+/* Milestone 3A.9: update_dz_d_post_transport_kernel was removed here.
+ *
+ * It was dead code with no caller anywhere in the tree, and it was not a
+ * redundant copy of a correct implementation -- it was a WRONG one, which is
+ * why leaving it in place was a hazard rather than clutter:
+ *
+ *   - it applied its own flux-divergence update to zh, as
+ *     `zh += rdt*rarea*(fx(i)-fx(i+1)+fy(j)-fy(j+1))`. The authoritative update
+ *     is nh_utils.F90:300-301,
+ *       zh = (zh*area + (fx(i)-fx(i+1)) + (fy(j)-fy(j+1)))
+ *            / ((ra_x + ra_y) - area)
+ *     -- an area-weighted RATIO, not an rdt-scaled increment, and it is applied
+ *     inside the WP-B transport body (launch_dgrid_height_transport_cuda), so
+ *     any caller of this kernel would also have double-counted it;
+ *   - it wrote delz, which on the D-grid belongs to Riem_Solver3
+ *     (nh_core.F90:181); update_dz_d writes only zh and ws
+ *     (nh_utils.F90:310-320).
+ *
+ * Its ws-then-clamp ordering and its `k = km-1 .. 0` clamp direction WERE
+ * correct (nh_utils.F90:313 then :315-319), which is exactly what made the
+ * kernel look plausible enough to be dangerous.
+ *
+ * The live path is launch_update_dz_d -> dispatch.dgrid_height_transport ->
+ * height_boundary_v2_kernel(..., write_delz=false), reached through the
+ * dgrid_height slot. Numerical semantics changed: NO (nothing called this).
+ */
 
 // Complete update_dz_d dispatch
 int launch_update_dz_d(const ExecutionContext &x, const NumericalDispatch &dispatch,
@@ -187,6 +194,63 @@ int launch_update_dz_d(const ExecutionContext &x, const NumericalDispatch &dispa
       fv_real(p.rdt), fv_real(cfg.dz_min), false);
 
   return cudaGetLastError() == cudaSuccess ? FV3_GPU_SUCCESS : FV3_GPU_CUDA_ERROR;
+}
+
+/* ==========================================================================
+ * Milestone 3A.9 §5 and §6 -- the dgrid_height slot, and how
+ * dgrid_height_transport becomes reachable.
+ *
+ * §5 RESOLUTION: dgrid_height IS update_dz_d, and the two slots are in a
+ * sequencer/service relationship, not a duplication:
+ *
+ *   dgrid_height            = nh_utils.F90:230-322 update_dz_d, ENTIRE routine,
+ *                             called once per substep from dyn_core.F90:905-906.
+ *                             WP-C property (project_architecture.md: WP-C owns
+ *                             "update_dz_d orchestration using WP-B horizontal
+ *                             transport").
+ *   dgrid_height_transport  = nh_utils.F90:255-305, the horizontal-transport
+ *                             BODY that routine's k loop runs. WP-B property.
+ *                             It has no authoritative call site of its own.
+ *
+ * So ownership is explicit and nothing is duplicated: this stage contributes
+ * only what update_dz_d does around the transport -- the crx/cry edge_profile
+ * inputs, the per-level damping split, and the :307-322 boundary/monotonicity
+ * closure -- and delegates the transport itself.
+ *
+ * launch_dgrid_height_v2 (above) is NOT this stage and is NOT production. It is
+ * height_boundary_v2_kernel with write_delz=true, i.e. the :307-322 closure plus
+ * a delz recompute that authoritatively belongs to Riem_Solver3 (nh_core.F90:181,
+ * where delz is derived from the solved zh). It has no caller anywhere in the
+ * tree. It is left in place because it is harmless and referenced by comments,
+ * but it must never be wired into a dispatch slot: doing so would write delz a
+ * substep early, before the Riemann solve that owns it.
+ *
+ * §6 ROOT CAUSE: launch_update_dz_d needs the dispatch table to reach
+ * dispatch.dgrid_height_transport, so its signature is
+ * (ExecutionContext, NumericalDispatch, error) -- which is not a LaunchFn and
+ * therefore cannot occupy a dispatch slot. dgrid_height_transport was
+ * IMPLEMENTED, WIRED and yet UNREACHABLE through fv3_gpu_dyn_core_step for
+ * exactly that reason. ExecutionContext::dispatch now carries the table, so this
+ * thin adapter is a legitimate LaunchFn and the real production path is
+ *
+ *   dgrid_dynamics (WP-B d_sw)
+ *     -> dgrid_height (WP-C update_dz_d)
+ *          -> dgrid_height_transport (WP-B fv_tp_2d/del6_vt_flux body)
+ *     -> vertical_solver (WP-C Riem_Solver3)
+ *
+ * which is dyn_core.F90:829 -> :905 -> :918 in order. The adapter adds no
+ * numerical content of its own.
+ *
+ * Numerical semantics changed: NO.
+ * ========================================================================== */
+int launch_dgrid_height_stage(const ExecutionContext &x, fv3_gpu_error *error) {
+  static constexpr const char *api = "launch_dgrid_height_stage";
+  if (!x.dispatch) {
+    return fail(error, FV3_GPU_INVALID_ARGUMENT, api,
+                "ExecutionContext::dispatch is null; update_dz_d cannot reach the "
+                "WP-B dgrid_height_transport service it sequences");
+  }
+  return launch_update_dz_d(x, *x.dispatch, error);
 }
 
 // Vertical Riemann solver kernel: one thread per horizontal column
@@ -329,6 +393,11 @@ int launch_vertical_solver(const ExecutionContext &x, fv3_gpu_error *error) {
   const auto &p = *x.dispatch_params;
 
   if (b.npz < 2) return FV3_GPU_UNSUPPORTED_CONFIGURATION;
+  /* gama = 1/(1-akap) below; akap == 1 is a pole, and m_split is the vertical
+   * substep count Riem_Solver3 receives at dyn_core.F90:918. Neither may be
+   * defaulted. */
+  if (cfg.akap <= 0.0 || cfg.akap >= 1.0 || cfg.m_split < 1)
+    return FV3_GPU_UNSUPPORTED_CONFIGURATION;
 
   // Get workspace slice
   const auto *ws_slice = workspace_slice(*x.workspace, WorkspaceId::vertical);
@@ -356,7 +425,15 @@ int launch_vertical_solver(const ExecutionContext &x, fv3_gpu_error *error) {
       view3(*v_pe), view3(*v_peln), view3(*v_pk), view3(*v_pk3), view3(*v_ppe),
       static_cast<fv_real *>(ws_slice->data), workspace_stride,
       b.is, b.ie, b.js, b.je, km,
-      p.vertical_ms, fv_real(p.dt), fv_real(cfg.rdgas), fv_real(1.4),
+      /* gama. nh_core.F90:99 `gama = 1./(1.-akap)` -- DERIVED from akap, not a
+       * constant. This argument was hardcoded to 1.4, which is only the value
+       * gama happens to take near akap = 2/7 (1/(1-0.2857) = 1.4000); with the
+       * GEOS akap of 0.286 the authoritative value is 1.40056, so every SIM1
+       * column solve was running a slightly wrong polytropic exponent.
+       * Milestone 3A.9: derived. Numerical semantics changed: YES -- this is a
+       * repair toward the authoritative Fortran, not a change away from it. */
+      p.vertical_ms, fv_real(p.dt), fv_real(cfg.rdgas),
+      fv_real(1.0 / (1.0 - cfg.akap)),
       fv_real(cfg.akap), fv_real(cfg.ptop), fv_real(cfg.p_fac),
       fv_real(cfg.a_imp), fv_real(cfg.scale_m),
       cfg.use_cond != 0, cfg.moist_cappa != 0,
@@ -366,13 +443,294 @@ int launch_vertical_solver(const ExecutionContext &x, fv3_gpu_error *error) {
   return cudaGetLastError() == cudaSuccess ? FV3_GPU_SUCCESS : FV3_GPU_CUDA_ERROR;
 }
 
-// C-grid vertical solver entry
+/* ==========================================================================
+ * Milestone 3A.9 §4 -- the C-grid vertical entry.
+ *
+ * VERDICT ON THE PRIOR IMPLEMENTATION: it was a semantic alias, and wiring it
+ * would have been numerically wrong. The body read
+ *
+ *     // For now, delegate to the same Riemann solver.
+ *     return launch_vertical_solver(x, error);
+ *
+ * i.e. it ran Riem_Solver3. dyn_core.F90:583 calls Riem_Solver_C, which is a
+ * DIFFERENT authoritative routine (nh_utils.F90) -- different argument list,
+ * different a_imp branch set (SIM3p0 / RIM_2D / SIM1 rather than Riem_Solver3's
+ * families), no pe/peln/pk/ppe/pk3 outputs, no last_call/fp_out/use_logp
+ * behaviour, and it consumes dt2 rather than dt. It is not an alias and must not
+ * be wired as one.
+ *
+ * So this slot IS genuinely distinct, and it is a COMPOSITE, not a single
+ * routine. dyn_core.F90's nonhydrostatic C-grid vertical group is:
+ *
+ *   :445-455   it==1 only: gz(:,:,npz+1) = zs; gz(k) = gz(k+1) - delz(k)
+ *   :459       it==1 only: start_group_halo_update(i_pack(5), gz)
+ *   :552       it==1 only: complete_group_halo_update(i_pack(5))
+ *   :557-563   it==1:  zh = gz   over isd:ied, jsd:jed, k=1..npz+1
+ *   :566-573   it/=1:  gz = zh   over isd:ied, jsd:jed, k=1..npz+1
+ *   :577       update_dz_c(..., dt2, ...)
+ *   :583       Riem_Solver_C(ms, dt2, ...)
+ *
+ * CUDA STRUCTURAL DIFFERENCE (§18 class "MATCHES WITH EXPLAINED CUDA STRUCTURAL
+ * DIFFERENCE"): in Fortran the :445-459 block sits BEFORE c_sw (:515) so that
+ * the gz halo exchange overlaps c_sw. It is hoisted into this stage here.
+ * That is safe and order-preserving because c_sw writes only delpc, ptc, uc, vc,
+ * ut, vt, divgd and omga, and the :445-455 reconstruction reads only delz and
+ * zs -- there is no read-write or write-write overlap in either direction. The
+ * only thing lost is communication/computation overlap, which is explicitly
+ * deferred (project_architecture.md, "Performance Work Comes Later").
+ *
+ * NOT part of this slot: the hydrostatic branch (:544 geopk) and the nested
+ * branches (:432-443, :586-606 nest_halo_nh -- the latter is dead code in the
+ * supported configuration anyway). Both are rejected below rather than
+ * silently approximated.
+ * ========================================================================== */
+
+// dyn_core.F90:445-455, non-nested branch. Reuses reconstruct_height_column
+// (fv3_vertical_column.hpp:109) rather than restating the recurrence.
+__global__ void gz_from_delz_kernel(View3 gz, CView3 delz, CView2 zs,
+                                    int64_t is, int64_t ie, int64_t js,
+                                    int64_t je, int km) {
+  const int64_t i = is + blockIdx.x * blockDim.x + threadIdx.x;
+  const int64_t j = js + blockIdx.y * blockDim.y + threadIdx.y;
+  if (i > ie || j > je) return;
+  // CView3::at returns by value, so address the column directly. Same offset
+  // arithmetic as CView3::at with k == 0.
+  Column<fv_real> z{&gz.at(i, j, 0), gz.s2};
+  const Column<const fv_real> dz{
+      delz.p + (i - delz.l0) * delz.s0 + (j - delz.l1) * delz.s1 +
+          (0 - delz.l2) * delz.s2,
+      delz.s2};
+  reconstruct_height_column<fv_real>(z, dz, zs.at(i, j), km);
+}
+
+// dyn_core.F90:557-563 (zh_from_gz) and :566-573 (gz from zh). Both loop the
+// FULL halo box isd:ied, jsd:jed over k=1..npz+1, so kmp1 == npz+1 levels.
+__global__ void gz_zh_sync_kernel(View3 gz, View3 zh, int64_t isd, int64_t ied,
+                                  int64_t jsd, int64_t jed, int kmp1,
+                                  bool zh_from_gz) {
+  const int64_t i = isd + blockIdx.x * blockDim.x + threadIdx.x;
+  const int64_t j = jsd + blockIdx.y * blockDim.y + threadIdx.y;
+  if (i > ied || j > jed) return;
+  for (int k = 0; k < kmp1; ++k) {
+    if (zh_from_gz)
+      zh.at(i, j, k) = gz.at(i, j, k);
+    else
+      gz.at(i, j, k) = zh.at(i, j, k);
+  }
+}
+
 int launch_cgrid_vertical_solver(const ExecutionContext &x, fv3_gpu_error *error) {
-  // C-grid vertical solver shares the same column primitives but has
-  // different orchestration scope (WP-A owned). This entry provides
-  // the internal dispatch point.
-  // For now, delegate to the same Riemann solver.
-  return launch_vertical_solver(x, error);
+  const int context_status = validate_execution_context(x, error);
+  if (context_status != FV3_GPU_SUCCESS) return context_status;
+  const char *api = "launch_cgrid_vertical_solver";
+  if (x.submission.stream_id != StreamId::compute)
+    return fail(error, FV3_GPU_INVALID_ARGUMENT, api,
+                "the C-grid vertical group must be enqueued on the compute stream");
+
+  const auto &b = x.immutable->bounds;
+  const auto &cfg = x.immutable->config;
+  const auto &p = *x.dispatch_params;
+  const auto &topo = *x.immutable->topology;
+
+  // ---- configuration fence: every rejection precedes the first launch ----
+  if (cfg.hydrostatic)
+    return fail(error, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                "hydrostatic C-grid pressure (dyn_core.F90:544 geopk) is not "
+                "implemented; the supported configuration is hydrostatic=false");
+  if (!topo.global_cubed_sphere || topo.nested || topo.regional)
+    return fail(error, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                "only the global non-nested cubed sphere is implemented");
+  if (cfg.grid_type != 0)
+    return fail(error, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                "only grid_type == 0 is implemented");
+  // update_dz_c's gz2 corner-fill band spans is-3..ie+3 (nh_utils.F90:156-160
+  // copies is-ng..ie+ng and the fill_4corners writes reach two cells out), and
+  // cgrid/fv3_cgrid_dz.cu sizes that band with a literal 3.
+  if (b.halo_width < 3u)
+    return fail(error, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                "update_dz_c requires halo_width >= 3");
+  // nh_utils.F90:96-97 form top_ratio from dp0(1),dp0(2) and bot_ratio from
+  // dp0(km-1),dp0(km), so km >= 3 is required for those to be distinct levels.
+  if (b.npz < 3)
+    return fail(error, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                "update_dz_c's top/bottom extrapolation requires npz >= 3");
+  if (topo.npx <= 0 || topo.npy <= 0)
+    return fail(error, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                "fill_4corners needs the tile corner counts npx/npy; a zero "
+                "value would silently skip the panel-corner fills");
+  // dyn_core.F90:577 and :583 both receive dt2, and nh_utils.F90:94 forms
+  // rdt = 1/dt from it.
+  if (p.dt2 == 0.0)
+    return fail(error, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                "dt2 is zero; update_dz_c divides by it");
+
+  const auto *v_gz    = x.fields->find(FieldId::gz);
+  const auto *v_zh    = x.fields->find(FieldId::zh);
+  const auto *v_delz  = x.fields->find(FieldId::delz);
+  const auto *v_zs    = x.fields->find(FieldId::zs);
+  const auto *v_ut    = x.fields->find(FieldId::ut);
+  const auto *v_vt    = x.fields->find(FieldId::vt);
+  const auto *v_dp0   = x.fields->find(FieldId::dp_ref);
+  const auto *v_area  = x.fields->find(FieldId::area);
+  const auto *v_ws3   = x.fields->find(FieldId::ws3);
+  if (!v_gz || !v_zh || !v_delz || !v_zs || !v_ut || !v_vt || !v_dp0 ||
+      !v_area || !v_ws3)
+    return fail(error, FV3_GPU_INVALID_ARGUMENT, api,
+                "the C-grid vertical group requires gz, zh, delz, zs, ut, vt, "
+                "dp_ref, area and ws3");
+
+  auto *stream = static_cast<cudaStream_t>(x.submission.stream);
+  const int km = static_cast<int>(b.npz);
+  const int64_t halo = static_cast<int64_t>(b.halo_width);
+  const int64_t isd = b.is - halo, ied = b.ie + halo;
+  const int64_t jsd = b.js - halo, jed = b.je + halo;
+  const dim3 block(16, 8);
+  auto grid_for = [&](int64_t nx, int64_t ny) {
+    return dim3(static_cast<unsigned>((nx + block.x - 1) / block.x),
+                static_cast<unsigned>((ny + block.y - 1) / block.y));
+  };
+
+  /* ---- Phase 1: gz / zh synchronisation (dyn_core.F90:445-573) ---- */
+  if (p.acoustic_index == 0) {
+    const dim3 g = grid_for(b.ie - b.is + 1, b.je - b.js + 1);
+    gz_from_delz_kernel<<<g, block, 0, stream>>>(
+        view3(*v_gz), cview3(*v_delz), cview2(*v_zs),
+        b.is, b.ie, b.js, b.je, km);
+    if (cudaPeekAtLastError() != cudaSuccess)
+      return fail(error, FV3_GPU_CUDA_ERROR, api, "gz_from_delz launch failed");
+
+    /* dyn_core.F90:459 starts and :552 completes the gz halo exchange, and only
+     * AFTER it completes does :557-563 propagate gz into zh across the full
+     * halo box. The reconstruction above wrote only is:ie / js:je, so the halo
+     * cells zh inherits here come entirely from that exchange. Requiring the
+     * group at this exact point is what prevents the copy below from
+     * broadcasting uninitialised halo values into zh, where they would persist
+     * for every subsequent substep.
+     *
+     * This require is deliberately NOT satisfied by this stage. Nothing here may
+     * mark a halo ready; that is the runtime's single-rank halo-readiness
+     * responsibility (§8). */
+    fv3_gpu_event gz_ready{};
+    if (x.dependencies->require(FV3_GPU_H_GZ_FIRST, &gz_ready) != FV3_GPU_SUCCESS)
+      return fail(error, FV3_GPU_STATE_CONFLICT, api,
+                  "H_GZ_FIRST (dyn_core.F90:459 start / :552 complete, gz) must "
+                  "be ready before zh inherits gz across the halo");
+  }
+
+  {
+    // it==1: zh <- gz (:557-563). it>1: gz <- zh (:566-573).
+    const bool zh_from_gz = (p.acoustic_index == 0);
+    const dim3 g = grid_for(ied - isd + 1, jed - jsd + 1);
+    gz_zh_sync_kernel<<<g, block, 0, stream>>>(view3(*v_gz), view3(*v_zh),
+                                               isd, ied, jsd, jed, km + 1,
+                                               zh_from_gz);
+    if (cudaPeekAtLastError() != cudaSuccess)
+      return fail(error, FV3_GPU_CUDA_ERROR, api, "gz/zh sync launch failed");
+    /* :557-563 rewrites zh over the whole halo box from an exchanged gz, so zh's
+     * own halo is consistent afterwards and H_ZH is NOT invalidated here. The
+     * it>1 direction does not write zh at all. Either way zh's halo state is
+     * unchanged by this phase, which is why there is no mark_stale for it. */
+  }
+
+  /* ---- Phase 2: update_dz_c (dyn_core.F90:577, nh_utils.F90:70-207) ---- */
+  {
+    /* Scratch: nh_utils.F90:84-86 declares gz2(is-ng:ie+ng,js-ng:je+ng),
+     * xfx/fx(is-1:ie+2,js-1:je+1) and yfx/fy(is-1:ie+1,js-1:je+2) as per-k
+     * OpenMP-private locals. The CUDA per-level launchers index them by k, so
+     * each of the four flux arrays is carved as one whole
+     * (ni x nj x (npz+1)) fv_real block and gz2 uses level 0 of a fifth block.
+     * That is the same arena convention as WpBDSwArena (dgrid/wp_b_dsw_cuda.cuh)
+     * and as the runtime's own workspace sizing.
+     *
+     * WorkspaceId::cgrid is safe to share with the C-grid predictor: this stage
+     * runs strictly after it within the substep, and every value the predictor
+     * hands over (ut, vt, uc, vc, delpc, ptc, divgd, omga) is a registered
+     * field, not scratch. */
+    constexpr uint64_t kUpdateDzCArrays = 5;
+    const auto *slice = workspace_slice(*x.workspace, WorkspaceId::cgrid);
+    if (!slice || !slice->data)
+      return fail(error, FV3_GPU_INVALID_ARGUMENT, api,
+                  "WorkspaceId::cgrid slice is unavailable");
+    const uint64_t ni = static_cast<uint64_t>(b.ie - b.is + 1) + 2 * b.halo_width;
+    const uint64_t nj = static_cast<uint64_t>(b.je - b.js + 1) + 2 * b.halo_width;
+    const uint64_t block_values = ni * nj * static_cast<uint64_t>(km + 1);
+    if (slice->bytes < kUpdateDzCArrays * block_values * sizeof(fv_real))
+      return fail(error, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                  "WorkspaceId::cgrid is too small for update_dz_c's five "
+                  "(ni x nj x npz+1) scratch arrays");
+    auto *arena = static_cast<fv_real *>(slice->data);
+    auto carve3 = [&](uint64_t n) {
+      cgrid::FieldView<fv_real, 3> v{};
+      v.data = arena + n * block_values;
+      v.lower[0] = isd; v.lower[1] = jsd; v.lower[2] = 0;
+      v.stride[0] = 1;
+      v.stride[1] = static_cast<int64_t>(ni);
+      v.stride[2] = static_cast<int64_t>(ni * nj);
+      return v;
+    };
+
+    cgrid::UpdateDzCArgs a{};
+    a.bounds = {b.is, b.ie, b.js, b.je, b.npz};
+    a.npx = static_cast<int32_t>(topo.npx);
+    a.npy = static_cast<int32_t>(topo.npy);
+    a.km = km;
+    a.dt = static_cast<fv_real>(p.dt2);   // dyn_core.F90:577 passes dt2
+    a.dz_min = static_cast<fv_real>(cfg.dz_min);
+    a.grid_type = cfg.grid_type;
+    a.sw_corner = topo.sw_corner; a.se_corner = topo.se_corner;
+    a.ne_corner = topo.ne_corner; a.nw_corner = topo.nw_corner;
+    a.ut = cgrid::make_view<const fv_real, 3>(*v_ut);
+    a.vt = cgrid::make_view<const fv_real, 3>(*v_vt);
+    a.dp0 = cgrid::make_view<const fv_real, 1>(*v_dp0);
+    a.gz = cgrid::make_view<fv_real, 3>(*v_gz);
+    a.zs = cgrid::make_view<const fv_real, 2>(*v_zs);
+    a.area = cgrid::make_view<const fv_real, 2>(*v_area);
+    a.ws = cgrid::make_view<fv_real, 2>(*v_ws3);   // dyn_core.F90:577 passes ws3
+    a.gz2 = cgrid::level_slice<fv_real>(carve3(0), 0);
+    a.xfx = carve3(1);
+    a.yfx = carve3(2);
+    a.fx  = carve3(3);
+    a.fy  = carve3(4);
+
+    cgrid::CornerFillArgs corner{};
+    corner.npx = a.npx; corner.npy = a.npy;
+    corner.sw_corner = a.sw_corner; corner.se_corner = a.se_corner;
+    corner.ne_corner = a.ne_corner; corner.nw_corner = a.nw_corner;
+
+    /* nh_utils.F90:113 `do 6000 k=1,km+1`. The loop is serialised on one stream
+     * because gz2 is a single reused level buffer, exactly as it is a per-k
+     * OpenMP-private local in Fortran. launch_update_dz_c_interface issues the
+     * whole level body including the two fill_4corners calls at :162 and :174,
+     * which sit between the gz2 copy and each flux phase and therefore cannot be
+     * hoisted out of the loop. */
+    for (int64_t k = 1; k <= km + 1; ++k) {
+      const fv3_gpu_status s =
+          cgrid::launch_update_dz_c_interface(a, corner, k, stream);
+      if (s != FV3_GPU_SUCCESS)
+        return fail(error, s, api, "update_dz_c interface level launch failed");
+    }
+
+    // nh_utils.F90:194-205, after the level loop closes.
+    fv3_gpu_status s = cgrid::launch_update_dz_c_finalize(a, stream);
+    if (s != FV3_GPU_SUCCESS)
+      return fail(error, s, api, "update_dz_c finalize launch failed");
+  }
+
+  /* ---- Phase 3: Riem_Solver_C (dyn_core.F90:583) ---- */
+  {
+    const int rc = launch_riem_solver_c_ctx(x, error);
+    if (rc != FV3_GPU_SUCCESS) return rc;
+  }
+
+  /* gz and pkc are now updated over is-1..ie+1 / js-1..je+1 only, which is
+   * exactly what p_grad_c (dyn_core.F90:614) reads -- Fortran performs no halo
+   * exchange between :583 and :614 either. Their halo rings are therefore stale
+   * with respect to the newly written interior, and any later consumer that
+   * needs a wider stencil must exchange first.
+   *
+   * H_ZH is NOT marked stale: this group does not write zh after phase 1, and
+   * dyn_core exchanges zh separately at :931 (i_pack(4)) once d_sw has run. */
+  return FV3_GPU_SUCCESS;
 }
 
 } // namespace fv3::gpu::vertical
