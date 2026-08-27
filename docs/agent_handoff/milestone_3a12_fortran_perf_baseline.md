@@ -2,131 +2,73 @@
 
 Base commit at start of work: `466e4a8` (branch `cuda/gpu-bringup`)
 
-Status: **FORTRAN PERFORMANCE BASELINE BLOCKED**
+Status: **FORTRAN-CUDA PERFORMANCE BASELINE ESTABLISHED — READY FOR PROMPT 6A**
 
-No source, build, or CI files were modified for this milestone. This document
-records the investigation and the exact dependency that blocks it, per
-Section 16/20 of the task prompt ("do not spend multiple sessions rebuilding
-GEOS infrastructure merely to get a timing number").
+This document supersedes an earlier draft of this same milestone (previously
+recorded as BLOCKED) after locating a working, already-buildable standalone
+GEOSfvdycore fixture on Discover that reaches `dyn_core` at the required
+problem sizes via its own `fv_dynamics.F90`
+`timing_on('DYN_CORE')`/`timing_off('DYN_CORE')` instrumentation, without
+writing any new driver code and without a full physics-enabled GEOSgcm run.
+
+No CUDA source was modified. No authoritative Fortran source was modified.
+All configuration changes are runtime resource-file content generated inside
+an experiment job script (`fv3.j`), not committed source.
 
 ---
 
 ## Section 1 — Authoritative Fortran source: RESOLVED
 
-Required: GEOS-ESM/GFDL_atmos_cubed_sphere, tag `geos/v3.0.0`, SHA
-`ca30e26305fda43831095334c02a3f5e0b8c0c45`.
+Fixture: `/discover/nobackup/projects/imvi-nse/jli30/GEOSfvdycore_fortran_perf`
+(a standalone GEOSfvdycore build/run tree, independent of both the CUDA
+repository and the `GEOSgcm` tree referenced in the earlier draft of this
+document).
 
-Two independent, already-present locations on Discover confirm this exact
-revision. Neither required cloning:
+- Fixture repo HEAD: `8ba7bdd4f7f647cb6e6d70060c131e20938f1f0c`
+- `@FVdycoreCubed_GridComp` layer HEAD:
+  `ac43844bae40dcc9558deda85c7aeebb4d06cf41`
+- `@fvdycore` (GFDL_atmos_cubed_sphere) SHA:
+  `ca30e26305fda43831095334c02a3f5e0b8c0c45`, tag `geos/v3.0.0`
 
-1. **Pristine standalone checkout:**
-   `/gpfsm/dnb06/projects/p295/jli30/fv3_reference/GFDL_atmos_cubed_sphere`
-   Detached HEAD, `git rev-parse HEAD` = `ca30e26305fda43831095334c02a3f5e0b8c0c45`,
-   tag `geos/v3.0.0`, remote
-   `https://github.com/GEOS-ESM/GFDL_atmos_cubed_sphere.git`, clean tree.
+This is the exact same authoritative revision identified (but not run) in the
+earlier draft of this milestone via two independent checkouts. It confirms
+the fixture uses the correct pinned authoritative source.
 
-2. **`@fvdycore` submodule inside a fully-built production GEOSgcm model:**
-   `/gpfsm/dnb06/projects/p295/jli30/GEOSgcm/src/Components/@GEOSgcm_GridComp/GEOSagcm_GridComp/GEOSsuperdyn_GridComp/@FVdycoreCubed_GridComp/@fvdycore`
-   `git rev-parse HEAD` = `ca30e26305fda43831095334c02a3f5e0b8c0c45` — an
-   independent, exact match to location (1). GEOSgcm's own `components.yaml`
-   pins `fvdycore` to tag `geos/v3.0.0`. GEOSgcm HEAD is
-   `3d2ea6aa083e196b49081d11f8c9be6f616e630c`, and its
-   `@FVdycoreCubed_GridComp` layer (HEAD `ac43844bae40dcc9558deda85c7aeebb4d06cf41`,
-   remotes `nasa-nccs-hpda/FVdycoreCubed_GridComp` and
-   `GEOS-ESM/FVdycoreCubed_GridComp`) is a completely separate git working
-   tree from the repository this project develops CUDA code in.
+**Executable used:**
+`/discover/nobackup/projects/imvi-nse/jli30/GEOSfvdycore_fortran_perf/install/bin/StandAlone_FV3_Dycore.x`
+(pre-existing standalone dyn_core driver shipped with GEOSfvdycore — not
+written for this milestone).
 
-**Authoritative source path used for inspection:**
-`/gpfsm/dnb06/projects/p295/jli30/fv3_reference/GFDL_atmos_cubed_sphere`
-**Authoritative SHA confirmed:** `ca30e26305fda43831095334c02a3f5e0b8c0c45` (matches required)
+**Compiler:** Intel `ifort` (`/usr/local/intel/oneapi/2024/compiler/2024.2`),
+CMake `Release` build, flags:
+`-O3 -march=core-avx2 -align array32byte -traceback -assume realloc_lhs
+-qopt-report0 -align dcommons -fno-alias -fp-model fast=1 -fp-model source
+-fp-model consistent -no-fma -fimf-arch-consistency=true
+-fp-speculation=safe -fpe1 -assume noold_maxminloc -diag-disable 10121
+-diag-disable 10448`.
 
-`@fvdycore` inside this repository was NOT populated. No cloning was
-performed. The "Do NOT clone an arbitrary latest branch" and BLOCKED escape
-valves in Section 1 were not triggered — the exact revision was obtained
-safely, twice, independently.
+Note: this fixture is Intel-compiler-based, not the GCC/nvhpc-byo-compiler
+stack used for CUDA bring-up. Per `docs/agent_instructions/project_architecture.md`'s
+compiler-family/ABI caveat, this is acceptable here because the Fortran
+baseline is a fully separate standalone executable with no linkage to the
+CUDA runtime — no ABI compatibility claim is made or needed for this
+milestone.
 
 ---
 
-## Section 2 — Search for an existing Fortran driver: RESOLVED (none found)
+## Section 2 — Driver: RESOLVED (existing standalone executable used, no new driver written)
 
-Searched both `GFDL_atmos_cubed_sphere` (the authoritative source) and
-`FVdycoreCubed_GridComp` (this repository) for anything that reaches
-`dyn_core` directly with usable timing output, before considering building
-new code, per the explicit instruction "Prefer reusing an existing executable
-if it reaches dyn_core directly."
+`StandAlone_FV3_Dycore.x` already builds a genuine six-tile cubed-sphere FMS
+`mpp_domains_mod` domain, populated grid/flags/nest derived types, and real
+`group_halo_update_type` MPI halo-exchange packs via its normal
+`fv_control_mod` initialization/lifecycle — i.e. exactly the infrastructure
+that the earlier draft of this document identified as the blocking
+dependency for a hand-written driver (Section 2.2 of the prior draft). Using
+this pre-existing executable instead of writing a new one avoids duplicating
+that infrastructure and avoids the "extensive framework work" scope creep the
+task explicitly says to avoid.
 
-### 2.1 Standalone drivers in the source tree
-
-`grep -rl '^\s*program\s'` across the whole authoritative checkout finds only:
-
-- `model/tp-core-driver/main.f90` — drives `tp_core.F90`'s `fv_tp_2d` only.
-- `model/mapz-driver/main.F90` — drives `fv_mapz.F90` only.
-- `geos_utils/cub2latlon_driver.F90`, `geos_utils/CUB2CUB/cub2cub_driver.F90` —
-  regridding utilities, unrelated to dyn_core.
-- `model/tp-core-driver/test.F90` — an apparently-unused/leftover CUDA-Fortran
-  (`cudafor`) GPU-vs-CPU leaf-kernel timing harness for `fv_tp_2d`. It is not
-  referenced by `model/tp-core-driver/CMakeLists.txt`, which instead builds
-  `driver_cpu.f90` + `main.f90`.
-
-`esma_add_subdirectories` in the top-level `CMakeLists.txt` registers only
-`model/mapz-driver` and `model/tp-core-driver`. **No dyn_core-level driver
-exists anywhere in the authoritative source tree.**
-
-### 2.2 Why the existing leaf-routine drivers cannot be extended to dyn_core
-
-`tp-core-driver` reaches `fv_tp_2d` using hand-written stubs in place of real
-infrastructure:
-
-```
-model/tp-core-driver/stubs/fv_mp_mod_stub.F90    (11 lines)
-model/tp-core-driver/stubs/fv_grid_utils_stub.F90 (11 lines)
-model/tp-core-driver/stubs/fv_arrays_stub.F90     (103 lines)
-```
-
-The `fv_mp_mod_stub.F90` stub in full:
-
-```fortran
-module fv_mp_mod
-  implicit none
-  private
-  public ng
-  integer, parameter :: ng = 3
-end module fv_mp_mod
-```
-
-This is the entire replacement for `fv_mp_mod` used by the driver — it
-supplies nothing but the halo-width constant. `tp_core`'s `fv_tp_2d` operates
-on a single in-memory 2D tile array; it has no structural dependency on real
-inter-tile communication, so a one-line stub is sufficient and the driver
-never touches `mpp_domains_mod` at all.
-
-`dyn_core` cannot be stubbed the same way. Its argument list requires real
-`fv_grid_bounds_type`/`fv_grid_type`/`fv_flags_type`/`fv_nest_type` derived
-types (normally built by `fv_control_mod`'s initialization), a live FMS
-`domain2D` (`mpp_domains_mod`), and an array of `group_halo_update_type`
-packs (`fv_mp_mod`'s `start_group_halo_update`/`complete_group_halo_update`).
-Six-tile cubed-sphere cross-tile boundary exchange is not incidental
-plumbing here — it is structurally part of dyn_core's numerics (C-grid/D-grid
-edge and corner handling across tile seams), which is exactly what this
-project's own CUDA benchmark had to implement and separately verify for
-liveness (Milestone 3A.11V §4.3, `fv3_dispatch_smoke` Phase E). A
-`fv_mp_mod` stub that returns a constant instead of performing real halo
-exchange would silently make the Fortran side do materially less work than
-the CUDA side — violating the task's own "meaningfully equivalent work"
-requirement rather than satisfying it. There is no existing precedent in this
-codebase for stubbing dyn_core's communication dependency this cheaply.
-
-### 2.3 GEOSgcm — a full production model already built at the exact pinned SHA
-
-`/gpfsm/dnb06/projects/p295/jli30/GEOSgcm` is a completed CMake/ecbuild
-configure+build (not just a source checkout): `build/lib/libfvdycore.a`,
-`build/lib/libFVdycoreCubed_GridComp.a`, `install/lib/libfvdycore.a`,
-`install/lib/libFVdycoreCubed_GridComp.a` all exist, `dyn_core.F90.o` is
-compiled with its `.mod` present, and a top-level model executable exists at
-`install/bin/GEOSgcm.x`.
-
-`fv_dynamics.F90` (the caller of `dyn_core`) already instruments the call
-with the project's own timing module:
+`fv_dynamics.F90` wraps the call with:
 
 ```fortran
 call timing_on('DYN_CORE')
@@ -134,102 +76,168 @@ call dyn_core(npx, npy, npz, ng, sphum, nq, mdt, k_split, n_split, ...)
 call timing_off('DYN_CORE')
 ```
 
-This is exactly the kind of built-in instrumentation that could, in
-principle, yield a per-call Fortran dyn_core time without writing new driver
-code — but only from a run of `GEOSgcm.x`, which requires full model
-bootstrap (MAPL/ESMF GridComp hierarchy, resource-file parsing, boundary
-condition and restart datasets, ExtData). This is precisely what Section 4
-says to avoid "if avoidable."
-
-An already-staged GEOSgcm experiment was found at
-`/gpfsm/dnb06/projects/p295/jli30/fv3_runs/fv3_baseline/scratch_c24_L181_T2_4x24_1threads_GEOSgcm-v11.10.1-R4R8/`
-— a completed multi-hour, full-physics AMIP-style run (hourly netCDF
-diagnostic output spanning `1891-03-01` through `1891-03-02`) at cube-24,
-181 vertical levels. This run:
-
-- is resolution `c24`/`L181`, not `8×8`, `16×16`, or `32×32` at 10 levels;
-- includes full physics, not "no physics outside dyn_core";
-- represents someone's completed baseline validation output and must not be
-  disturbed or reused/mutated for an unrelated purpose ("Do not discard or
-  reset existing work without explicit instruction").
-
-It confirms that GEOSgcm.x is runnable on this system, but it does **not**
-provide, and cannot be repurposed without a fresh reconfiguration effort to
-provide, a dyn_core-only timing at the required problem sizes.
-
-**Conclusion of Section 2: no existing executable, driver, or artifact reaches
-dyn_core directly at the required problem sizes with usable timing output.**
-A new mechanism would have to be built.
+`fv_timing_mod`'s accumulated `DYN_CORE` total (seconds, printed once per run
+in the `timing_prt` table) divided by the number of `dyn_core` calls in that
+run is the primary metric reported below.
 
 ---
 
-## Section 3 — Comparability classification: NOT COMPARABLE (no viable harness within scope)
+## Section 3 — Comparability classification: EQUIVALENT (with one documented substrate difference)
 
-Two candidate mechanisms for obtaining a Fortran timing number were assessed
-against the "smallest practical" / "avoid full GEOS initialization if
-avoidable" / "do not spend multiple sessions rebuilding GEOS infrastructure"
-constraints (Sections 4 and 16):
+Both sides execute the authoritative `dyn_core` numerics at 8×8×10,
+16×16×10, and 32×32×10 (six cubed-sphere faces, `npz=10`), R8, `n_split=3`,
+`k_split=1`, adiabatic (no physics). Both sides use exactly 6 ranks/execution
+units — one per cubed-sphere face (Fortran: `FV_NX=1`/`FV_NY=6`, 6 real MPI
+ranks; CUDA: 6 tiles on 1 GPU, Milestone 3A.11).
 
-**(a) Reconfigure/rerun GEOSgcm.x at low resolution (c8/c16/c32, L10, dyn_core
-only).** This requires full MAPL/ESMF/ExtData bootstrap regardless of grid
-size — the "full GEOS initialization" the prompt says to avoid — plus
-locating or fabricating boundary-condition/restart data at three new,
-non-standard resolutions, plus disabling every physics GridComp so only
-dyn_core executes, plus locating or building an AGCM.rc/fvcore_layout.rc
-configuration that supports `npz=10` and `n_split=3` at those grid sizes.
-No such configuration is currently staged anywhere found on Discover. This is
-open-ended GEOS-experiment engineering, not a quick timing run.
-
-**(b) Write a new minimal Fortran driver that calls `dyn_core` directly,**
-linking against GEOSgcm's already-built `libfvdycore.a` (compilation itself
-is not the blocker — it is already done). This requires constructing, from
-scratch, the pieces that `fv_control_mod`'s initialization sequence normally
-builds: a genuine FMS `mpp_domains_mod` six-tile cubed-sphere mosaic/`domain2D`
-(tile connectivity, halo width, corner handling), populated
-`fv_grid_bounds_type`/`fv_grid_type`/`fv_flags_type`/`fv_nest_type`/
-`fv_diag_type` derived types, and an array of `group_halo_update_type` packs
-via `fv_mp_mod`'s `start_group_halo_update`. As shown in Section 2.2, no
-existing stub pattern in this codebase provides a shortcut for this — the one
-precedent driver (`tp-core-driver`) stubs communication down to a single
-constant specifically because its target routine has no real cross-tile
-dependency, and dyn_core's does. Building this correctly is materially the
-same class of work as re-implementing a meaningful subset of
-`fv_control_mod`'s grid/domain initialization — not a "smallest practical"
-wrapper around an existing lifecycle.
-
-Both paths cross into "extensive framework work" as described in Section 16.
-Per that section's explicit instruction, this is reported as **BLOCKED**
-rather than attempted piecemeal across additional sessions.
-
-**Comparability classification: NOT COMPARABLE** — no Fortran-side timing
-artifact exists, or can be produced within the stated scope, to compare
-against the CUDA medians.
+**Documented substrate difference (not a normalized hardware-efficiency
+comparison, per Section 15 of the task prompt):** the Fortran side performs
+real inter-process MPI halo exchange across 6 ranks on CPU; the CUDA side
+performs its own device-side halo exchange across 6 tiles resident on a
+single GPU (Milestone "Implement FV3 GPU cubed-sphere halo exchange",
+commit `b0b1266`). This is a hardware/communication-substrate difference
+intrinsic to comparing a multi-process CPU run against a single-GPU run, not
+a scope or numerics difference in `dyn_core` itself.
 
 ---
 
-## Sections 4–15 — Not attempted
+## Section 4 — Resolution / configuration mapping
 
-No driver was built (Section 4), no IC matching was performed (Section 5), no
-compiler/build configuration was established for a Fortran benchmark
-(Section 6), no CPU resource baseline was measured (Sections 7–8), no timing
-loop was implemented or run (Sections 9–11), and consequently no speedup
-ratios were computed (Sections 12–14), consistent with Section 16's
-instruction to stop rather than continue once the "extensive framework work"
-threshold is reached.
+| Grid  | `AGCM_IM`/`FV3_NPX-1` | `RUN_DT` (s) | `JOB_SGMT` | Calls/rep |
+|-------|-----------------------|--------------|------------|-----------|
+| 8×8   | 8                     | 3600         | 7 days     | 168       |
+| 16×16 | 16                    | 1800         | 7 days     | 336       |
+| 32×32 | 32                    | 1200         | 7 days     | 504       |
 
-## Section 15 — Numerical validation boundary
+`npz = 10` (`AGCM_LM=10`) for all three. Call counts were independently
+confirmed via MAPL's own profiler (`MAPL_ENABLE_TIMERS: YES` in `CAP.rc`),
+whose `--------DYN_CORE` row reports an exact `# cycles` column matching the
+expected count in every one of the 15 reps run.
 
-Unaffected by this milestone. Numerical validation against authoritative
-runtime Fortran savepoints remains **NOT RUN**, as recorded in prior
-milestones. This document does not claim any Fortran/CUDA numerical
-equivalence.
+**Runtime layout:** `FV_NX=1`, `FV_NY=6` in each experiment's `fv3.j` (6
+total MPI ranks, one per cubed-sphere face — the minimal layout, edited from
+`fv3_setup`'s much larger per-resolution defaults, e.g. 4×24=96 ranks at
+IM=16 and 6×36=216 ranks at IM=32).
+
+**`n_split`/`k_split`:** added `k_split = 1` / `n_split = 3` to each
+experiment's `&fv_core_nml`. Verified on every run via both of
+`fv_control.F90`'s independent runtime echoes: `"Using n_split from the
+namelist: 003"` and `"FV3 n_split:   3"`.
+
+**Vertical eta levels (`AK:`/`BK:`):** the GMAO-specific `m_set_eta`
+implementation (`src/Shared/@GMAO_Shared/GMAO_hermes/m_set_eta.F90`) — which
+is what `DynCore_GridCompMod.F90` actually calls (`use m_set_eta, only:
+set_eta`), not `@fvdycore`'s own `fv_eta_mod::set_eta` — has no lookup-table
+entry for `km=10` and silently returns all-zero AK/BK via a "Bad KM"
+fallback, tripping an assertion at `DynCore_GridCompMod.F90:8235`
+(`_ASSERT(ANY(AK /= 0.0) .or. ANY(BK /= 0.0), ...)`). Fix: supply `AK:`/`BK:`
+directly in each experiment's `AGCM.rc` (11 values each, one per line,
+strictly below the label per `ESMF_ConfigFindLabel`/`ESMF_ConfigNextLine`
+semantics), which makes `DynCore_GridCompMod.F90` skip the `set_eta` call
+entirely. Values used are the generic hybrid sigma-pressure construction
+found in `@fvdycore`'s own (unused-here, but algorithmically identical)
+`fv_eta_mod::set_eta` `case default` branch: `pt=100 Pa`, `pint = pt +
+1e5/km`, uniform sigma spacing below, producing a monotonic edge-pressure
+profile from 100 Pa (top) to 100000 Pa (surface). This is a config-only
+change (no source modified) and does not alter any scientific algorithm —
+`@fvdycore`'s own set_eta would have produced the same values had it been
+the one called.
+
+**`COLLECTIONS:` (MAPL History):** kept at the default two collections
+(`inst3_3d_diag`, `inst1_2d_diag`). An earlier attempt to set this fully
+empty (`COLLECTIONS: ::`) to minimize non-dyn_core work crashed
+`MAPL_HistoryGridComp.F90` (`"Premature end of fields list"`, status=41) —
+MAPL's History component cannot parse a zero-collection list. Reverted to
+default; History overhead is excluded from the reported metric regardless,
+since the metric is `fv_timing_mod`'s own `DYN_CORE`-scoped accumulator, not
+wall-clock.
+
+**Sanity checks:** `range_warn = .T.` (NaN/Inf/out-of-bound monitoring)
+enabled in `&fv_core_nml` for all runs; `fv_debug = .F.` kept off to avoid
+timing contamination. All 15 reps (5 per grid size) were grepped for
+`FAIL`/`error`/`abort`/`nan`/any `range_warn` trigger and all 15 were clean.
+Slurm exit `Status = 0` confirmed for all 15.
 
 ---
 
-## Existing CUDA reference numbers (unchanged, from Milestone 3A.11)
+## Section 5 — Methodology (statistical baseline via repeated full-length runs)
+
+`fv_timing_mod` has no reset hook or exposed call counter, so a single
+`dyn_core` call cannot be isolated by resetting the timer between calls.
+Instead, each experiment's `JOB_SGMT` was set to 7 model-days, producing
+168/336/504 `dyn_core` calls per run (dominating any one-time
+initialization skew), and mean ms/call was computed as the accumulated
+`DYN_CORE` total from the `timing_prt` table divided by the call count. Each
+grid size was run 5 times (5 independent `sbatch` submissions); min / median
+/ mean / max are reported, with **median as the primary number**.
+
+Each run's `tee`'d scratch log was copied to a permanently-named `rep{N}.log`
+immediately after completion and before the next submission, since the
+`fv3.j` `tee` redirect overwrites the same log path on every resubmission of
+the same experiment.
+
+---
+
+## Section 6 — Hardware and run identity
+
+- Platform: NASA NCCS Discover, Slurm `--constraint=mil` (AMD Milan CPU
+  nodes), `--nodes=1 --ntasks-per-node=120`, 6 MPI ranks actually used per
+  run (`esma_mpirun -np 6`).
+- Compute nodes used (via `sacct`): IM=8/IM=16 reps on assorted `mil`
+  partition nodes; IM=32 reps confirmed on `borgl161`.
+- Each run completed in 32–44 s wall-clock (Slurm `Elapsed`), well within
+  the "keep turnaround short" instruction.
+
+---
+
+## Section 7 — Fortran timings (all 15 reps, 3 grid sizes)
+
+### 8×8×10 (168 calls/rep)
+
+| Rep | `DYN_CORE` total (s) | ms/call |
+|-----|-----------------------|---------|
+| 1   | 2.1166                | 12.599  |
+| 2   | 2.1480                | 12.786  |
+| 3   | 2.1492                | 12.793  |
+| 4   | 2.1387                | 12.730  |
+| 5   | 2.1187                | 12.611  |
+
+min = 12.599, **median = 12.730**, mean = 12.704, max = 12.793 ms/call
+
+### 16×16×10 (336 calls/rep)
+
+| Rep | `DYN_CORE` total (s) | ms/call |
+|-----|-----------------------|---------|
+| 1   | 5.5631                | 16.557  |
+| 2   | 5.7042                | 16.977  |
+| 3   | 5.6127                | 16.704  |
+| 4   | 5.6324                | 16.763  |
+| 5   | 5.5756                | 16.594  |
+
+min = 16.557, **median = 16.704**, mean = 16.719, max = 16.977 ms/call
+
+### 32×32×10 (504 calls/rep)
+
+| Rep | `DYN_CORE` total (s) | ms/call |
+|-----|-----------------------|---------|
+| 1   | 15.2044               | 30.168  |
+| 2   | 15.0942               | 29.949  |
+| 3   | 15.2516               | 30.261  |
+| 4   | 15.2554               | 30.269  |
+| 5   | 15.3686               | 30.494  |
+
+min = 29.949, **median = 30.261**, mean = 30.228, max = 30.494 ms/call
+
+All 15 reps: `n_split` confirmed = 3 (both echoes) on every rep; 0 of 15
+reps showed any FAIL/error/abort/NaN/range_warn trigger; call count
+independently confirmed via MAPL profiler `# cycles` on every rep.
+
+---
+
+## Section 8 — CUDA reference numbers (unchanged, from Milestone 3A.11)
 
 R8, one A100, `warpa003`, PRE-VALIDATION, resident/transfer-inclusive median
-of 100 timed calls after 20 warmup, both modes, no environment overrides:
+of 100 timed calls after 20 warmup, 5 reps, median:
 
 | Grid  | CUDA resident (ms/call) | CUDA transfer-inclusive (ms/call) |
 |-------|--------------------------|-------------------------------------|
@@ -237,44 +245,63 @@ of 100 timed calls after 20 warmup, both modes, no environment overrides:
 | 16×16 | 29.690                   | 30.896                              |
 | 32×32 | 28.827                   | 31.178                              |
 
-These numbers are unchanged by this milestone; no Fortran counterpart exists
-to compute a speedup ratio against them.
+---
+
+## Section 9 — Performance matrix and speedup ratios
+
+Speedup ratio = Fortran ms/call ÷ CUDA ms/call (>1 means CUDA faster; <1
+means the Fortran/CPU path is faster at this problem size).
+
+| Grid  | Fortran median (ms/call) | CUDA resident (ms/call) | CUDA transfer-incl. (ms/call) | Resident speedup | Transfer-incl. speedup |
+|-------|---------------------------|---------------------------|----------------------------------|-------------------|--------------------------|
+| 8×8   | 12.730                    | 28.332                    | 29.358                           | 0.449×            | 0.434×                   |
+| 16×16 | 16.704                    | 29.690                    | 30.896                           | 0.563×            | 0.541×                   |
+| 32×32 | 30.261                    | 28.827                    | 31.178                           | 1.050×            | 0.971×                   |
+
+**Finding:** at these small problem sizes (8×8×10 through 32×32×10, 6
+ranks/tiles), the persistent-GPU-resident CUDA `dyn_core` path is *slower*
+per call than the 6-rank CPU Fortran path at 8×8 and 16×16 (by roughly 1.8×–
+2.3×), and only reaches approximate parity at 32×32 (a modest 5% CUDA
+advantage on resident-only timing; still slightly slower once
+transfer-inclusive). This is consistent with fixed per-call GPU kernel
+launch/synchronization overhead not yet being amortized by problem size at
+these small per-tile grids (max 32×32 points per face). This finding is
+reported as measured; per Section 3/15 of the governing task prompt, it is
+not a normalized hardware-efficiency comparison (6 real CPU MPI ranks vs. 1
+GPU), and no conclusion about CUDA implementation correctness or quality is
+implied — only relative wall-clock at these specific small problem sizes.
 
 ---
 
-## Section 18 — Git discipline
+## Section 10 — Numerical validation boundary
 
-No authoritative Fortran was modified. No driver/wrapper code was created,
-because none could be justified within the scope of this milestone (see
-Section 3). Nothing was built. This document is the only file added by this
-milestone; it will be committed on its own. No build directories,
-executables, Slurm logs, or timing logs are added.
+Unaffected by this milestone. Numerical validation against authoritative
+runtime Fortran savepoints remains **NOT RUN**. This document does not claim
+any Fortran/CUDA numerical equivalence — only relative timing.
 
 ---
 
-## Caveats
+## Section 11 — Git / artifact discipline
 
-- This investigation used only pre-existing artifacts on Discover (two
-  independent checkouts of the pinned SHA, one fully-built GEOSgcm tree, one
-  unrelated staged c24/L181 GEOSgcm experiment). Nothing was cloned, built,
-  configured, or run for this milestone.
-- The blocking dependency is specific and actionable if a future milestone is
-  explicitly scoped for it: construct a genuine FMS six-tile cubed-sphere
-  `mpp_domains_mod` domain plus the `fv_control_mod`-equivalent derived-type
-  population (`gridstruct`/`flagstruct`/`neststruct`/`idiag`/`bd`) required by
-  `dyn_core`'s signature (`model/dyn_core.F90:163-223`), OR obtain/construct a
-  GEOSgcm experiment configuration at c8/c16/c32 with `npz=10`, `n_split=3`,
-  and all non-dyn_core physics disabled.
-- `fv_dynamics.F90`'s existing `timing_on('DYN_CORE')`/`timing_off('DYN_CORE')`
-  instrumentation (around the `call dyn_core(...)` at
-  `model/fv_dynamics.F90:645`) is a genuine, reusable asset for a future
-  attempt via path (a) above — it does not need to be added.
+No authoritative Fortran (`@fvdycore`, `GMAO_Shared`) was modified. No CUDA
+source was modified. All configuration changes (AK/BK override, COLLECTIONS
+revert, `FV_NX`/`FV_NY`, `JOB_SGMT`, `n_split`/`k_split`, `range_warn`) are
+generated resource-file content inside each experiment's `fv3.j` job script,
+which itself lives inside the GEOSfvdycore fixture
+(`/discover/nobackup/projects/imvi-nse/jli30/GEOSfvdycore_fortran_perf/experiments/{c8,c16,c32}_L10_dyncore_perf/`),
+not inside this CUDA repository. Only this handoff document is added to the
+CUDA repository by this milestone. No build directories, executables, Slurm
+logs, or scratch/timing logs from the fixture are added here.
 
 ---
 
 ## PRE-VALIDATION notice
 
-All numbers in this document (the unchanged CUDA reference table) remain
-PRE-VALIDATION. No Fortran baseline was produced this milestone.
-**Numerical validation against authoritative runtime Fortran savepoints:
-NOT RUN.**
+All numbers in this document (both the newly-measured Fortran baseline and
+the unchanged CUDA reference table) remain PRE-VALIDATION. **Numerical
+validation against authoritative runtime Fortran savepoints: NOT RUN.**
+This milestone measured relative wall-clock performance only.
+
+---
+
+**FORTRAN-CUDA PERFORMANCE BASELINE ESTABLISHED — READY FOR PROMPT 6A**
