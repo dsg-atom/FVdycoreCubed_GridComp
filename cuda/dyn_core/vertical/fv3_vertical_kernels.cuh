@@ -44,8 +44,32 @@ int launch_dgrid_height_stage(const ExecutionContext &, fv3_gpu_error *);
 // Requires WorkspaceId::vertical slice with sufficient capacity.
 int launch_vertical_solver(const ExecutionContext &, fv3_gpu_error *);
 
+/* C-grid vertical PRE-HALO part (Milestone 3A.11S).
+ *
+ * dyn_core.F90:436-455 reconstructs gz's INTERIOR (is:ie, js:je) from delz, and
+ * :459 only then starts the gz halo exchange that :552 completes. The producer
+ * therefore runs strictly BEFORE the exchange packs anything.
+ *
+ * That ordering cannot be expressed if the reconstruction lives inside the same
+ * opaque LaunchFn as the post-exchange work, because the runtime has no point at
+ * which to resolve H_GZ_FIRST in between. So the reconstruction is its own stage:
+ *
+ *   cgrid_vertical_pre_halo  ->  resolve(H_GZ_FIRST)  ->  cgrid_vertical_solver
+ *
+ * Gated on acoustic_index == 0, matching Fortran's `if (it==1)` at :433. A no-op
+ * for it > 1, where gz is restored from zh instead of rebuilt from delz.
+ *
+ * Numerical algorithm changed: NO. This is the identical gz_from_delz_kernel
+ * launch that previously opened launch_cgrid_vertical_solver, relocated. */
+int launch_cgrid_vertical_pre_halo(const ExecutionContext &, fv3_gpu_error *);
+
 // C-grid vertical solver entry for WP-A. Shares column solver primitives
 // but has different orchestration scope (pressure outputs only).
+//
+// POST-HALO part as of Milestone 3A.11S: assumes launch_cgrid_vertical_pre_halo
+// has already reconstructed gz's interior and that H_GZ_FIRST has been resolved
+// from it. Still require()s H_GZ_FIRST, so a runtime that forgets the pre-halo
+// stage fails loudly rather than running on a stale halo.
 int launch_cgrid_vertical_solver(const ExecutionContext &, fv3_gpu_error *);
 
 // Workspace sizing and layout from fv3_vertical_column.hpp.

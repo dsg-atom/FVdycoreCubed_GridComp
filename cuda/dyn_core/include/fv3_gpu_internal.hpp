@@ -338,6 +338,19 @@ using LaunchFn = int (*)(const ExecutionContext &, fv3_gpu_error *);
 struct NumericalDispatch {
   uint32_t contract_version=internal_contract_version;
   LaunchFn cgrid_predictor=nullptr;
+  /* Milestone 3A.11S. dyn_core.F90 reconstructs gz's interior from delz at
+   * :436-455 and only then starts the gz halo exchange at :459, completing it at
+   * :552. Expressing that requires a resolve point BETWEEN the reconstruction
+   * and the rest of the C-grid vertical group, so the group is two slots:
+   *
+   *   cgrid_vertical_pre_halo -> resolve(H_GZ_FIRST) -> cgrid_vertical_solver
+   *
+   * Additive slot on an internal C++ contract, and the runtime skips null slots,
+   * so leaving it unset keeps older wiring compiling -- but such wiring will now
+   * fail loudly at cgrid_vertical_solver's require(H_GZ_FIRST) rather than run
+   * on a stale halo. Same additive-tail argument as ExecutionContext::dispatch;
+   * it does not move internal_contract_version. */
+  LaunchFn cgrid_vertical_pre_halo=nullptr;
   LaunchFn cgrid_vertical_solver=nullptr;
   LaunchFn cgrid_pressure=nullptr;
   LaunchFn dgrid_dynamics=nullptr;

@@ -4,11 +4,16 @@
 #include "fv3_gpu_halo_peer.hpp"
 #include "fv3_gpu_halo_topology.hpp"
 #include "fv3_gpu_types.hpp"
+#include "vertical/fv3_vertical_column.hpp"
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <new>
 #include <string>
+#include <vector>
 
 #ifdef FV3_GPU_ENABLE_CUDA
 #include <cuda_runtime_api.h>
@@ -101,6 +106,104 @@ int zero_accumulators(ContextData &d, fv3_gpu_error *e, const char *api) {
     if (rc != cudaSuccess) return cuda_fail(rc, e, api, &d);
   }
   return FV3_GPU_SUCCESS;
+}
+
+/* TEMPORARY diagnostic for the Milestone 3A.11 bounded cross-step NaN pass.
+ * Gated on FV3_GPU_DEBUG_FAIL and model_step>=1 (call #2 onward) so it is a
+ * no-op in every normal build/run. To be reverted once the bounded pass
+ * concludes (fix applied + re-verified, or PERFORMANCE BASELINE BLOCKED). */
+void debug_check_finite_stage(ContextData &d, const char *stage, int64_t model_step) {
+  const char *dbg = std::getenv("FV3_GPU_DEBUG_FAIL");
+  if (!dbg || !*dbg) return;
+  /* BOTH streams. Syncing only the compute stream made the checkpoint itself
+   * nondeterministic: a pending unpack on the transfer stream may or may not
+   * have landed by the time the D2H copy runs, so the checksum would differ
+   * run-to-run for reasons that have nothing to do with the defect under
+   * investigation. Draining both makes each checkpoint a quiescent state.
+   *
+   * This doubles as Milestone 3A.11R §11's serialization probe: with both
+   * streams drained at every stage boundary, no cross-stream ordering gap
+   * inside a stage can survive. If corruption persists under it, a missing
+   * stream/event edge is excluded and the defect is in kernel or stage logic. */
+  cudaStreamSynchronize(static_cast<cudaStream_t>(d.compute_stream));
+  cudaStreamSynchronize(static_cast<cudaStream_t>(d.transfer_stream));
+  static const FieldId targets[] = {FieldId::u, FieldId::delp, FieldId::v, FieldId::w,
+                                     FieldId::delz, FieldId::uc, FieldId::vc, FieldId::ut,
+                                     FieldId::vt, FieldId::divgd, FieldId::crx, FieldId::cry,
+                                     FieldId::xfx, FieldId::yfx, FieldId::gz, FieldId::zh,
+                                     FieldId::pkc, FieldId::ws3};
+  static const char *names[] = {"u", "delp", "v", "w", "delz", "uc", "vc", "ut", "vt",
+                                 "divgd", "crx", "cry", "xfx", "yfx", "gz", "zh", "pkc", "ws3"};
+  for (int t = 0; t < static_cast<int>(sizeof(targets) / sizeof(targets[0])); ++t) {
+    for (auto &x : d.state.fields) {
+      if (field_id_from_abi(x.host.field_id) != targets[t]) continue;
+      const size_t count = x.host.allocation_bytes / sizeof(fv_real);
+      std::vector<fv_real> tmp(count);
+      cudaMemcpy(tmp.data(), x.device, x.host.allocation_bytes, cudaMemcpyDeviceToHost);
+      size_t bad_count = 0, first = count;
+      /* Bitwise FNV-1a over the raw bytes. A hash rather than a sum because the
+       * question this answers is "did two runs of identical code produce
+       * identical bits at this point", and a floating-point sum can collide or
+       * mask a reordered-but-equal-magnitude difference. NaN payload bits are
+       * included deliberately: they carry which operation produced them. */
+      uint64_t h = 1469598103934665603ull;
+      const auto *raw = reinterpret_cast<const unsigned char *>(tmp.data());
+      for (size_t b = 0; b < count * sizeof(fv_real); ++b) {
+        h ^= raw[b];
+        h *= 1099511628211ull;
+      }
+      for (size_t i = 0; i < count; ++i) {
+        if (std::isnan(static_cast<double>(tmp[i])) || std::isinf(static_cast<double>(tmp[i]))) {
+          ++bad_count;
+          if (first == count) first = i;
+        }
+      }
+      /* Keyed by TILE, not by context address: a heap pointer changes every run,
+       * which makes two runs' logs undiffable, and diffing them is the whole
+       * point of the checksum. */
+      std::fprintf(stderr,
+                    "[FV3DBG tile=%d step=%lld] %-28s %-6s nan/inf=%zu/%zu first_idx=%zu hash=%016llx\n",
+                    static_cast<int>(d.topology.tile), static_cast<long long>(model_step), stage, names[t],
+                    bad_count, count, first, static_cast<unsigned long long>(h));
+      /* Decode the bad cells' (i,j,k). Which CELLS go bad first separates the
+       * candidate mechanisms: an interior plane implicates the stage's own
+       * arithmetic, an edge strip implicates the halo exchange, and a 3-wide
+       * diagonal block implicates the corner halo, which a four-edge exchange
+       * never fills. */
+      if (bad_count > 0) {
+        /* DomainBounds carries only is/ie/js/je/halo_width, so the allocated
+         * halo extent is inferred: nx+2*hw for a centred field, one more for a
+         * staggered one. Pick whichever divides the element count evenly, which
+         * is unambiguous here because the two candidates differ by a full
+         * i-row. */
+        const int64_t hw = static_cast<int64_t>(d.immutable.bounds.halo_width);
+        const int64_t isd = d.immutable.bounds.is - hw;
+        const int64_t jsd = d.immutable.bounds.js - hw;
+        int64_t ni = (d.immutable.bounds.ie - d.immutable.bounds.is + 1) + 2 * hw;
+        int64_t nj = (d.immutable.bounds.je - d.immutable.bounds.js + 1) + 2 * hw;
+        if (ni > 0 && nj > 0 && count % static_cast<size_t>(ni * nj) != 0) { ++ni; ++nj; }
+        if (ni > 0 && nj > 0 && count % static_cast<size_t>(ni * nj) == 0) {
+          std::fprintf(stderr, "    [FV3DBG-IDX tile=%d step=%lld] %s %s ni=%lld nj=%lld isd=%lld is=%lld ie=%lld :",
+                       static_cast<int>(d.topology.tile), static_cast<long long>(model_step),
+                       stage, names[t], static_cast<long long>(ni), static_cast<long long>(nj),
+                       static_cast<long long>(isd), static_cast<long long>(d.immutable.bounds.is),
+                       static_cast<long long>(d.immutable.bounds.ie));
+          size_t shown = 0;
+          for (size_t i = 0; i < count && shown < 24; ++i) {
+            if (!(std::isnan(static_cast<double>(tmp[i])) || std::isinf(static_cast<double>(tmp[i])))) continue;
+            const int64_t li = static_cast<int64_t>(i);
+            std::fprintf(stderr, " (%lld,%lld,%lld)",
+                         static_cast<long long>(isd + li % ni),
+                         static_cast<long long>(jsd + (li / ni) % nj),
+                         static_cast<long long>(li / (ni * nj)));
+            ++shown;
+          }
+          std::fprintf(stderr, "%s\n", bad_count > shown ? " ..." : "");
+        }
+      }
+      break;
+    }
+  }
 }
 #endif
 
@@ -934,8 +1037,26 @@ extern "C" int fv3_gpu_initialize_state(fv3_gpu_context *c, const fv3_gpu_state_
      * scratch (8) and one slot subdivided into the per-level derived
      * coefficient arrays (1). The binder re-checks the slice against that
      * constant, so a stale literal here fails loudly instead of corrupting
-     * neighbouring scratch. */
-    if(mul_overflow(values,sizeof(fv_real),value_bytes)||mul_overflow(value_bytes,12,cgrid_bytes)||mul_overflow(value_bytes,34,transport_bytes)||mul_overflow(value_bytes,16,vertical_bytes)||mul_overflow(value_bytes,12,operator_bytes)){fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"workspace byte-size overflow");goto rollback;}
+     * neighbouring scratch.
+     *
+     * WorkspaceId::vertical is NOT sized by that same (ni x nj x npz+1) x N
+     * convention: its two consumers (launch_vertical_solver's Riem_Solver3
+     * path and RiemSolverCArgs's Riem_Solver_c path) each pack a per-column
+     * arena whose per-column scalar count is set by
+     * vertical::compute_workspace_layout()/riem_solver_c_scalars_per_column()
+     * -- 422 and 209 scalars respectively at km=10, not a flat multiple of
+     * (npz+1). It is sized here as cells x vertical_workspace_per_column(npz),
+     * using the exact Riem_Solver3 layout (its 422 > Riem_Solver_c's 209,
+     * so it also covers the narrower Riem_Solver_c consumer) over the full
+     * halo-inclusive cell count (>= either consumer's own column count). A
+     * prior flat "x16" placeholder undersized this for any grid large enough
+     * that halo padding didn't accidentally compensate (e.g. milestone
+     * 3A.11's 16x16 case: it allocated ~681KB against Riem_Solver3's actual
+     * ~864KB need), so launch_vertical_solver's workspace-capacity guard
+     * (fv3_vertical_kernels.cu) rejected every call with
+     * FV3_GPU_UNSUPPORTED_CONFIGURATION. */
+    const uint64_t vertical_bytes_per_column=vertical::vertical_workspace_per_column<fv_real>((int)c->data.create.npz);
+    if(mul_overflow(values,sizeof(fv_real),value_bytes)||mul_overflow(value_bytes,12,cgrid_bytes)||mul_overflow(value_bytes,34,transport_bytes)||mul_overflow(cells,vertical_bytes_per_column,vertical_bytes)||mul_overflow(value_bytes,12,operator_bytes)){fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"workspace byte-size overflow");goto rollback;}
     WorkspaceRequest requests[]={{WorkspaceId::cgrid,cgrid_bytes,256},{WorkspaceId::transport,transport_bytes,256},{WorkspaceId::vertical,vertical_bytes,256},{WorkspaceId::operators,operator_bytes,256}};
     if(build_workspace_layout(requests,4,c->data.workspace.layout,e)!=0)goto rollback;if(cudaMalloc(&c->data.workspace.allocation,c->data.workspace.layout.total_bytes)!=cudaSuccess)goto rollback;
     for(auto &slice:c->data.workspace.layout.slices)slice.data=(char*)c->data.workspace.allocation+slice.offset; }
@@ -1162,7 +1283,8 @@ extern "C" int fv3_gpu_dyn_core_step(fv3_gpu_context *c,const fv3_gpu_step_desc 
    *   Fortran      group        entry state          producer of readiness         made stale by            next consumer
    *   :402/:504    H_DWIND_IN   unknown | ready      resolve_halo, top of substep  (never)                  cgrid_predictor  (fv3_cgrid_predictor.cu:539)
    *   :427/:507    H_W_IN       unknown | ready      resolve_halo, top of substep  (never)                  cgrid_predictor  (:549)
-   *   :459/:552    H_GZ_FIRST   unknown              resolve_halo, it==1 only      (never)                  cgrid_vertical_solver (fv3_vertical_kernels.cu:604, acoustic_index==0)
+   *   :459/:552    H_GZ_FIRST   unknown              resolve_halo, it==1 only,     cgrid_vertical_pre_halo   cgrid_vertical_solver (fv3_vertical_kernels.cu, acoustic_index==0)
+   *                                                  AFTER cgrid_vertical_pre_halo (gz_from_delz_kernel)
    *   :528/:636    H_DIVGD      stale after predictor resolve_halo, post-predictor cgrid_predictor (:831)    dgrid_dynamics   (wp_b_contract.cpp:66)
    *   :618/:640    H_CWIND      stale after pressure resolve_halo, post-pressure   cgrid_predictor (:844),   dgrid_dynamics   (wp_b_contract.cpp:63)
    *                                                                                cgrid_pressure (fv3_cgrid.cu:122)
@@ -1180,14 +1302,29 @@ extern "C" int fv3_gpu_dyn_core_step(fv3_gpu_context *c,const fv3_gpu_step_desc 
    *                       loop already resolves. Resolving it separately would
    *                       double-count one exchange, and nothing require()s it.
    *
-   * H_GZ_FIRST is the one group whose require() site cannot be reached from
-   * here: it lives INSIDE launch_cgrid_vertical_solver, between the gz
-   * reconstruction and the gz<->zh sync, matching Fortran's :459 -> :552 split
-   * across the C-grid vertical group. So it is resolved immediately before that
-   * stage. On the only topology resolve_halo will accept, the exchange copies
-   * nothing, so resolving before rather than inside the stage skips no
-   * operation; on any other topology resolve_halo refuses outright, so the
-   * earlier placement can never manufacture a readiness claim that is false.
+   * H_GZ_FIRST's require() site is inside launch_cgrid_vertical_solver, between
+   * the gz reconstruction and the gz<->zh sync, matching Fortran's :459 -> :552
+   * split across the C-grid vertical group.
+   *
+   * CORRECTED IN MILESTONE 3A.11S. This comment previously claimed that
+   * resolving the group BEFORE the stage was harmless because "on the only
+   * topology resolve_halo will accept, the exchange copies nothing, so resolving
+   * before rather than inside the stage skips no operation."
+   *
+   * That claim was FALSE. On the real six-tile grid_type == 0 cubed sphere all
+   * four edge neighbours are populated and the exchange performs real
+   * device-to-device data movement. Resolving before the stage therefore packed
+   * gz's interior BEFORE gz_from_delz_kernel rebuilt it, so every tile's gz halo
+   * carried the previous top-level step's values. :557-563 then broadcast that
+   * stale halo into zh across the full halo box, where it persisted for every
+   * later substep, and update_dz_c differenced gz2 across the resulting
+   * interior/halo discontinuity until its denominator crossed zero. The failure
+   * was deterministic, first appearing at (ie, js) and (ie, js+1) -- the
+   * southeast corner, where the east and south discontinuities compound.
+   *
+   * The fix is the two-slot split: cgrid_vertical_pre_halo rebuilds the interior,
+   * then the group is resolved, then cgrid_vertical_solver consumes it. See
+   * docs/agent_handoff/milestone_3a11s_h_gz_first_ordering.md.
    */
   auto resolve=[&](fv3_gpu_halo_group g)->bool{
     rc=resolve_halo(c->data,g,e,__func__);
@@ -1223,9 +1360,20 @@ extern "C" int fv3_gpu_dyn_core_step(fv3_gpu_context *c,const fv3_gpu_step_desc 
      * which the remap stage depends. */
     p.last_call=p.remap_step;
 
+#ifdef FV3_GPU_ENABLE_CUDA
+    char dbg_lbl[80];
+#define FV3_GPU_DBG_STAGE(name) \
+    (std::snprintf(dbg_lbl, sizeof(dbg_lbl), "it=%d " name, it), \
+     debug_check_finite_stage(c->data, dbg_lbl, p.model_step))
+#else
+#define FV3_GPU_DBG_STAGE(name) do {} while (0)
+#endif
+
     if(!resolve(FV3_GPU_H_DWIND_IN)) return rc;               // :402 -> :504
     if(!resolve(FV3_GPU_H_W_IN)) return rc;                   // :427 -> :507
+    FV3_GPU_DBG_STAGE("halo_in");
     if(!run(dispatch.cgrid_predictor)) return rc;             // :515-523
+    FV3_GPU_DBG_STAGE("cgrid_predictor");
     /* :525-531 is gated on `nord > 0`; when nord == 0 the Fortran neither packs
      * nor completes the divgd corner update, and cgrid_predictor correspondingly
      * leaves H_DIVGD alone (fv3_cgrid_predictor.cu:831). The WP-B binder
@@ -1233,18 +1381,33 @@ extern "C" int fv3_gpu_dyn_core_step(fv3_gpu_context *c,const fv3_gpu_step_desc 
      * dgrid_dynamics rather than running with an unproduced halo. That is the
      * correct outcome: with nord == 0 divgd has no producer at all. */
     if(config.nord>0 && !resolve(FV3_GPU_H_DIVGD)) return rc; // :528 -> :636
+    /* Milestone 3A.11S. The gz interior must be rebuilt from delz BEFORE the
+     * exchange packs it (:436-455 precedes :459), so the pre-halo half runs
+     * first, then the exchange, then the consumer. Resolving H_GZ_FIRST ahead of
+     * the reconstruction -- as this loop did through 3A.11R -- exchanged the
+     * PREVIOUS step's gz interior and left every tile's gz halo one step stale. */
+    if(!run(dispatch.cgrid_vertical_pre_halo)) return rc;     // :436-455
     if(it==1 && !resolve(FV3_GPU_H_GZ_FIRST)) return rc;      // :459 -> :552
-    if(!run(dispatch.cgrid_vertical_solver)) return rc;       // :543-583
+    if(!run(dispatch.cgrid_vertical_solver)) return rc;       // :552-583
+    FV3_GPU_DBG_STAGE("cgrid_vertical_solver");
     if(!run(dispatch.cgrid_pressure)) return rc;              // :614
+    FV3_GPU_DBG_STAGE("cgrid_pressure");
     if(!resolve(FV3_GPU_H_CWIND)) return rc;                  // :618 -> :640
     if(!run(dispatch.dgrid_dynamics)) return rc;              // :700-829
+    FV3_GPU_DBG_STAGE("dgrid_dynamics");
     if(!resolve(FV3_GPU_H_DSCALAR)) return rc;                // :844 -> :878
     if(!run(dispatch.dgrid_height)) return rc;                // :905-906
+    FV3_GPU_DBG_STAGE("dgrid_height");
     if(!run(dispatch.vertical_solver)) return rc;             // :918-923
+    FV3_GPU_DBG_STAGE("vertical_solver");
     if(!resolve(FV3_GPU_H_ZH)) return rc;                     // :931 -> :967
     if(!resolve(FV3_GPU_H_PKC2)) return rc;                   // :931 -> :967
     if(!run(dispatch.nh_pressure)) return rc;                 // :940-1019
+    FV3_GPU_DBG_STAGE("nh_pressure");
   }
+#ifdef FV3_GPU_ENABLE_CUDA
+#undef FV3_GPU_DBG_STAGE
+#endif
 
   /* -------------------------------------------------------------------------
    * After the loop: dyn_core.F90:1212-1214
@@ -1279,6 +1442,9 @@ extern "C" int fv3_gpu_dyn_core_step(fv3_gpu_context *c,const fv3_gpu_step_desc 
       rc=dispatch.post_loop_heating(x,e);
       if(rc!=FV3_GPU_SUCCESS){ c->data.phase=ContextPhase::failed; return rc; }
     }
+#ifdef FV3_GPU_ENABLE_CUDA
+    debug_check_finite_stage(c->data, "post_loop_heating", p.model_step);
+#endif
   }
 
   *ev=issue_event(c->data);

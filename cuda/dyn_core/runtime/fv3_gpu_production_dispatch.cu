@@ -30,10 +30,15 @@ int fv3_build_production_dispatch(NumericalDispatch &out, fv3_gpu_error *e) noex
   // (Riem_Solver3); dyn_core.F90:583 calls Riem_Solver_C, a different routine
   // with a different argument list and dt2 rather than dt, so wiring the old body
   // would have been numerically wrong rather than merely redundant.
-  // It now runs: gz from delz/zs on the first substep (:445-455), the gz<->zh
-  // sync over the full halo box (:557-573), update_dz_c per interface level
-  // (:577, dt2) with both fill_4corners(gz2) inside the level body, and
-  // Riem_Solver_C (:583, dt2).
+  // Milestone 3A.11S split the group in two so H_GZ_FIRST can be resolved
+  // between the gz reconstruction and its first consumer, matching dyn_core.F90
+  // :436-455 (rebuild) -> :459 (start) -> :552 (complete) -> :557 (zh <- gz).
+  //
+  // pre_halo runs: gz from delz/zs on the first substep (:445-455).
+  d.cgrid_vertical_pre_halo = &fv3::gpu::vertical::launch_cgrid_vertical_pre_halo;
+  // cgrid_vertical_solver now runs: the gz<->zh sync over the full halo box
+  // (:557-573), update_dz_c per interface level (:577, dt2) with both
+  // fill_4corners(gz2) inside the level body, and Riem_Solver_C (:583, dt2).
   d.cgrid_vertical_solver = &fv3::gpu::vertical::launch_cgrid_vertical_solver;
   d.cgrid_pressure = &fv3::gpu::cgrid::launch_cgrid_pressure_v3;
   // Milestone 3A.8 (WP-B.5) populates this slot. It was deliberately nullptr

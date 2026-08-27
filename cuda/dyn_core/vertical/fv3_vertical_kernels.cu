@@ -519,6 +519,88 @@ __global__ void gz_zh_sync_kernel(View3 gz, View3 zh, int64_t isd, int64_t ied,
   }
 }
 
+/* Shared configuration fence for both halves of the C-grid vertical group
+ * (Milestone 3A.11S). Factored out of launch_cgrid_vertical_solver verbatim so
+ * the pre-halo half rejects exactly the same unsupported configurations, and so
+ * every rejection still precedes the first launch of either half.
+ *
+ * Numerical algorithm changed: NO. Identical predicates, identical messages. */
+static int cgrid_vertical_config_fence(const ExecutionContext &x,
+                                       fv3_gpu_error *error, const char *api) {
+  const auto &b = x.immutable->bounds;
+  const auto &cfg = x.immutable->config;
+  const auto &p = *x.dispatch_params;
+  const auto &topo = *x.immutable->topology;
+
+  if (cfg.hydrostatic)
+    return fail(error, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                "hydrostatic C-grid pressure (dyn_core.F90:544 geopk) is not "
+                "implemented; the supported configuration is hydrostatic=false");
+  if (!topo.global_cubed_sphere || topo.nested || topo.regional)
+    return fail(error, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                "only the global non-nested cubed sphere is implemented");
+  if (cfg.grid_type != 0)
+    return fail(error, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                "only grid_type == 0 is implemented");
+  if (b.halo_width < 3u)
+    return fail(error, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                "update_dz_c requires halo_width >= 3");
+  if (b.npz < 3)
+    return fail(error, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                "update_dz_c's top/bottom extrapolation requires npz >= 3");
+  if (topo.npx <= 0 || topo.npy <= 0)
+    return fail(error, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                "fill_4corners needs the tile corner counts npx/npy; a zero "
+                "value would silently skip the panel-corner fills");
+  if (p.dt2 == 0.0)
+    return fail(error, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                "dt2 is zero; update_dz_c divides by it");
+  return FV3_GPU_SUCCESS;
+}
+
+/* dyn_core.F90:433-455 -> :459. See fv3_vertical_kernels.cuh for why this is a
+ * separate stage rather than the opening phase of launch_cgrid_vertical_solver.
+ *
+ * Writes gz's INTERIOR only (is:ie, js:je), exactly as the non-nested Fortran
+ * branch at :445-455 does. The halo cells are supplied by the H_GZ_FIRST
+ * exchange the runtime resolves immediately after this stage returns. */
+int launch_cgrid_vertical_pre_halo(const ExecutionContext &x, fv3_gpu_error *error) {
+  const int context_status = validate_execution_context(x, error);
+  if (context_status != FV3_GPU_SUCCESS) return context_status;
+  const char *api = "launch_cgrid_vertical_pre_halo";
+  if (x.submission.stream_id != StreamId::compute)
+    return fail(error, FV3_GPU_INVALID_ARGUMENT, api,
+                "the C-grid vertical group must be enqueued on the compute stream");
+
+  const int fence = cgrid_vertical_config_fence(x, error, api);
+  if (fence != FV3_GPU_SUCCESS) return fence;
+
+  const auto &b = x.immutable->bounds;
+  const auto &p = *x.dispatch_params;
+
+  // it > 1 rebuilds gz from zh inside the post-halo half, not from delz, and
+  // dyn_core.F90:459 correspondingly starts no exchange. Nothing to do.
+  if (p.acoustic_index != 0) return FV3_GPU_SUCCESS;
+
+  const auto *v_gz   = x.fields->find(FieldId::gz);
+  const auto *v_delz = x.fields->find(FieldId::delz);
+  const auto *v_zs   = x.fields->find(FieldId::zs);
+  if (!v_gz || !v_delz || !v_zs)
+    return fail(error, FV3_GPU_INVALID_ARGUMENT, api,
+                "the C-grid vertical pre-halo stage requires gz, delz and zs");
+
+  auto *stream = static_cast<cudaStream_t>(x.submission.stream);
+  const dim3 block(16, 8);
+  const dim3 g(static_cast<unsigned>((b.ie - b.is + 1 + block.x - 1) / block.x),
+               static_cast<unsigned>((b.je - b.js + 1 + block.y - 1) / block.y));
+  gz_from_delz_kernel<<<g, block, 0, stream>>>(
+      view3(*v_gz), cview3(*v_delz), cview2(*v_zs),
+      b.is, b.ie, b.js, b.je, static_cast<int>(b.npz));
+  if (cudaPeekAtLastError() != cudaSuccess)
+    return fail(error, FV3_GPU_CUDA_ERROR, api, "gz_from_delz launch failed");
+  return FV3_GPU_SUCCESS;
+}
+
 int launch_cgrid_vertical_solver(const ExecutionContext &x, fv3_gpu_error *error) {
   const int context_status = validate_execution_context(x, error);
   if (context_status != FV3_GPU_SUCCESS) return context_status;
@@ -590,26 +672,27 @@ int launch_cgrid_vertical_solver(const ExecutionContext &x, fv3_gpu_error *error
                 static_cast<unsigned>((ny + block.y - 1) / block.y));
   };
 
-  /* ---- Phase 1: gz / zh synchronisation (dyn_core.F90:445-573) ---- */
+  /* ---- Phase 1: gz / zh synchronisation (dyn_core.F90:552-573) ----
+   *
+   * Milestone 3A.11S: the gz reconstruction from delz (:436-455) that used to
+   * open this phase now lives in launch_cgrid_vertical_pre_halo, which the
+   * runtime runs BEFORE resolving H_GZ_FIRST. That is required for correctness,
+   * not style: :459 starts the exchange only after the interior is rebuilt, so
+   * packing before the reconstruction exchanges the previous step's gz. */
   if (p.acoustic_index == 0) {
-    const dim3 g = grid_for(b.ie - b.is + 1, b.je - b.js + 1);
-    gz_from_delz_kernel<<<g, block, 0, stream>>>(
-        view3(*v_gz), cview3(*v_delz), cview2(*v_zs),
-        b.is, b.ie, b.js, b.je, km);
-    if (cudaPeekAtLastError() != cudaSuccess)
-      return fail(error, FV3_GPU_CUDA_ERROR, api, "gz_from_delz launch failed");
-
     /* dyn_core.F90:459 starts and :552 completes the gz halo exchange, and only
      * AFTER it completes does :557-563 propagate gz into zh across the full
-     * halo box. The reconstruction above wrote only is:ie / js:je, so the halo
-     * cells zh inherits here come entirely from that exchange. Requiring the
-     * group at this exact point is what prevents the copy below from
-     * broadcasting uninitialised halo values into zh, where they would persist
-     * for every subsequent substep.
+     * halo box. The pre-halo stage wrote only is:ie / js:je, so the halo cells
+     * zh inherits here come entirely from that exchange. Requiring the group at
+     * this exact point is what prevents the copy below from broadcasting
+     * uninitialised or stale halo values into zh, where they would persist for
+     * every subsequent substep.
      *
      * This require is deliberately NOT satisfied by this stage. Nothing here may
      * mark a halo ready; that is the runtime's single-rank halo-readiness
-     * responsibility (§8). */
+     * responsibility (§8). It is also the guard that makes a runtime which
+     * forgot to run the pre-halo stage fail loudly instead of silently
+     * exchanging stale gz. */
     fv3_gpu_event gz_ready{};
     if (x.dependencies->require(FV3_GPU_H_GZ_FIRST, &gz_ready) != FV3_GPU_SUCCESS)
       return fail(error, FV3_GPU_STATE_CONFLICT, api,

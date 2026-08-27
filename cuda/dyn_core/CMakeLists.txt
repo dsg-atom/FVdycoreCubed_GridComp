@@ -2,6 +2,9 @@ cmake_minimum_required(VERSION 3.21)
 project(FV3DynCoreGPU LANGUAGES C CXX)
 
 option(FV3_DYN_CORE_ENABLE_CUDA "Build the CUDA-backed runtime" OFF)
+# Milestone 3A.11: manually-run wall-clock timing tool, not a correctness
+# test -- off by default so it never adds time to the default ctest run.
+option(BUILD_FV3_GPU_PERF_BENCH "Build the 3A.11 small-scale perf benchmark" OFF)
 set(FV3_DYN_CORE_PRECISION "R8" CACHE STRING "FV precision: R4, R4R8, or R8")
 set_property(CACHE FV3_DYN_CORE_PRECISION PROPERTY STRINGS R4 R4R8 R8)
 
@@ -295,6 +298,26 @@ if(BUILD_TESTING)
       LABELS "gpu"
       SKIP_RETURN_CODE 77
     )
+
+    # Milestone 3A.11: small-scale Fortran-vs-CUDA performance benchmark.
+    # PRE-VALIDATION PERFORMANCE CHARACTERIZATION -- see
+    # docs/agent_handoff/milestone_3a11_small_perf.md. Not registered as a
+    # ctest: it is a manually-invoked timing tool with CLI-selectable grid
+    # size/mode/repeats, not a pass/fail correctness check.
+    if(BUILD_FV3_GPU_PERF_BENCH)
+      add_executable(fv3_gpu_perf_bench benchmarks/run_small_perf_bench.cpp)
+      target_include_directories(fv3_gpu_perf_bench PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/runtime
+      )
+      find_package(Threads REQUIRED)
+      target_link_libraries(fv3_gpu_perf_bench PRIVATE
+        fv3_dyn_core_gpu
+        fv3_production_dispatch
+        CUDA::cudart
+        Threads::Threads
+      )
+    endif()
 
     # Milestone 3A.4 WP-B height-transport CUDA behavior test (requires CUDA and GPU)
     # Parts A-J: interior order-6 transport, panel-edge PPM, copy_corners,
