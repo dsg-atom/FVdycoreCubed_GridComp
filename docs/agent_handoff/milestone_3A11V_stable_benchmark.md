@@ -2,6 +2,7 @@
 
 Branch: `cuda/gpu-bringup`
 Base commit at start of work: `774ab59`
+Checkpoint commit for this work: `dd7b45e`
 
 This document covers the three closure tasks of 3A.11V:
 
