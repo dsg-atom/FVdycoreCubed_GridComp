@@ -253,6 +253,19 @@ int launch_dgrid_height_stage(const ExecutionContext &x, fv3_gpu_error *error) {
   return launch_update_dz_d(x, *x.dispatch, error);
 }
 
+/* TEMPORARY diagnostic budget for [RIEM3-BAD], Milestone 3A.11T §7.
+ *
+ * Once the first bad column appears the failure cascades, so an ungated probe
+ * would print every column of every remaining substep -- tens of thousands of
+ * lines that bury the only ones that matter. Capping globally keeps exactly the
+ * FIRST few offending columns, which is what §7 asks for ("immediately before
+ * the first bad invocation"; "do not dump full arrays unless needed").
+ *
+ * Not reset between steps on purpose: the budget is spent by the earliest
+ * failure in the run, whichever step that turns out to be. */
+__device__ unsigned fv3_riem3_bad_budget = 0;
+static constexpr unsigned kRiem3BadMax = 6;
+
 // Vertical Riemann solver kernel: one thread per horizontal column
 __global__ void riem_solver3_kernel(
     CView3 delp, CView3 pt, CView3 q_con, CView3 cappa, CView3 zh_in, CView3 w_in,
@@ -262,7 +275,7 @@ __global__ void riem_solver3_kernel(
     fv_real *workspace, uint64_t workspace_stride,
     int64_t is, int64_t ie, int64_t js, int64_t je, int km,
     int ms, fv_real dt, fv_real rgas, fv_real gama, fv_real kappa,
-    fv_real ptop, fv_real p_fac, fv_real a_imp, fv_real scale_m,
+    fv_real ptop, fv_real p_fac, fv_real a_imp, fv_real scale_m, fv_real grav,
     bool use_cond, bool moist_cappa, bool last_call, bool fp_out, bool use_logp,
     const VerticalWorkspaceLayout layout) {
 
@@ -335,7 +348,7 @@ __global__ void riem_solver3_kernel(
 
   // Call the column solver
   riem_solver3_column(
-      ms, dt, rgas, gama, kappa, ptop, p_fac, a_imp, scale_m,
+      ms, dt, rgas, gama, kappa, ptop, p_fac, a_imp, scale_m, grav,
       use_cond, moist_cappa, last_call, fp_out, use_logp,
       delp_col, pt_col, q_con_col, cappa_col, zh_col, w_col,
       surface_z, ws, w_out_col, dz_out_col, zh_out_col,
@@ -344,6 +357,53 @@ __global__ void riem_solver3_kernel(
       pe2, aa, bb, dd, w1, wk, g_rat, gam_arr, pp, bet, p1,
       dts, pf1, r_lo, r_hi, m_bot, m_top, r_bot, r_top, wbar, pbar,
       cm, wc, dm_tmp, wm, dz_tmp, km);
+
+  /* TEMPORARY diagnostic, Milestone 3A.11T §7: isolate Riem_Solver3's inputs
+   * immediately before the first bad invocation.
+   *
+   * Self-targeting on purpose. The failing columns are not known ahead of the
+   * run and an (i,j) filter passed from the host would have to be guessed; this
+   * fires only on a column whose OWN output went non-finite, so it prints the
+   * inputs of exactly the first offending column(s) and nothing else. The
+   * inputs are still live in the local copies above, so nothing is re-read from
+   * global memory and no other column's arithmetic is disturbed.
+   *
+   * Also reports the two SIM1 preconditions that a finite-input/NaN-output
+   * column implicates: layer thickness must stay strictly negative (dz < 0, an
+   * upward-decreasing height), and the reconstructed edge pressure must stay
+   * strictly positive and monotone so that log(pe) and pe**kappa are defined.
+   * Printing the precondition verdict alongside the raw column is what
+   * separates "invalid state handed in" (§8) from "valid state, bad port" (§9).
+   *
+   * Device printf goes to STDOUT; the host [FV3DBG] probe goes to STDERR. */
+  bool bad_out = false;
+  for (int k = 0; k < km; ++k)
+    if (!isfinite(w_out_col[k]) || !isfinite(dz_out_col[k])) bad_out = true;
+  if (bad_out && atomicAdd(&fv3_riem3_bad_budget, 1u) < kRiem3BadMax) {
+    int n_dz_nonneg = 0, n_pe_nonpos = 0, n_pe_nonmono = 0;
+    fv_real dz_worst = dz_out_col[0];
+    for (int k = 0; k < km; ++k) {
+      const fv_real d = zh_col[k + 1] - zh_col[k];
+      if (!(d < (fv_real)0)) ++n_dz_nonneg;
+      if (d > dz_worst) dz_worst = d;
+    }
+    for (int k = 0; k <= km; ++k) {
+      if (!(pe_col[k] > (fv_real)0)) ++n_pe_nonpos;
+      if (k > 0 && !(pe_col[k] > pe_col[k - 1])) ++n_pe_nonmono;
+    }
+    printf("[RIEM3-BAD i=%lld j=%lld] dz_nonneg=%d dz_worst=%.6e "
+           "pe_nonpos=%d pe_nonmono=%d ws=%.6e zs=%.6e p_fac=%.3e a_imp=%.3e\n",
+           (long long)i, (long long)j, n_dz_nonneg, (double)dz_worst,
+           n_pe_nonpos, n_pe_nonmono, (double)ws, (double)surface_z,
+           (double)p_fac, (double)a_imp);
+    for (int k = 0; k < km; ++k)
+      printf("[RIEM3-BAD i=%lld j=%lld] k=%d delp=%.9e pt=%.9e w=%.9e "
+             "zh=%.9e zh1=%.9e cappa=%.9e | w_out=%.9e dz_out=%.9e\n",
+             (long long)i, (long long)j, k, (double)delp_col[k],
+             (double)pt_col[k], (double)w_col[k], (double)zh_col[k],
+             (double)zh_col[k + 1], (double)cappa_col[k],
+             (double)w_out_col[k], (double)dz_out_col[k]);
+  }
 
   // Write outputs back to global memory
   for (int k = 0; k < km; ++k) {
@@ -355,8 +415,25 @@ __global__ void riem_solver3_kernel(
     ppe_out.at(i, j, k) = ppe_col[k];
     pk3_out.at(i, j, k) = pk3_col[k];
     if (last_call) {
-      pe_out.at(i, j, k) = pe_col[k];
-      peln_out.at(i, j, k) = peln_col[k];
+      /* Milestone 3A.11T. pe and peln are the FV3 exception to the (i,j,k)
+       * convention: every one of their ~40 declaration sites in the
+       * authoritative tree orders them (i, k, j), with the vertical axis in
+       * the MIDDLE slot. Riem_Solver3's own dummies say so --
+       *   nh_core.F90:87  pe(is-1:ie+1,km+1,js-1:je+1)
+       *   nh_core.F90:88  peln(is:ie,km+1,js:je)
+       * -- as do dyn_core.F90:202-203, fv_dynamics.F90:215/217, geopk's
+       * :2123-2124, and pe_halo's :1396. Body-level proof: geopk writes
+       * `pe(i,1,j) = ptop` (:2191) and fv_dynamics reads the surface as
+       * `pe(i,npz+1,j)` (:611).
+       *
+       * View3::at() is purely positional -- slot 0/1/2 -- so the k index has
+       * to be handed to the MIDDLE argument. It previously went to the last
+       * one, transposing k against j on every write.
+       *
+       * pk is deliberately NOT changed: nh_core.F90:91 declares
+       * pk(is:ie,js:je,km+1), genuinely (i,j,k). Only pe/peln are special. */
+      pe_out.at(i, k, j) = pe_col[k];
+      peln_out.at(i, k, j) = peln_col[k];
       pk_out.at(i, j, k) = pk_col[k];
     }
   }
@@ -398,6 +475,11 @@ int launch_vertical_solver(const ExecutionContext &x, fv3_gpu_error *error) {
    * defaulted. */
   if (cfg.akap <= 0.0 || cfg.akap >= 1.0 || cfg.m_split < 1)
     return FV3_GPU_UNSUPPORTED_CONFIGURATION;
+  /* grav reaches riem3_precompute_column as rgrav = 1/grav (nh_core.F90:100),
+   * so a defaulted 0 would divide by zero and silently poison every column.
+   * Mirrors the guard at fv3_riem_solver_c.cu:272 for the C-grid twin, which
+   * already validated its own grav. Milestone 3A.11V. */
+  if (!(cfg.grav > 0.0)) return FV3_GPU_UNSUPPORTED_CONFIGURATION;
 
   // Get workspace slice
   const auto *ws_slice = workspace_slice(*x.workspace, WorkspaceId::vertical);
@@ -436,6 +518,10 @@ int launch_vertical_solver(const ExecutionContext &x, fv3_gpu_error *error) {
       fv_real(1.0 / (1.0 - cfg.akap)),
       fv_real(cfg.akap), fv_real(cfg.ptop), fv_real(cfg.p_fac),
       fv_real(cfg.a_imp), fv_real(cfg.scale_m),
+      /* grav. Was hardcoded T(9.8) inside riem_solver3_column, which had no grav
+       * parameter to pass it through; see fv3_vertical_column.hpp for the full
+       * derivation and the measured 10-digit reproduction. Milestone 3A.11V. */
+      fv_real(cfg.grav),
       cfg.use_cond != 0, cfg.moist_cappa != 0,
       p.last_call != 0, p.fp_out != 0, cfg.use_logp != 0,
       layout);

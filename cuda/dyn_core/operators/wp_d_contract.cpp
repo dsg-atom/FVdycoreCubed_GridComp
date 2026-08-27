@@ -1,6 +1,7 @@
 #include "wp_d_contract.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <limits>
 
@@ -199,10 +200,19 @@ int launch_nh_pressure(const ExecutionContext &x, fv3_gpu_error *e) noexcept {
   const auto topology = *x.immutable->topology;
   const auto edges = physical_edges(topology);
   const auto corners = physical_corners(topology);
-  const fv_real grav = static_cast<fv_real>(x.immutable->config.grav);
+  const auto &cfg = x.immutable->config;
+  const fv_real grav = static_cast<fv_real>(cfg.grav);
   const fv_real dt = static_cast<fv_real>(x.dispatch_params->dt);
+  const fv_real ptop = static_cast<fv_real>(cfg.ptop);
+  const fv_real akap = static_cast<fv_real>(cfg.akap);
+  // top_value = ptk = ptop**akap, dyn_core.F90:296 / :1623.
+  const fv_real ptk = static_cast<fv_real>(std::pow(cfg.ptop, cfg.akap));
   HorizontalBounds hb{b.is, b.ie, b.js, b.je, b.npz};
   geopotential_from_height(hb, 2, grav, view3_const(views.zh), view3<fv_real>(views.gz));
+  // dyn_core.F90:946 -- every substep, unconditionally. See the CUDA twin in
+  // wp_d_contract_cuda.cpp for why this is required rather than optional.
+  reconstruct_pk3_halo(hb, ptop, akap, view3_const(views.delp),
+                       view3<fv_real>(views.pk3));
   A2BGeometry geom{view2<const fv_real>(views.dxa), view2<const fv_real>(views.dya),
                    view3<const fv_real>(views.grid_lonlat), view3<const fv_real>(views.agrid_lonlat),
                    view1<const accumulator_real>(views.edge_w), view1<const accumulator_real>(views.edge_e),
@@ -211,6 +221,7 @@ int launch_nh_pressure(const ExecutionContext &x, fv3_gpu_error *e) noexcept {
   auto *qy = static_cast<fv_real*>(arena.arrays[1]);
   auto *qxx = static_cast<fv_real*>(arena.arrays[2]);
   auto *qyy = static_cast<fv_real*>(arena.arrays[3]);
+  auto *pk3_b = static_cast<fv_real*>(arena.arrays[4]);
   auto *pk_b = static_cast<fv_real*>(arena.arrays[5]);
   auto *gz_b = static_cast<fv_real*>(arena.arrays[6]);
   auto *delp_b = static_cast<fv_real*>(arena.arrays[7]);
@@ -227,16 +238,22 @@ int launch_nh_pressure(const ExecutionContext &x, fv3_gpu_error *e) noexcept {
   View2<fv_real> qx_v = slice2(qx), qy_v = slice2(qy);
   View2<fv_real> qxx_v = slice2(qxx), qyy_v = slice2(qyy);
   View3<fv_real> pk_v = slice3(pk_b);
+  View3<fv_real> pk3_v = slice3(pk3_b);
   View3<fv_real> gz_v = slice3(gz_b);
   View3<fv_real> delp_v = slice3(delp_b);
+  // pp (=pkc) and pk (=pk3) are interpolated independently, dyn_core.F90:1637-1638.
   for (int64_t k = 0; k <= b.npz; ++k) {
     View2<fv_real> pkc_slice{views.pkc.base() + views.pkc.offset(lo_i, lo_j, k),
                              lo_i, lo_j, views.pkc.stride[0], views.pkc.stride[1]};
+    View2<fv_real> pk3_slice{views.pk3.base() + views.pk3.offset(lo_i, lo_j, k),
+                             lo_i, lo_j, views.pk3.stride[0], views.pk3.stride[1]};
     View2<fv_real> gz_slice{views.gz.base() + views.gz.offset(lo_i, lo_j, k),
                             lo_i, lo_j, views.gz.stride[0], views.gz.stride[1]};
     View2<fv_real> pk_out{pk_v.data + k * static_cast<int64_t>(ni * nj), lo_i, lo_j, 1, static_cast<int64_t>(ni)};
+    View2<fv_real> pk3_out{pk3_v.data + k * static_cast<int64_t>(ni * nj), lo_i, lo_j, 1, static_cast<int64_t>(ni)};
     View2<fv_real> gz_out{gz_v.data + k * static_cast<int64_t>(ni * nj), lo_i, lo_j, 1, static_cast<int64_t>(ni)};
     a2b_ord4_global(hb, edges, corners, pkc_slice, pk_out, geom, qx_v, qy_v, qxx_v, qyy_v, true);
+    a2b_ord4_global(hb, edges, corners, pk3_slice, pk3_out, geom, qx_v, qy_v, qxx_v, qyy_v, true);
     a2b_ord4_global(hb, edges, corners, gz_slice, gz_out, geom, qx_v, qy_v, qxx_v, qyy_v, true);
   }
   for (int64_t k = 0; k < b.npz; ++k) {
@@ -245,7 +262,9 @@ int launch_nh_pressure(const ExecutionContext &x, fv3_gpu_error *e) noexcept {
     View2<fv_real> delp_out{delp_v.data + k * static_cast<int64_t>(ni * nj), lo_i, lo_j, 1, static_cast<int64_t>(ni)};
     a2b_ord4_global(hb, edges, corners, delp_slice, delp_out, geom, qx_v, qy_v, qxx_v, qyy_v, false);
   }
-  PressureInputs pin{pk_v, gz_v, delp_v, pk_v, view2<const fv_real>(views.rdx), view2<const fv_real>(views.rdy)};
+  // dyn_core.F90:1628-1635 -- the k==1 level is not interpolated.
+  set_pressure_top(hb, ptk, pk_v, pk3_v);
+  PressureInputs pin{pk_v, gz_v, delp_v, pk3_v, view2<const fv_real>(views.rdx), view2<const fv_real>(views.rdy)};
   PressureOutputs pout{view3<fv_real>(views.u), view3<fv_real>(views.v),
                        view3<fv_real>(views.du), view3<fv_real>(views.dv)};
   PressureConfig pcfg{PressureVariant::normal_nh, dt, 0};

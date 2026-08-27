@@ -70,6 +70,15 @@ void geopotential_from_height(const HorizontalBounds &b, int halo_band,
         gz(i,j,gz.lo_k+level)=grav*zh(i,j,zh.lo_k+level);
 }
 
+void set_pressure_top(const HorizontalBounds &b, fv_real top_value,
+                      View3<fv_real> pp, View3<fv_real> pk) {
+  for (int64_t j = b.js; j <= b.je + 1; ++j)
+    for (int64_t i = b.is; i <= b.ie + 1; ++i) {
+      pp(i, j, pp.lo_k) = fv_real(0);
+      pk(i, j, pk.lo_k) = top_value;
+    }
+}
+
 void pressure_gradient(const HorizontalBounds &b, const PressureInputs &p,
                        const PressureOutputs &o, const PressureConfig &c) {
   const fv_real alpha = fv_real(1) - c.beta;

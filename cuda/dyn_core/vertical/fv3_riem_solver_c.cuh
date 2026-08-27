@@ -167,6 +167,18 @@ struct RiemSolverCArgs {
   fv_real *workspace = nullptr;
   uint64_t workspace_scalars_per_column = 0;
   uint64_t workspace_bytes = 0;
+
+  /* Milestone 3A.11T diagnostic, default OFF and off in every normal run.
+   * When set, the kernel evaluates SIM1_solver's own preconditions
+   * (nh_utils.F90:1232 log argument, :1244 pem ratio, :1272/:1320 p_fac
+   * clamp argument) on the exact values it is about to pass to sim1_column,
+   * and device-printfs the first violating level per column. This answers
+   * "were Riem_Solver_c's inputs physically valid before the first NaN"
+   * at the point of use rather than by inference from a neighbouring
+   * checkpoint. Enabled from FV3_GPU_DEBUG_FAIL in launch_riem_solver_c_ctx. */
+  bool diag_preconditions = false;
+  int32_t diag_tile = -1;
+  int64_t diag_step = -1;
 };
 
 // Enqueue-only. `stream` is the WP-E-owned compute stream (cudaStream_t).

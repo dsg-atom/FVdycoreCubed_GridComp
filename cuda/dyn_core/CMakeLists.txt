@@ -14,10 +14,19 @@ set_property(CACHE FV3_DYN_CORE_PRECISION PROPERTY STRINGS R4 R4R8 R8)
 # the panel-seam index/vector algebra. It is host-only and CUDA-free so the seam
 # transforms are unit-testable without a GPU; the same inline functions are
 # compiled into the device kernels from the header.
+#
+# Milestone 3A.11V Task 2 adds runtime/fv3_damping_translation.cpp: the single
+# place where damping configuration scalars become the ten per-level
+# device-resident damping arrays the storage contract already declares
+# (dyn_core.F90:677-765). It lives in the core library so the benchmark, the
+# unit tests and the eventual GEOS bridge all consume one translation instead
+# of inventing their own tables. Host-only and CUDA-free, for the same reason
+# fv3_gpu_halo_topology.cpp is.
 add_library(fv3_dyn_core_gpu
   runtime/fv3_gpu_runtime.cpp
   runtime/fv3_gpu_contract.cpp
   runtime/fv3_gpu_halo_topology.cpp
+  runtime/fv3_damping_translation.cpp
 )
 target_include_directories(fv3_dyn_core_gpu PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -157,6 +166,12 @@ if(FV3_DYN_CORE_ENABLE_CUDA)
   # away and the archive linked empty, surfacing only as an undefined reference at
   # the first consumer rather than as a compile error.
   target_sources(fv3_dyn_core_gpu PRIVATE runtime/fv3_gpu_halo_exchange.cu)
+  # Milestone 3A.11T: the huge_r constant-fill used to restore dyn_core.F90's
+  # init_step poison of gz/pk3 (see poison_init_step_transients). Same target and
+  # same reasoning as the halo kernels above -- the runtime itself calls it, and
+  # it needs FV3_GPU_ENABLE_CUDA, which is PRIVATE here. A .cu because
+  # cudaMemsetAsync fills bytes and so cannot write huge_r; this needs a kernel.
+  target_sources(fv3_dyn_core_gpu PRIVATE runtime/fv3_gpu_state_poison.cu)
   set_target_properties(fv3_dyn_core_gpu PROPERTIES CUDA_STANDARD 17)
 
   # Milestone 3A.1: production NumericalDispatch (wires WP-A/WP-C/WP-D CUDA
@@ -239,6 +254,35 @@ if(BUILD_TESTING)
   target_link_libraries(fv3_halo_topology_test PRIVATE fv3_dyn_core_gpu)
   add_test(NAME fv3_halo_topology COMMAND fv3_halo_topology_test)
 
+  # Milestone 3A.11V Task 2: the per-level damping translation. Host-only for
+  # the same reason as the topology test -- translate_damping() is a total
+  # function of its arguments, so the entire authoritative npz=10 production
+  # column can be asserted value-for-value without a GPU. This is the test that
+  # would have caught the fabricated (d4_bg=0.16, nord_k=2) benchmark table.
+  add_executable(fv3_damping_translation_test tests/runtime/test_damping_translation.cpp)
+  target_link_libraries(fv3_damping_translation_test PRIVATE fv3_dyn_core_gpu)
+  add_test(NAME fv3_damping_translation COMMAND fv3_damping_translation_test)
+
+  # Milestone 3A.11V Task 1: the globally single-valued cubed-sphere geometry the
+  # benchmark IC is built from. Deliberately a SEPARATE library and deliberately
+  # NOT linked into fv3_dyn_core_gpu -- it is benchmark/test infrastructure that
+  # ports FV3's grid construction for the harness, not production numerics, and
+  # nothing in the shipped runtime may come to depend on it.
+  add_library(fv3_cube_geometry STATIC benchmarks/fv3_cube_geometry.cpp)
+  target_include_directories(fv3_cube_geometry PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
+  )
+
+  # The seam-continuity test required by Task 1. Host-only, and that is the
+  # point: single-valuedness of the initial state is a property of the geometry,
+  # so it is provable on a login node with no GPU and no CUDA. Three of its six
+  # checks (T2 against FV3's own 13 seam copies, T4 by brute-force geometric
+  # cell matching, T5 by brute-force edge matching) never consult the halo index
+  # map, so they cannot pass by agreeing with the code under test.
+  add_executable(fv3_cube_seam_test tests/benchmarks/test_cube_seam_continuity.cpp)
+  target_link_libraries(fv3_cube_seam_test PRIVATE fv3_cube_geometry)
+  add_test(NAME fv3_cube_seam COMMAND fv3_cube_seam_test)
+
   # Prompt 5B.1 Integrated smoke test (requires CUDA and GPU)
   if(FV3_DYN_CORE_ENABLE_CUDA)
     add_executable(fv3_integrated_smoke_test tests/integration/test_integrated_smoke.cpp)
@@ -299,6 +343,27 @@ if(BUILD_TESTING)
       SKIP_RETURN_CODE 77
     )
 
+    # Milestone 3A.11T §4: permanent LAYOUT-SENSITIVE pe/peln test.
+    # pe and peln are the FV3 axis-order exception -- authoritative FV3 declares
+    # pe(is-1:ie+1, npz+1, js-1:je+1), i.e. (i,k,j), while pk/gz/zh/pkc/pk3 in
+    # the same routines are (i,j,k). Both share FV3_GPU_STAGGER_INTERFACE, so
+    # stagger carries no axis information and the order is expressible only
+    # through descriptor strides. This test seeds values that uniquely encode
+    # all three coordinates, so any i/j/k permutation aliases into a detectable
+    # mismatch rather than round-tripping silently.
+    add_executable(fv3_pe_peln_layout_test
+                   tests/integration/test_pe_peln_layout.cu)
+    target_link_libraries(fv3_pe_peln_layout_test PRIVATE
+      fv3_dyn_core_gpu
+      CUDA::cudart
+    )
+    set_target_properties(fv3_pe_peln_layout_test PROPERTIES CUDA_STANDARD 17)
+    add_test(NAME fv3_pe_peln_layout COMMAND fv3_pe_peln_layout_test)
+    set_tests_properties(fv3_pe_peln_layout PROPERTIES
+      LABELS "gpu"
+      SKIP_RETURN_CODE 77
+    )
+
     # Milestone 3A.11: small-scale Fortran-vs-CUDA performance benchmark.
     # PRE-VALIDATION PERFORMANCE CHARACTERIZATION -- see
     # docs/agent_handoff/milestone_3a11_small_perf.md. Not registered as a
@@ -314,6 +379,7 @@ if(BUILD_TESTING)
       target_link_libraries(fv3_gpu_perf_bench PRIVATE
         fv3_dyn_core_gpu
         fv3_production_dispatch
+        fv3_cube_geometry
         CUDA::cudart
         Threads::Threads
       )

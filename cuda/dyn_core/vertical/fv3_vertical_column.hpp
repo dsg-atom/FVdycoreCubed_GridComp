@@ -195,14 +195,24 @@ FV3_VERTICAL_HD inline void riem3_finalize_column(const T *pem, const T *peln2,
 // Beta=0 variant of SIM3. All work arrays are caller-provided from persistent arena.
 template <class T>
 FV3_VERTICAL_HD inline void sim3p0_column(T dt, T rgas, T gama, T kappa, T p_fac, T scale_m,
+                          T grav,
                           const T *dm, const T *pt, const T *pem, T *w,
                           T *dz, T ws, T *pe2, T *aa, T *bb, T *dd, T *w1,
                           T *g_rat, T *gam, T *pp, T *bet, T *p1, int km) {
   const T t1g = T(2) * gama * dt * dt;
   const T rdt = T(1) / dt;
   const T capa1 = kappa - T(1);
-  const T r2g = T(9.8) / T(2);
-  const T r6g = T(9.8) / T(6);
+  /* r2g/r6g were hardcoded T(9.8)/2 and T(9.8)/6. nh_utils.F90:1082-1083 sets
+   * r2g = grav/2, r6g = grav/6 from constants_mod grav, so the constant was a
+   * second, independent copy of the gravity used to build the state. Both terms
+   * are BOTTOM-BOUNDARY terms (nh_utils.F90:1109 dd(km) += r2g*dm(km);
+   * :1185 p1(km) -= r6g*dm(km)), so a mismatch here perturbs exactly the lowest
+   * level. Milestone 3A.11V: plumbed. Numerical semantics changed: YES -- a
+   * repair toward the authoritative Fortran, which uses ONE grav throughout.
+   * NOT NUMERICALLY EXERCISED: this branch is dead at a_imp = 1.0 (the mandated
+   * production first-run value), so this site is IMPLEMENTED + COMPILED only. */
+  const T r2g = grav / T(2);
+  const T r6g = grav / T(6);
   const T r3 = T(1) / T(3);
 
   for (int k = 0; k < km; ++k) {
@@ -288,7 +298,7 @@ FV3_VERTICAL_HD inline void sim3p0_column(T dt, T rgas, T gama, T kappa, T p_fac
 // General alpha/beta variant. All work arrays are caller-provided from persistent arena.
 template <class T>
 FV3_VERTICAL_HD inline void sim3_column(T dt, T rgas, T gama, T kappa, T alpha, T p_fac,
-                        T scale_m, const T *dm, const T *pt, const T *pem,
+                        T scale_m, T grav, const T *dm, const T *pt, const T *pem,
                         T *w, T *dz, T ws, T *pe2, T *aa, T *bb, T *dd,
                         T *w1, T *wk, T *g_rat, T *gam, T *pp, T *bet, T *p1,
                         int km) {
@@ -298,8 +308,12 @@ FV3_VERTICAL_HD inline void sim3_column(T dt, T rgas, T gama, T kappa, T alpha, 
   const T t1g = gama * T(2) * (alpha * dt) * (alpha * dt);
   const T rdt = T(1) / dt;
   const T capa1 = kappa - T(1);
-  const T r2g = T(9.8) / T(2);
-  const T r6g = T(9.8) / T(6);
+  /* See sim3p0_column: r2g/r6g are grav/2 and grav/6 per nh_utils.F90:934-935,
+   * not a hardcoded 9.8. Bottom-boundary terms (:962, :1042). Milestone 3A.11V.
+   * Numerical semantics changed: YES -- repair toward authoritative Fortran.
+   * NOT NUMERICALLY EXERCISED: dead at a_imp = 1.0. */
+  const T r2g = grav / T(2);
+  const T r6g = grav / T(6);
   const T r3 = T(1) / T(3);
 
   for (int k = 0; k < km; ++k) {
@@ -683,7 +697,7 @@ slow_path:
 // Callers provide all workspace arrays from persistent arena.
 template <class T>
 FV3_VERTICAL_HD inline void riem_solver3_column(int ms, T dt, T rgas, T gama, T kappa,
-                                T ptop, T p_fac, T a_imp, T scale_m,
+                                T ptop, T p_fac, T a_imp, T scale_m, T grav,
                                 bool use_cond, bool moist_cappa,
                                 bool last_call, bool fp_out, bool use_logp,
                                 const T *delp, const T *pt, const T *q_con,
@@ -699,16 +713,38 @@ FV3_VERTICAL_HD inline void riem_solver3_column(int ms, T dt, T rgas, T gama, T 
                                 T *m_top, T *r_bot, T *r_top, T *wbar, T *pbar,
                                 T *cm, T *wc, T *dm_tmp, T *wm, T *dz_tmp,
                                 int km) {
+  /* grav was the literal T(9.8) here. nh_core.F90:100 sets rgrav = 1./grav from
+   * constants_mod and :154 applies dm = dm*rgrav, so this is the SAME gravity
+   * that builds the state -- there is only one grav in the authoritative code.
+   * Hardcoding it made the D-grid Riemann solver disagree with cfg.grav, which
+   * Riem_Solver_C (fv3_riem_solver_c.cu:404) and gz = grav*zh
+   * (wp_d_contract_cuda.cpp:42) both use, i.e. two gravities inside one acoustic
+   * substep. Because dm is the coefficient of the very gamma-law invariant SIM1
+   * inverts (nh_utils.F90:1234), a ratio f = 1.00067857 became a spurious
+   * perturbation pressure pm2*(f^gama - 1) of 1.08 Pa at k=0 rising to 73.0 Pa
+   * at k=9 -- bottom-weighted -- destroying an exact rest state: measured
+   * w = +9.206721742e-02 m/s at the first vertical solve from bitwise-zero wind,
+   * reproduced to 10 significant digits in host double and falling to 2.011e-13
+   * once the two gravities agree.
+   *
+   * riem_solver3_column had no grav parameter at all, so this was a missing
+   * plumbing path, not a mistyped constant. Milestone 3A.11V.
+   * Numerical semantics changed: YES -- a repair toward the authoritative
+   * Fortran, not away from it. The authoritative VALUE of constants_mod grav is
+   * NOT VERIFIED here (FMS constants_mod is absent from this filesystem; FMS has
+   * historically used 9.80 while GEOS/MAPL uses 9.80665). That ambiguity does
+   * not affect this fix: the defect is the DISAGREEMENT, and using the single
+   * configured value is correct whichever value the build supplies. */
   riem3_precompute_column(delp, pt, q_con, cappa_in, zh_in, w_in, ptop, kappa,
-                          T(9.8), use_cond, moist_cappa, dm, pm, pem, peln2,
+                          grav, use_cond, moist_cappa, dm, pm, pem, peln2,
                           pk3_tmp, gm, cp, dz, w2, peg, pelng, km);
 
   if (a_imp < T(-0.999)) {
-    sim3p0_column(dt, rgas, gama, kappa, p_fac, scale_m, dm, pt, pem, w2, dz,
-                  ws, pe2, aa, bb, dd, w1, g_rat, gam, pp, bet, p1, km);
+    sim3p0_column(dt, rgas, gama, kappa, p_fac, scale_m, grav, dm, pt, pem, w2,
+                  dz, ws, pe2, aa, bb, dd, w1, g_rat, gam, pp, bet, p1, km);
   } else if (a_imp < T(-0.5)) {
-    sim3_column(dt, rgas, gama, kappa, -a_imp, p_fac, scale_m, dm, pt, pem, w2,
-                dz, ws, pe2, aa, bb, dd, w1, wk, g_rat, gam, pp, bet, p1, km);
+    sim3_column(dt, rgas, gama, kappa, -a_imp, p_fac, scale_m, grav, dm, pt, pem,
+                w2, dz, ws, pe2, aa, bb, dd, w1, wk, g_rat, gam, pp, bet, p1, km);
   } else if (a_imp <= T(0.5)) {
     rim_2d_column(ms, dt, rgas, gama, moist_cappa, gm, dm, pm, pt, ws, dz, w2,
                   pe2, dts, pf1, r_lo, r_hi, m_bot, m_top, r_bot, r_top, wbar,

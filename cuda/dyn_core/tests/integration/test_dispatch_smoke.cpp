@@ -71,24 +71,30 @@ static constexpr int64_t NJ = 8;
 static constexpr int64_t NPZ = 10;
 static constexpr uint32_t HALO = 3;
 
-// bind_wp_d's contract (wp_d_contract.cpp) requires peln's k-slot (axis 2)
-// to satisfy lower[2] <= js-2 (its hardcoded p=2 halo constant; pe uses
-// p=1), but launch_vertical_solver's riem_solver3_kernel requires that same
-// slot's registered lower[2] to make every (k - lower[2]) offset for
-// k=0..npz land in-bounds (see the lo_3d/lo_3d_if comment below for the
-// original 0-based-k fix). A single shared lower[2]=0 satisfies the vertical
-// solver but not bind_wp_d's peln check (0 <= -1 is false); lower[2]=0 only
-// satisfies bind_wp_d's looser pe check by coincidence at this domain size.
-// Give pe/peln their own k-padded buffer instead: kPelnHaloPad dummy leading
-// k-slices that the vertical solver's k=0..npz loop never addresses (its
-// offsets land at buffer positions kPelnHaloPad..kPelnHaloPad+npz), while
-// lower[2] = -kPelnHaloPad lets bind_wp_d's coverage check pass. Both WP-C's
-// view3()/cview3() (fv3_vertical_kernels.cu) and WP-D's view3_const()
-// (wp_d_operators.hpp) build device views generically from each field's own
-// registered lower[]/stride[], so this is a per-field bookkeeping choice,
-// not a kernel change -- no field data used by any executed kernel moves or
-// changes value, it just lives kPelnHaloPad slices further into its buffer.
-static constexpr int64_t kPelnHaloPad = 2;
+// Milestone 3A.11T: pe/peln are registered (i, k, j), NOT (i, j, k).
+//
+// This is the FV3 exception to the usual convention, and it is uniform across
+// the entire authoritative tree -- ~40 declaration sites, zero exceptions:
+//   nh_core.F90:87-88     pe(is-1:ie+1,km+1,js-1:je+1), peln(is:ie,km+1,js:je)
+//   dyn_core.F90:202-203  same, as dyn_core's own dummies
+//   dyn_core.F90:2123-4   geopk's intent(out) pe/peln
+//   fv_arrays.F90:1472-4  allocate(Atm%pe(is-1:ie+1, npz+1, js-1:je+1))
+// with body-level proof at geopk's `pe(i,1,j) = ptop` (dyn_core.F90:2191) and
+// fv_dynamics.F90:611's surface read `pe(i,npz+1,j)`. Every other pressure
+// field -- pk, pkz, pkc, pk3 -- really is (i,j,k); only pe/peln invert.
+//
+// A previous revision registered them (i,j,k) with a 2-slice k pad
+// (`kPelnHaloPad`) bolted on. That pad existed solely to make bind_wp_d's
+// coverage check `lower[2] <= js - 2` pass. But that check is CORRECT and was
+// being misread: in the authoritative layout axis 2 IS j, so WP-D is asking
+// for a 2-deep j halo -- and the harness was padding its VERTICAL axis to
+// satisfy a horizontal-halo requirement. Two consequences of the old form:
+//   * it only ever passed when npz + pad >= nj_h, i.e. by arithmetic accident
+//     at 8x8x10; at 16x16x10 bind_wp_d would have rejected outright.
+//   * pe/peln were transposed against every authoritative consumer.
+// Registering the real layout makes the check `jsd <= js - 2` -- true at any
+// domain size for HALO >= 2 -- so the pad is not merely unnecessary, it was
+// masking the defect.
 
 fv3_gpu_field_desc make_field(FieldId id, void *base, int rank,
                               const int64_t *lower, const uint64_t *extent,
@@ -293,13 +299,16 @@ HostState make_host_state() {
   h.npz1 = NPZ + 1;
   h.size_3d = (size_t)(h.ni_h * h.nj_h * NPZ);
   h.size_3d_if = (size_t)(h.ni_h * h.nj_h * h.npz1);
-  h.size_3d_pe = (size_t)(h.ni_h * h.nj_h * (h.npz1 + kPelnHaloPad));
+  // pe/peln: (i, k, j) -- i fastest, then k, then j. Same element count as an
+  // interface field, just a different axis order (no pad; see the file-header
+  // note where kPelnHaloPad used to live).
+  h.size_3d_pe = (size_t)(h.ni_h * h.npz1 * h.nj_h);
   h.size_2d = (size_t)(h.ni_h * h.nj_h);
 
   h.delp.assign(h.size_3d, 0); h.pt.assign(h.size_3d, 0); h.w.assign(h.size_3d, 0);
   h.delz.assign(h.size_3d, 0); h.q_con.assign(h.size_3d, 0); h.cappa.assign(h.size_3d, 0);
   h.uc.assign(h.size_3d, 0); h.vc.assign(h.size_3d, 0); h.delpc.assign(h.size_3d, 0);
-  // pe/peln get their own k-padded buffer -- see kPelnHaloPad's comment.
+  // pe/peln carry the authoritative (i,k,j) axis order, hence their own size.
   h.pe.assign(h.size_3d_pe, 0); h.peln.assign(h.size_3d_pe, 0);
   h.pk.assign(h.size_3d_if, 0); h.pk3.assign(h.size_3d_if, 0); h.pkc.assign(h.size_3d_if, 0);
   h.zh.assign(h.size_3d_if, 0); h.gz.assign(h.size_3d_if, 0);
@@ -415,12 +424,12 @@ HostState make_host_state() {
         // result would just be float32 rounding noise, not a real signal.
         const fv_real horiz = 0.02 * std::sin(0.35 * (fv_real)i) *
                                std::cos(0.35 * (fv_real)j);
-        // pe/peln live kPelnHaloPad slices further into their own
-        // k-padded buffer (see kPelnHaloPad's comment) -- the vertical
-        // solver's k=0..npz loop reaches exactly this shifted range via
-        // its view's registered lower[2] = -kPelnHaloPad.
-        const size_t idx_pe = i + j * (size_t)h.ni_h +
-                              (k + (size_t)kPelnHaloPad) * (size_t)h.ni_h * (size_t)h.nj_h;
+        // pe/peln are (i, k, j): k is the MIDDLE axis, so it strides by ni_h
+        // and j strides by ni_h*npz1. Compare `idx` above, which is the
+        // ordinary (i,j,k). Seeding through this index rather than `idx` is
+        // what makes the host state agree with the registered descriptor.
+        const size_t idx_pe = i + k * (size_t)h.ni_h +
+                              j * (size_t)h.ni_h * (size_t)h.npz1;
         h.pe[idx_pe] = p;
         h.peln[idx_pe] = std::log(p);
         h.pk[idx] = std::pow(p, h.akap) * (1.0 + horiz);
@@ -661,18 +670,22 @@ std::vector<fv3_gpu_field_desc> make_fields(HostState &h) {
   st_3d[1] = st_3d_if[1] = h.ni_h;
   st_3d[2] = st_3d_if[2] = h.ni_h * h.nj_h;
 
-  // pe/peln: own k-padded shape (see kPelnHaloPad's comment) -- same (i,j)
-  // box and stride as lo_3d_if, but lower[2] shifted to -kPelnHaloPad and
-  // extent[2] grown to match, so bind_wp_d's coverage check on axis 2
-  // (lower[2] <= js-p) can pass while the vertical solver's k=0..npz
-  // accesses still land on the real data at buffer offset kPelnHaloPad+k.
+  /* pe/peln: authoritative (i, k, j) -- slot 1 is the VERTICAL axis and slot 2
+   * is j. See the file-header note. Mapping, slot by slot:
+   *   slot 0 = i : same box and unit stride as every other field
+   *   slot 1 = k : 0-based, npz1 deep, strides by ni_h
+   *   slot 2 = j : same box as slot 1 of an (i,j,k) field, strides ni_h*npz1
+   * k stays 0-based to match riem_solver3_kernel's documented convention
+   * (Fortran k=1..npz+1 -> 0..npz); the kernel now hands k to the middle
+   * argument of View3::at, so descriptor and kernel agree by construction.
+   * bind_wp_d's `lower[2] <= js - 2` is now a genuine j-halo test and passes
+   * as jsd <= js-2 for any domain with HALO >= 2. */
   static thread_local int64_t lo_pe[3];
   static thread_local uint64_t ex_pe[3];
   static thread_local int64_t st_pe[3];
-  lo_pe[0] = lo_3d_if[0]; lo_pe[1] = lo_3d_if[1]; lo_pe[2] = -kPelnHaloPad;
-  ex_pe[0] = ex_3d_if[0]; ex_pe[1] = ex_3d_if[1];
-  ex_pe[2] = (uint64_t)(h.npz1 + kPelnHaloPad);
-  st_pe[0] = st_3d_if[0]; st_pe[1] = st_3d_if[1]; st_pe[2] = st_3d_if[2];
+  lo_pe[0] = lo_3d_if[0]; lo_pe[1] = 0;                lo_pe[2] = lo_3d_if[1];
+  ex_pe[0] = ex_3d_if[0]; ex_pe[1] = (uint64_t)h.npz1; ex_pe[2] = ex_3d_if[1];
+  st_pe[0] = 1;           st_pe[1] = h.ni_h;           st_pe[2] = h.ni_h * h.npz1;
   const uint64_t bytes_pe = h.size_3d_pe * sizeof(fv_real);
 
   lo_2d[0] = 1 - (int64_t)HALO; lo_2d[1] = 1 - (int64_t)HALO;
@@ -845,9 +858,10 @@ std::vector<fv3_gpu_field_desc> make_fields(HostState &h) {
   // are therefore load-bearing, not defensive.
   //
   // omga must use lo_3d EXACTLY, not lo_3d_if and not lo_pe: the predictor
-  // requires every one of its 15 mutable-state 3-D fields to share
-  // delp's lower[2], so a -kPelnHaloPad or interface-level registration is
-  // rejected even though it would "cover" the range.
+  // requires every one of its 15 mutable-state 3-D fields to share delp's
+  // lower[2], so an interface-level registration is rejected even though it
+  // would "cover" the range -- and lo_pe is doubly wrong here, since pe/peln
+  // deliberately carry a different axis ORDER, not just different bounds.
   fields.push_back(make_field(FieldId::omga, h.omga.data(), 3, lo_3d, ex_3d, st_3d, bytes_3d));
   // f_c is the dual-mesh Coriolis term (B stagger), a different field from f0
   // registered in group 3 above. ws3 and phis are the C-grid surface pair

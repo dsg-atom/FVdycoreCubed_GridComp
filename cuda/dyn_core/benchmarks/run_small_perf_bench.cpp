@@ -20,11 +20,22 @@
 #include "fv3_gpu_halo_peer.hpp"
 #include "fv3_gpu_halo_topology.hpp"
 #include "fv3_gpu_production_dispatch.hpp"
+// Milestone 3A.11V Task 2: the benchmark no longer invents per-level damping
+// arrays; it calls the shared authoritative translation of dyn_core.F90:677-765.
+#include "fv3_damping_translation.hpp"
+// 3A.11V Task 1: globally single-valued cubed-sphere geometry and analytic
+// fields. Benchmark/test infrastructure only -- deliberately NOT linked into
+// fv3_dyn_core_gpu. See the header for the provenance table and, importantly,
+// for what it does NOT provide (grid metrics: the harness keeps its fabricated
+// uniform 100 km metrics, so the IC is globally consistent but not balanced).
+#include "fv3_cube_geometry.hpp"
 
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <thread>
@@ -32,30 +43,37 @@
 #include <vector>
 
 using namespace fv3::gpu;
+namespace cube = fv3::bench::cube;
 
 static int64_t NI = 8;      // runtime-configurable for the perf benchmark (3A.11)
 static int64_t NJ = 8;      // runtime-configurable for the perf benchmark (3A.11)
 static int64_t NPZ = 10;    // runtime-configurable for the perf benchmark (3A.11)
 static constexpr uint32_t HALO = 3;
 
-// bind_wp_d's contract (wp_d_contract.cpp) requires peln's k-slot (axis 2)
-// to satisfy lower[2] <= js-2 (its hardcoded p=2 halo constant; pe uses
-// p=1), but launch_vertical_solver's riem_solver3_kernel requires that same
-// slot's registered lower[2] to make every (k - lower[2]) offset for
-// k=0..npz land in-bounds (see the lo_3d/lo_3d_if comment below for the
-// original 0-based-k fix). A single shared lower[2]=0 satisfies the vertical
-// solver but not bind_wp_d's peln check (0 <= -1 is false); lower[2]=0 only
-// satisfies bind_wp_d's looser pe check by coincidence at this domain size.
-// Give pe/peln their own k-padded buffer instead: kPelnHaloPad dummy leading
-// k-slices that the vertical solver's k=0..npz loop never addresses (its
-// offsets land at buffer positions kPelnHaloPad..kPelnHaloPad+npz), while
-// lower[2] = -kPelnHaloPad lets bind_wp_d's coverage check pass. Both WP-C's
-// view3()/cview3() (fv3_vertical_kernels.cu) and WP-D's view3_const()
-// (wp_d_operators.hpp) build device views generically from each field's own
-// registered lower[]/stride[], so this is a per-field bookkeeping choice,
-// not a kernel change -- no field data used by any executed kernel moves or
-// changes value, it just lives kPelnHaloPad slices further into its buffer.
-static constexpr int64_t kPelnHaloPad = 2;
+// Milestone 3A.11T: pe/peln are registered (i, k, j), NOT (i, j, k).
+//
+// This is the FV3 exception to the usual convention, and it is uniform across
+// the entire authoritative tree -- ~40 declaration sites, zero exceptions:
+//   nh_core.F90:87-88     pe(is-1:ie+1,km+1,js-1:je+1), peln(is:ie,km+1,js:je)
+//   dyn_core.F90:202-203  same, as dyn_core's own dummies
+//   dyn_core.F90:2123-4   geopk's intent(out) pe/peln
+//   fv_arrays.F90:1472-4  allocate(Atm%pe(is-1:ie+1, npz+1, js-1:je+1))
+// with body-level proof at geopk's `pe(i,1,j) = ptop` (dyn_core.F90:2191) and
+// fv_dynamics.F90:611's surface read `pe(i,npz+1,j)`. Every other pressure
+// field -- pk, pkz, pkc, pk3 -- really is (i,j,k); only pe/peln invert.
+//
+// A previous revision registered them (i,j,k) with a 2-slice k pad
+// (`kPelnHaloPad`) bolted on. That pad existed solely to make bind_wp_d's
+// coverage check `lower[2] <= js - 2` pass. But that check is CORRECT and was
+// being misread: in the authoritative layout axis 2 IS j, so WP-D is asking
+// for a 2-deep j halo -- and the harness was padding its VERTICAL axis to
+// satisfy a horizontal-halo requirement. Two consequences of the old form:
+//   * it only ever passed when npz + pad >= nj_h, i.e. by arithmetic accident
+//     at 8x8x10; at 16x16x10 bind_wp_d would have rejected outright.
+//   * pe/peln were transposed against every authoritative consumer.
+// Registering the real layout makes the check `jsd <= js - 2` -- true at any
+// domain size for HALO >= 2 -- so the pad is not merely unnecessary, it was
+// masking the defect.
 
 fv3_gpu_field_desc make_field(FieldId id, void *base, int rank,
                               const int64_t *lower, const uint64_t *extent,
@@ -205,10 +223,21 @@ struct HostState {
       cosa_s, rsin2, area, rdxa, rdya, cosa, rsina, rsin_u, rsin_v, f0;
   std::vector<fv_real> sin_sg; // 3D: (i, j, 0..3) cell-edge components
   // (4) the ten per-level damping controls dyn_core.F90:699-765 recomputes
-  // inside its k loop. These are what make a MIXED-branch run possible: see
-  // make_host_state for the deliberately non-uniform nord_k pattern.
+  // inside its k loop, as fv_real device-upload buffers. Milestone 3A.11V Task 2:
+  // these are filled from fv3::gpu::damping::translate_damping(), not from a
+  // pattern invented here.
   std::vector<fv_real> lv_nord_k, lv_ndif, lv_nord_w, lv_d2_bg, lv_d4_bg;
   std::vector<fv_real> lv_damp_v, lv_damp_w, lv_damp_t, lv_d_con, lv_kgb;
+  // The translated column and flags, retained in double precision so the
+  // stability report printed at config time reports on the same numbers the
+  // translation produced rather than on their fv_real round-trip. Also the
+  // scalars NumericalConfig needs, so a scalar cannot disagree with the column.
+  fv3::gpu::damping::DampingFlags tr_flags;
+  fv3::gpu::damping::DampingColumn tr_col;
+  int tr_nord = 0;
+  int tr_nord_t = 0;
+  fv_real tr_dddmp = 0;
+  fv_real tr_d_con = 0;
 
   // Milestone 3A.9: the six fields the two newly-reachable C-grid stages
   // (cgrid_predictor, cgrid_vertical_solver) require and that no earlier
@@ -230,10 +259,332 @@ struct HostState {
   std::vector<fv_real> omga, f_c, cos_sg, dp_ref, ws3, phis;
 
   fv_real ptop, akap, grav;
+
+  /* Milestone 3A.11T diagnostic switch.  When set (FV3_BENCH_ORTHO_METRIC=1)
+   * the grid metric collapses to the exactly orthogonal case
+   * cos_sg == 0, sin_sg == 1 that fv_grid_utils.F90:492-493 uses for
+   * grid_type >= 3.  The default remains a small-angle NON-orthogonal metric,
+   * which is what a grid_type == 0 cubed sphere actually presents; the switch
+   * exists so that "is the residual growth driven by the angle terms at all?"
+   * can be answered without rebuilding. */
+  bool ortho_metric;
+
+  /* Milestone 3A.11T diagnostic scale on del6_u/del6_v only
+   * (FV3_BENCH_DEL6_SCALE).  1.0 is the authoritative value for this geometry
+   * (fv_grid_utils.F90:787/:794 with dx == dyc); before 3A.11T the harness used
+   * 0.5, i.e. half the diffusion coefficient the grid implies.  The switch
+   * exists so the effect of that magnitude alone can be separated from the
+   * angle-metric repair it shipped with. */
+  fv_real del6_scale;
 };
 
-HostState make_host_state() {
+/* --- Milestone 3A.11T §7 damping bisection --------------------------------
+ *
+ * FV3_BENCH_DAMP selects which damping families are live, so the residual
+ * multi-step growing mode can be attributed to one of them without touching
+ * production code.  Default (unset) is the full production-coverage set.  This
+ * is a DIAGNOSTIC control on benchmark INPUT only; it disables no guard and
+ * changes no kernel.
+ *
+ *   none       every damping family off
+ *   nodivdamp  divergence damping off (d2_bg / d4_bg / dddmp), del6 flux on
+ *   nodel6     del6_vt_flux family off (damp_v / damp_w / damp_t), divg on
+ *   noheat     d_con / n_con off (the KE-dissipation heating path)
+ *
+ * The per-level arrays must be zeroed inside make_host_state, NOT in
+ * production_config: setup() runs fv3_gpu_initialize_state (the H2D of every
+ * registered field, the lv_* damping controls included) BEFORE install_config,
+ * so a mutation made at config time would never reach the device.
+ */
+/* FV3_BENCH_DIVDAMP bisects WITHIN the divergence-damping family, which the
+ * FV3_BENCH_DAMP=nodivdamp leg proved is the sole necessary ingredient:
+ *   d2only   d4_bg := 0            -- second-order arm only
+ *   d4only   d2_bg := 0            -- high-order arm only
+ *   nosmag   dddmp := 0            -- sw_core.F90:1407-1411 takes `vort := 0`
+ *                                     instead of calling smag_corner
+ *   nord0    nord_k := 0 (all k)   -- pure branch L, sw_core.F90:1277-1358
+ *   nord1    nord_k := 1 (all k)   -- branch H, one n-sweep, fill_c never fires
+ *   nord2    nord_k := 2 (all k)   -- branch H, two n-sweeps, fill_c fires at n=1
+ */
+struct DampSelection {
+  bool no_divdamp, no_del6, no_heat;
+  bool d2only, d4only, nosmag;
+  int force_nord;  // -1 = leave the per-level pattern alone
+  /* FV3_BENCH_D4_SCALE multiplies every level's d4_bg. Milestone 3A.11T: an
+   * audit showed the CUDA divg_d nord loop is index-exact against
+   * sw_core.F90:1359-1423, so the nord1-PASS / nord2-FAIL split is not a
+   * transcription defect in that loop. The remaining candidate is that the
+   * bench's (da_min, d4_bg) pair sits above the del-2n stability limit for
+   * TWO sweeps but below it for one -- note dd8 = da_min*d4_bg**(nord+1) is
+   * actually SMALLER at nord=2 (4.7e7) than nord=1 (2.9e8), so magnitude alone
+   * is not the discriminator; the two-sweep operator's larger spectral radius
+   * is. Scaling d4_bg separates the two explanations: if nord2 becomes stable
+   * at a reduced d4_bg with the operator unchanged, the configuration is
+   * marginal (harness), not the port.
+   *
+   * MILESTONE 3A.11V -- ANSWERED: the configuration is marginal, not the port.
+   * The del-2n limit was re-derived term-by-term from the Fortran statements as
+   *
+   *     gamma_d4 = (8*d4_bg)**(nord+1) * (da_min/area_local),   unstable > 2
+   *
+   * (divergence_corner contributes 2 PER DIRECTION, not 2 total; an earlier
+   * estimate here counted a 1-D mode and was exactly 2x too small, which is why
+   * the "gamma_d == 2.055" prediction below was contradicted). Critical d4_bg is
+   * 2**(1/(nord+1))/8 = 0.2500 / 0.17678 / 0.15749 for nord 0/1/2. This table
+   * pairs d4_bg = 0.16 with nord_k = 2 at k%4 == 1, i.e. 1.6% OVER the limit.
+   *
+   * Confirmed by a PARAMETER-FREE threshold measurement at two different nord,
+   * on a seam-free IC (FV3_BENCH_HORIZ_SCALE=0), classified by functional form:
+   *     nord=1  predicted s* in [1.105, 1.127]   measured s* in (1.10, 1.15]
+   *     nord=2  predicted s* in [0.984, 0.998]   measured s* in (0.98, 1.00]
+   * The competing "ported operator is effectively too strong" hypothesis needed
+   * s* = 1.221 at nord=1 and is refuted. Growth is +0.0685 per acoustic substep
+   * and dt-INDEPENDENT (constant to +-2.5% over a 24x dt range via n_split
+   * 1..24), so it is not a CFL/timestep instability.
+   *
+   * The authoritative code never forms this pairing: FV_StateMod.F90:681 sets
+   * nord=2 while :683 sets d4_bg_top=0.12, giving gamma_d4 = 0.885 (2.26x
+   * margin). Raw fv_arrays.F90 defaults pair 0.16 with nord=1, gamma = 1.638.
+   * The (0.16, nord_k=2) pairing is an invention of this harness.
+   *
+   * Note the general limit has a SECOND, additive term on the nord>0 branch:
+   * sw_core.F90:1418 applies damp2*delpc + dd8*divg_d, contributing
+   * +8*max(d2_bg, min(0.20, dddmp*|div*dt|))*(da_min_c/area_c). It does not
+   * affect the thresholds above because d2_bg == 0.0 at exactly the k%4 == 1
+   * group that is critical, and a quiescent seam-free run leaves the
+   * Smagorinsky part ~0. It WOULD matter for any other group or a divergent
+   * flow. Per-group gamma at nord=2, s=1: 1.018 / 2.035 / 1.603 / 0.497. */
+  fv_real d4_scale;
+  /* FV3_BENCH_DAMPV_SCALE multiplies every level's damp_v, i.e. the del^6
+   * WIND-damping coefficient, leaving nord_v and every other damping arm alone.
+   *
+   * Why a separate knob from FV3_BENCH_DEL6_SCALE: del6_u/del6_v are consumed by
+   * all three del6 arms (damp_v at wp_b_dsw_cuda.cu:1238, damp_w at :1020,
+   * damp_t at :1044), so scaling the metric moves three coefficients at once and
+   * also fabricates a metric no grid corresponds to. This scales exactly one
+   * table column.
+   *
+   * What it tests. For a checkerboard mode on this uniform fabricated metric
+   * (dx == dy == dxc == dyc == 1e5, rarea == 1/dx^2, da_min_c == 9.900108e9,
+   * del6_u == del6_v == 1) each del^6 sweep in del6_vt_flux contributes -8*rarea
+   * and the final flux stage -2, damp4 == (damp_v*da_min_c)**(nord_v+1), and the
+   * consumer applies *rdx (wp_b_divergence_cuda.cu:534-560). The per-substep
+   * forward-Euler amplification is therefore
+   *
+   *     gamma_v = 4 * damp_v**(nord_v+1) * 8**nord_v
+   *
+   * which needs gamma_v <= 2. The fabricated table at :874/:878 gives
+   *
+   *     k%4 == 1  damp_v 0.10  nord_v 2  ->  0.256   stable
+   *     k%4 == 2  damp_v 0.05  nord_v 1  ->  0.080   stable
+   *     k%4 == 3  damp_v 0.20  nord_v 2  ->  2.048   UNSTABLE
+   *
+   * The nord_v == 2 ceiling is damp_v <= (2/256)**(1/3) == 0.198, so 0.20 is over
+   * it. That is the same order as FV3's documented 0.16 divergence-damping
+   * ceiling, which is a nord == 1 limit and does not carry to nord == 2.
+   *
+   * This is a diagnostic, not the fix. If a reduced damp_v is stable with the
+   * operator order untouched, the finding is that the HARNESS table pairs a
+   * high nord_v with a coefficient above that pairing's stability limit. */
+  fv_real dampv_scale;
+};
+
+DampSelection damp_selection() {
+  DampSelection d{false,        false, false, false,
+                  false,        false, -1,    (fv_real)1.0,
+                  (fv_real)1.0};
+  if (const char *sel = std::getenv("FV3_BENCH_DAMP")) {
+    const bool none = std::strcmp(sel, "none") == 0;
+    d.no_divdamp = none || std::strcmp(sel, "nodivdamp") == 0;
+    d.no_del6 = none || std::strcmp(sel, "nodel6") == 0;
+    d.no_heat = none || std::strcmp(sel, "noheat") == 0;
+  }
+  if (const char *sel = std::getenv("FV3_BENCH_DIVDAMP")) {
+    d.d2only = std::strcmp(sel, "d2only") == 0;
+    d.d4only = std::strcmp(sel, "d4only") == 0;
+    d.nosmag = std::strcmp(sel, "nosmag") == 0;
+    if (std::strcmp(sel, "nord0") == 0) d.force_nord = 0;
+    if (std::strcmp(sel, "nord1") == 0) d.force_nord = 1;
+    if (std::strcmp(sel, "nord2") == 0) d.force_nord = 2;
+  }
+  if (const char *s = std::getenv("FV3_BENCH_D4_SCALE")) {
+    const double v = std::atof(s);
+    /* Reject <= 0 rather than silently accepting it: 0 would be d2only under a
+     * different name and a negative value would flip the damping's sign, both
+     * of which would be read as "the scale test", which they are not. */
+    if (v > 0.0) d.d4_scale = (fv_real)v;
+  }
+  if (const char *s = std::getenv("FV3_BENCH_DAMPV_SCALE")) {
+    const double v = std::atof(s);
+    /* Same reasoning as d4_scale: 0 is "no del^6 wind damping" under a different
+     * name and a negative value reverses the damping's sign. Both would be read
+     * as a coefficient measurement and are not one. */
+    if (v > 0.0) d.dampv_scale = (fv_real)v;
+  }
+  return d;
+}
+
+/* Milestone 3A.11U: a scale factor on the INITIAL wind field only (uc, vc, u,
+ * v, ua, va). Diagnostic, not a configuration knob -- it exists to separate two
+ * explanations of the monotone delp growth measured at the owned cube corner
+ * (ie, js) on all six tiles, at both 8x8 and 16x16, from the very first
+ * acoustic substep:
+ *
+ *   PORT DEFECT   -- delp changes even with the state at rest. d_sw's delp
+ *                    update (sw_core.F90:1013) is strict flux form,
+ *                    delp = wk + (fx(i)-fx(i+1)+fy(j)-fy(j+1))*rarea, and with
+ *                    zero winds every flux is identically zero, so ANY change
+ *                    to delp at WIND_SCALE=0 is arithmetic that does not belong
+ *                    there, independent of the state.
+ *   STATE-DRIVEN  -- delp is bit-constant at rest and the growth rate scales
+ *                    with the wind amplitude. Then the carrier is the synthetic
+ *                    field itself: it is defined in LOCAL index space
+ *                    (x = 0.29*i, y = 0.23*j) identically on all six tiles and
+ *                    carries a large mean (u = +12, v = -7), so it is not a
+ *                    single globally consistent vector field on the cube. The
+ *                    D-grid seam transform then correctly delivers a halo u of
+ *                    about -10 against an owned +12 -- a real ~22 m/s shear at
+ *                    every panel seam, compounding where two seams meet.
+ *
+ * 0.0 is accepted and is the whole point, so unlike d4_scale/dampv_scale this
+ * does NOT reject zero. Negative is rejected: it would reverse the flow, which
+ * is a different experiment that would read as this one.
+ *
+ * READ THE FOLLOWING BEFORE USING WIND_SCALE=0 AS A REST STATE. The dichotomy
+ * above is INCOMPLETE, and reading it as complete produced a wrong conclusion
+ * that had to be retracted. WIND_SCALE=0 gives zero WIND, and nothing more. It
+ * does NOT give a horizontally uniform state, because the SCALARS carry their
+ * own local-index horizontal structure which this knob never touched:
+ * horiz_pert on pt/delz/zh/gz, the metric `horiz` on area/rarea_c/f0, and the
+ * standalone patterns on ptc, z_rat, omga and heat_source. With those live,
+ * p_grad_c produces nonzero uc from a real gz gradient, d_sw's fluxes are
+ * legitimately nonzero, and delp legitimately changes -- so "delp changed at
+ * WIND_SCALE=0" does NOT imply a port defect. Use FV3_BENCH_HORIZ_SCALE=0
+ * together with this knob for an actually uniform state. */
+fv_real bench_wind_scale() {
+  if (const char *s = std::getenv("FV3_BENCH_WIND_SCALE")) {
+    const double v = std::atof(s);
+    if (v >= 0.0) return (fv_real)v;
+  }
+  return (fv_real)1.0;
+}
+
+/* Scales the AMPLITUDE of the horizontal shape function in the synthetic initial
+ * state. Defaults to 1.0.
+ *
+ * 3A.11V Task 1 CHANGED WHAT THIS KNOB MEANS. It no longer switches off a seam
+ * discontinuity, because there no longer is one: every horizontal perturbation
+ * is now cube::flow_shape(center(i,j)), a smooth single-valued function of
+ * position on the real gnomonic cubed sphere, so it is seam-consistent at any
+ * amplitude including 1.0. What the knob still does is set how strong the
+ * large-scale horizontal structure is, and 0.0 still collapses the horizontal to
+ * exactly uniform, which is what the exact-rest invariant below needs.
+ *
+ * So the ORIGINAL justification for the knob's existence is now obsolete and the
+ * knob is retained for the exact-rest control only. Everything from "WHY THIS
+ * KNOB HAS TO EXIST" down to the blank line before the exact-rest paragraph is
+ * HISTORICAL: it records the defect that motivated Task 1 and the measurement
+ * that proved it was IC forcing rather than a port defect. Do not read it as a
+ * description of the current state.
+ *
+ * Two caveats that do survive Task 1, because they are not about the seam:
+ *   - The fabricated uniform 100 km metrics are unchanged, so the state is
+ *     globally consistent but NOT in discrete balance. A smooth O(1) forcing
+ *     remains at scale 1.0 and this knob still scales it.
+ *   - area, rarea_c, f0 and f_c still carry a (1 + horiz) factor built from the
+ *     same shape function, so this knob perturbs the METRICS too, not only the
+ *     state. That is unchanged from before and is documented at those sites.
+ *
+ * --- HISTORICAL, describes the pre-3A.11V IC ---------------------------------
+ *
+ * WHY THIS KNOB HAS TO EXIST. Each of those perturbations is a function of the
+ * per-tile LOCAL array indices, seeded identically on all six tiles. That is
+ * not a single-valued field on a cubed sphere: the value seeded into tile T's
+ * ring-1 halo is not the value the neighbour tile owns at the cell that halo
+ * shadows, so the state has a genuine discontinuity across all twelve panel
+ * edges. The seam exchange then CORRECTLY transports the neighbour's differing
+ * value inward, and the resulting cliff is real input, not a port defect.
+ *
+ * This was measured, and the agreement is what makes it certain rather than
+ * plausible. At WIND_SCALE=0 the ring-1 surface pkc overshoot was +4182.3 Pa on
+ * tiles 1,3,5 at (i=2,j=0) and +1211.4 Pa on tiles 2,4,6 at (i=0,j=1). Both
+ * LOCATIONS follow from seam_along_index plus the odd/even parity rule (odd
+ * tiles are aligned on SOUTH, even tiles on WEST), and the RATIO follows from
+ * r^gama - 1 with r = (1+hp_owned)/(1+hp_ghost) and gama = 1/(1-akap) = 1.4:
+ * predicted 3.45464 against measured 4182.3132/1211.4443 = 3.45227, i.e. 0.069%.
+ * Both endpoints of the cube geometry and the thermodynamics are therefore
+ * accounted for, leaving nothing for a kernel defect to explain.
+ *
+ * --- end HISTORICAL ----------------------------------------------------------
+ *
+ * At HORIZ_SCALE=0 with WIND_SCALE=0 the state becomes exactly uniform in the
+ * horizontal and exactly at rest, and THEN the exact-rest invariant is a real
+ * test: every horizontal difference is exactly 0.0, p_grad_c's numerator is
+ * A*B + (-A)*B which is exactly 0.0 because IEEE subtraction is exactly
+ * antisymmetric, every flux is exactly 0, and every field must stay
+ * bit-constant forever. Any change at that point IS a port defect.
+ *
+ * Note the limitation, so it is not claimed as coverage: at HORIZ_SCALE=0 and
+ * WIND_SCALE=0 all six tiles are identical and every exchanged quantity is
+ * uniform, so this leg is BLIND to neighbour-mapping, stagger and sign defects
+ * -- a wrong seam map returns values indistinguishable from the right one.
+ * Those need the separate seam-sensitive test.
+ *
+ * 0.0 is accepted and is the point. Negative is rejected as a different
+ * experiment that would read as this one. */
+fv_real bench_horiz_scale() {
+  if (const char *s = std::getenv("FV3_BENCH_HORIZ_SCALE")) {
+    const double v = std::atof(s);
+    if (v >= 0.0) return (fv_real)v;
+  }
+  return (fv_real)1.0;
+}
+
+// Milestone 3A.11V Task 1: the state is now built on the ACTUAL gnomonic
+// cubed-sphere geometry, so every horizontal field is a smooth single-valued
+// function of position on the sphere rather than a function of the tile-local
+// array index. `tile` is therefore a required argument: it selects which part of
+// the sphere this state occupies, which is the whole point.
+//
+// What that buys, and what it does not:
+//   - It removes the O(1) discontinuity the old local-index patterns carried
+//     across all twelve panel seams. Verified by fv3_cube_seam_test: the
+//     analytic scalar agrees across every seam to 4.4e-16 and the D-grid
+//     components to 0.0/7.8e-14 over thousands of halo edges.
+//   - It does NOT make the state balanced. The harness keeps its fabricated
+//     uniform 100 km metrics (see the metric block below and the header of
+//     fv3_cube_geometry.hpp for why), so a smooth large-scale imbalance remains.
+//     "Globally consistent" and "balanced" are different claims; only the first
+//     is made here.
+//
+// Tiles now differ because they occupy different parts of the sphere, which is
+// why make_tile_asymmetric() is gone -- see the note at its former site.
+HostState make_host_state(int tile) {
   HostState h{};
+  // NI == NJ is enforced by the CLI (both come from --grid), and CubeGrid is
+  // square by construction. Assert rather than silently mis-index.
+  if (NI != NJ) {
+    printf("  FAIL: make_host_state requires NI == NJ (got %lld x %lld)\n",
+           (long long)NI, (long long)NJ);
+    std::abort();
+  }
+  const cube::CubeGrid cg((int)NI, tile, (int)HALO);
+  const cube::FlowParams flow{};
+  // Array index -> FV3 index. The harness allocates lo_3d = 1 - HALO = -2, so
+  // array slot 0 is FV3 index -2 and owned index i lives at slot i + HALO - 1.
+  auto fv = [](int64_t a) { return (int)(a - (int64_t)HALO + 1); };
+  /* Scales every INITIAL velocity component -- uc, vc, u, v, ua, va and the
+   * vertical w. w is included deliberately: at ws == 0 the intent is a state
+   * genuinely at rest, and a nonzero w alone would keep the nonhydrostatic
+   * solver evolving, which would make a "delp changed at rest" reading
+   * ambiguous. Defaults to 1.0, so the default configuration is unchanged. */
+  const fv_real ws = bench_wind_scale();
+  {
+    const char *e = std::getenv("FV3_BENCH_ORTHO_METRIC");
+    h.ortho_metric = (e != nullptr && e[0] == '1');
+    const char *s = std::getenv("FV3_BENCH_DEL6_SCALE");
+    h.del6_scale = (s != nullptr) ? (fv_real)std::atof(s) : (fv_real)1.0;
+  }
   // Milestone 3A.8: the horizontal box carries ONE EXTRA row and column beyond
   // the extended [is-HALO, ie+HALO] x [js-HALO, je+HALO] domain, i.e. every
   // field here is registered over [isd, ied+1] x [jsd, jed+1].
@@ -260,13 +611,16 @@ HostState make_host_state() {
   h.npz1 = NPZ + 1;
   h.size_3d = (size_t)(h.ni_h * h.nj_h * NPZ);
   h.size_3d_if = (size_t)(h.ni_h * h.nj_h * h.npz1);
-  h.size_3d_pe = (size_t)(h.ni_h * h.nj_h * (h.npz1 + kPelnHaloPad));
+  // pe/peln: (i, k, j) -- i fastest, then k, then j. Same element count as an
+  // interface field, just a different axis order (no pad; see the file-header
+  // note where kPelnHaloPad used to live).
+  h.size_3d_pe = (size_t)(h.ni_h * h.npz1 * h.nj_h);
   h.size_2d = (size_t)(h.ni_h * h.nj_h);
 
   h.delp.assign(h.size_3d, 0); h.pt.assign(h.size_3d, 0); h.w.assign(h.size_3d, 0);
   h.delz.assign(h.size_3d, 0); h.q_con.assign(h.size_3d, 0); h.cappa.assign(h.size_3d, 0);
   h.uc.assign(h.size_3d, 0); h.vc.assign(h.size_3d, 0); h.delpc.assign(h.size_3d, 0);
-  // pe/peln get their own k-padded buffer -- see kPelnHaloPad's comment.
+  // pe/peln carry the authoritative (i,k,j) axis order, hence their own size.
   h.pe.assign(h.size_3d_pe, 0); h.peln.assign(h.size_3d_pe, 0);
   h.pk.assign(h.size_3d_if, 0); h.pk3.assign(h.size_3d_if, 0); h.pkc.assign(h.size_3d_if, 0);
   h.zh.assign(h.size_3d_if, 0); h.gz.assign(h.size_3d_if, 0);
@@ -320,35 +674,266 @@ HostState make_host_state() {
                                   &h.lv_kgb})
     p->assign((size_t)NPZ, 0);
 
-  h.ptop = 100.0;
+  /* Vertical grid: LOG-SPACED in pressure, pe(k) = ptop*(psurf/ptop)^(k/npz).
+   *
+   * Milestone 3A.11T. The uniform-delp column this replaces was thermodynamically
+   * balanced -- the derivation below is unchanged and still correct -- but
+   * geometrically pathological, and that was a SECOND, independent harness
+   * defect. Uniform delp from 100 Pa to 100000 Pa puts a pressure ratio of 100.9
+   * across the topmost layer ALONE. Measured by tests/host/
+   * check_bench_column_balance.cpp, the balanced thicknesses then run -890 m at
+   * the surface to -37810 m at the top -- a 42.5:1 spread with a single 37.8 km
+   * layer -- and the interface pk increment that nh_p_grad scales its wind
+   * increment by spans 12.8:1 over the column. Empirically that column is not
+   * integrable: uc/vc grew 15 -> 64 m/s within one acoustic substep and the
+   * D-grid Riemann solver went non-finite at step 2, while the C-grid stages
+   * stayed perfectly clean through step 0 (delpc 9974..9996, ptc 10.72..31.51,
+   * flat across all three substeps). So the amplifier was the vertical grid, not
+   * any C-grid stage -- and thermodynamic balance alone is not sufficient.
+   *
+   * Log spacing is the well-conditioned choice for a nonhydrostatic solver:
+   * uniform d(ln p) means uniform delz. With H = RT/g ~ 8 km the layers come out
+   * -3774 m at the top and -3895 m at the bottom, a 1.0:1 spread, and the pk
+   * increment spans 3.3:1. ptop moves to 1000 Pa (10 hPa), a plausible top for a
+   * 10-level column, and the total depth is ln(100)*H ~ 38.3 km -- which is what
+   * a real atmosphere does between 10 hPa and the surface.
+   *
+   * This is a HARNESS grid choice. No production CUDA numerics and no
+   * production guard were touched to accommodate it. */
+  h.ptop = 1000.0;
   const fv_real psurf = 100000.0;
-  const fv_real dp_uniform = (psurf - h.ptop) / NPZ;
   h.grav = 9.80665;
+  /* FV3_BENCH_GRAV -- DIAGNOSTIC ONLY. It exists because the CUDA path is
+   * internally inconsistent about g in a way the authoritative Fortran cannot be:
+   *   - Riem_Solver3's precompute hardcodes T(9.8) (fv3_vertical_column.hpp:703),
+   *     consumed as rgrav = 1/grav scaling dm (:161,:175), and
+   *     fv3_vertical_kernels.cu never references grav at ALL, so cfg.grav does
+   *     not reach the D-grid Riemann path;
+   *   - Riem_Solver_c uses cfg.grav (fv3_riem_solver_c.cu:404) and so does
+   *     gz = grav*zh (wp_d_contract_cuda.cpp:42).
+   * In nh_core.F90:100 / nh_utils.F90:348 both read the SAME constants_mod grav,
+   * so the Fortran is self-consistent at whatever value that is (NOT VERIFIED
+   * here: FMS constants_mod is not on this filesystem, and FMS has historically
+   * used 9.80 rather than 9.80665, so which side is faithful is undetermined).
+   * The CUDA path runs TWO gravities inside one acoustic substep regardless.
+   *
+   * Why this knob is the clean test: the balanced column below is derived with
+   * h.grav (:717) and its SIM1 invariant (:622) is stated in terms of it, and
+   * cfg.grav = h.grav (:1411). Setting this to 9.8 therefore makes the IC, the
+   * runtime config and the hardcoded riem3 value all agree -- the one
+   * configuration in which an exact rest state should be an exact fixed point of
+   * Riem_Solver3. Predicted effect if the inconsistency is the mechanism: the
+   * spurious first-substep w at the vertical_solver stage falls from ~9.2e-02 to
+   * roundoff, because pe stops being inflated by (9.80665/9.8)^gama - 1 = 9.5e-4
+   * of pm2 (i.e. 1.2 Pa at k=0 rising to 76 Pa at k=9, largest at the bottom
+   * level where the mode localizes).
+   *
+   * This is NOT a fix. It changes only the harness; the production inconsistency
+   * at fv3_vertical_column.hpp:703 is untouched, and a rest state preserved
+   * under this knob is evidence about the mechanism, not restored correctness. */
+  if (const char *s = std::getenv("FV3_BENCH_GRAV")) {
+    const double v = std::atof(s);
+    /* Reject <= 0 rather than silently accepting: rgrav = 1/grav, so 0 divides
+     * and a negative g inverts the column, and either would still be read as a
+     * "consistent-gravity measurement", which it would not be. */
+    if (v > 0.0) {
+      h.grav = (fv_real)v;
+      std::fprintf(stderr,
+                   "[BENCH] FV3_BENCH_GRAV=%.9g -> IC + cfg.grav "
+                   "(riem3 precompute stays hardcoded 9.8)\n",
+                   (double)h.grav);
+    }
+  }
   h.akap = fv_real(2.0 / 7.0);
+  // Must equal cfg.rdgas below: the balanced column is derived with it, and the
+  // solver evaluates the same invariant with cfg's value.
+  const double kRdgas = 287.0;
+
+  // Interface pressures, and the layer thicknesses they imply. delp is NOT
+  // uniform any more -- every consumer below reads delp_col[k].
+  std::vector<double> pe_face((size_t)NPZ + 1), delp_col((size_t)NPZ);
+  {
+    const double lr = std::log((double)psurf / (double)h.ptop) / (double)NPZ;
+    for (int64_t k = 0; k <= NPZ; ++k)
+      pe_face[(size_t)k] = (double)h.ptop * std::exp(lr * (double)k);
+    pe_face[(size_t)NPZ] = (double)psurf; // pin the surface face exactly
+    for (int64_t k = 0; k < NPZ; ++k)
+      delp_col[(size_t)k] = pe_face[(size_t)k + 1] - pe_face[(size_t)k];
+  }
+
+  /* ------------------------------------------------------------------------
+   * Milestone 3A.11T. A BALANCED column, derived rather than asserted.
+   *
+   * SIM1_solver's first statement (nh_utils.F90:1232) is
+   *
+   *   pe(i,k) = exp(gama*log(-dm2/dz2*rgas*pt2)) - pm2      gama = 1/(1-akap)
+   *
+   * where dm2 = delp/grav, dz2 = delz < 0 and pm2 is the layer's log-mean
+   * pressure (Riem_Solver_c:396). `pe` is a PERTURBATION: Riem_Solver_c adds
+   * the hydrostatic component back at :417. So the state must satisfy
+   *
+   *   X ^ gama == pm2,   X = (rdgas/grav) * delp / (-delz) * pt
+   *
+   * and dyn_core.F90:1075 raises the SAME X to akap/(1-akap) to get pkz, so
+   * the relation also fixes pkz = pm2^akap, the Exner function.
+   *
+   * The state this harness used through 3A.11S violated that by two compounding
+   * factors and was therefore unintegrable:
+   *
+   *   1. pt was seeded as an ABSOLUTE temperature, 280..290 K. It is not one.
+   *      fv_dynamics.F90:552 executes `pt(i,j,k) = pt(i,j,k)/pkz(i,j,k)`
+   *      BEFORE calling dyn_core, so every pt inside dyn_core -- including
+   *      Riem_Solver_c's `pt` dummy at nh_utils.F90:333 -- is a virtual
+   *      temperature divided by the Exner function. For this column that is
+   *      order 11 at the surface and 31 at the top, not 280.
+   *   2. delz was seeded as a uniform -1000 m to match an assumed 10 km deep
+   *      zh column. The ideal-gas law does not permit that alongside uniform
+   *      delp: the balanced thicknesses run -890 m at the surface to -37810 m
+   *      in the topmost layer, and the column is 56.8 km deep, not 10 km.
+   *
+   * Measured consequence, by tests/host/check_bench_column_balance.cpp:
+   * X^gama/pm2 ran 83 at k=9 to 3490 at k=0, i.e. SIM1 saw a perturbation
+   * pressure of 7.8e6 Pa -- 77 ATMOSPHERES -- on the very first call, at every
+   * level, before a single step was integrated. That is what pef/pkc carried
+   * into p_grad_c; the resulting uc/vc increments are orders of magnitude
+   * beyond anything physical, the D-grid transport drove delp down (owned
+   * interior 9990 -> 3175 Pa over six steps, NOT edge-confined), and once the
+   * first delpc went negative SIM1's log argument went negative -> NaN. The
+   * authoritative Fortran has no guard there and would NaN identically; this
+   * was never a port defect.
+   *
+   * So: keep delp uniform and keep a physical temperature profile, then let the
+   * two authoritative relations above determine delz, pt and pkz, and build
+   * zh/gz from that delz. The horizontal signal p_grad_c needs now rides on
+   * TEMPERATURE, which is how a real baroclinic state carries it -- pe/pk stay
+   * horizontally uniform (they must, being an exact pk = pe^akap pair) while
+   * gz acquires a genuine horizontal gradient through delz. The previous
+   * `(1.0 + horiz)` factors on pk and gz are gone: they perturbed the answer
+   * without perturbing the state it was derived from, which is just a second
+   * imbalance.
+   * ---------------------------------------------------------------------- */
+  std::vector<double> pm2_col(NPZ), temp_col(NPZ), pkz_col(NPZ);
+  for (int64_t k = 0; k < NPZ; ++k) {
+    const double pe_top = pe_face[(size_t)k];
+    const double pe_bot = pe_face[(size_t)k + 1];
+    pm2_col[k] = (pe_bot - pe_top) / std::log(pe_bot / pe_top);
+    temp_col[k] = 280.0 + 10.0 * ((double)k / (double)NPZ);
+    pkz_col[k] = std::exp((double)h.akap * std::log(pm2_col[k]));
+  }
+  // Horizontal temperature perturbation: +-2%, about +-5.7 K, a realistic
+  // gradient. It must be nonzero or p_grad_c's two terms cancel exactly in
+  // exact arithmetic and the stage cannot be distinguished from a no-op.
+  // Scaled by FV3_BENCH_HORIZ_SCALE.
+  //
+  // 3A.11V Task 1: this was `0.02*sin(0.35*i)*cos(0.35*j)` on the tile-local
+  // array index, identical on all six tiles, and therefore discontinuous across
+  // every panel seam -- the forcing whose consequence was measured at +4182.3 Pa
+  // / +1211.4 Pa of ring-1 pkc overshoot. It is now the Williamson-2 shape
+  // function S(lon,lat) evaluated at the cell's TRUE position on the cubed
+  // sphere, which is single-valued by construction. Amplitude is unchanged at
+  // +-2% (about +-5.7 K) because S is in [-1,1] exactly as the old sin*cos was.
+  // It reaches pt, delz, zh and gz below.
+  const double hscale = (double)bench_horiz_scale();
+  auto horiz_pert = [&](int64_t ai, int64_t aj) {
+    return hscale * 0.02 * cube::flow_shape(cg.center(fv(ai), fv(aj)), flow);
+  };
+
+  // Two further INDEPENDENT global shapes, both in [-1,1] like flow_shape.
+  //
+  // The reason these exist rather than reusing flow_shape everywhere: the fields
+  // that consumed the old tile-local patterns used DIFFERENT patterns on purpose
+  // (`sin(x+y)` for ptc against `sin(x-y)` for z_rat), so that a product or
+  // difference of two of them could not cancel identically and hide a
+  // transcription error. Making every field proportional to one shape would throw
+  // that away.
+  //
+  // The reason it is free to do this: ANY smooth function of the TRUE (lon,lat)
+  // is single-valued on the sphere, so independence between patterns costs
+  // nothing and cannot reintroduce a seam discontinuity. Both are finite at the
+  // poles (the cos(lat) / sin(2*lat) factors vanish there) and both are 2*pi
+  // periodic in lon, so there is no branch-cut artifact at the lon = +-pi seam
+  // that global_corner's wrap_pi produces.
+  auto shape2 = [&](int64_t ai, int64_t aj) {
+    const cube::LonLat p = cg.center(fv(ai), fv(aj));
+    return std::sin(2.0 * p.lon) * std::cos(p.lat);
+  };
+  auto shape3 = [&](int64_t ai, int64_t aj) {
+    const cube::LonLat p = cg.center(fv(ai), fv(aj));
+    return std::cos(p.lon) * std::sin(2.0 * p.lat);
+  };
 
   for (size_t idx = 0; idx < h.size_3d; ++idx) {
-    h.delp[idx] = dp_uniform;
-    h.pt[idx] = 280.0 + 10.0 * (fv_real(idx % NPZ) / NPZ);
-    h.w[idx] = 0.01;
-    // delz is the per-LAYER thickness and must be consistent with the zh/gz
-    // column built below, which spans 10000 m -> 0 m in steps of 1000 m
-    // (z = 10000 - k*1000). Total depth 10000 m over NPZ layers therefore
-    // gives -10000/NPZ = -1000 m per layer.
-    //
-    // This previously read -1000.0/NPZ = -100 m, understating the layer
-    // thickness by exactly 10x. That is not a benign scaling of the test
-    // input: gz_from_delz_kernel reconstructs gz's INTERIOR from delz, while
-    // gz's HALO keeps the analytic grav*z from the zh column, and H_GZ_FIRST
-    // resolves only at it==1 (before that reconstruction). The halo is
-    // therefore never made consistent with the interior, leaving a ~9x
-    // geopotential cliff exactly one cell outside each tile edge. At it==2
-    // update_dz_c differences gz2 across that cliff, and update_gz's
-    // denominator (area + xfx_diff + yfx_diff) crosses zero -> NaN, first at
-    // the southeast corner where the east and south cliffs compound.
-    h.delz[idx] = -10000.0 / NPZ;
+    // idx = i + j*ni_h + k*ni_h*nj_h, so the level is the quotient. delp is
+    // per-level now, so it cannot be hoisted out of the loop.
+    const size_t k = idx / (size_t)(h.ni_h * h.nj_h);
+    h.delp[idx] = (fv_real)delp_col[k];
+    h.w[idx] = (fv_real)(ws * (fv_real)0.01);
     h.q_con[idx] = 0.001;
     h.cappa[idx] = h.akap;
-    h.delpc[idx] = dp_uniform;
+    h.delpc[idx] = (fv_real)delp_col[k];
+  }
+  /* pt, delz, pkz and the zh/gz column, all from the one invariant.
+   *
+   * The 3A.7 note this replaces was right about the MECHANISM -- delz and the
+   * zh/gz column must agree, because gz_from_delz_kernel rebuilds gz's interior
+   * from delz while gz's halo keeps whatever the harness seeded, and H_GZ_FIRST
+   * resolves only at it==1, so any mismatch leaves a geopotential cliff one
+   * cell outside each tile edge for update_dz_c to difference across. It was
+   * wrong only in fixing the disagreement by asserting a uniform -1000 m on
+   * both sides. Deriving both from delp/pm2/T satisfies that consistency
+   * requirement AND the thermodynamic one at the same time.
+   *
+   * Loop over (i,j,k) explicitly. The flat `idx % NPZ` this replaces was not a
+   * vertical index at all -- with idx = i + j*ni_h + k*ni_h*nj_h and
+   * ni_h = 15, `idx % 10` walks a diagonal through the box, so the intended
+   * 280..290 K vertical profile was actually being laid down horizontally. */
+  std::vector<double> zh_col((size_t)h.npz1);
+  for (int64_t j = 0; j < h.nj_h; ++j) {
+    for (int64_t i = 0; i < h.ni_h; ++i) {
+      const double hp = horiz_pert(i, j);
+      // Build the layer thicknesses for this column, then integrate zh upward
+      // from the surface so zh and delz agree by construction.
+      zh_col[(size_t)NPZ] = 0.0; // zs = 0 everywhere in this harness
+      for (int64_t k = NPZ - 1; k >= 0; --k) {
+        const double T = temp_col[k] * (1.0 + hp);
+        const double rho = pm2_col[k] / (kRdgas * T);
+        const double dz = -delp_col[(size_t)k] / (rho * (double)h.grav);
+        const size_t idx = (size_t)(i + j * h.ni_h + k * h.ni_h * h.nj_h);
+        h.delz[idx] = (fv_real)dz;
+        h.pt[idx] = (fv_real)(T / pkz_col[k]);
+        h.pkz[idx] = (fv_real)pkz_col[k];
+        zh_col[(size_t)k] = zh_col[(size_t)(k + 1)] - dz;
+      }
+      for (int64_t k = 0; k <= NPZ; ++k) {
+        const size_t idx = (size_t)(i + j * h.ni_h + k * h.ni_h * h.nj_h);
+        h.zh[idx] = (fv_real)zh_col[(size_t)k];
+        /* gz is seeded in METRES, matching zh, NOT as a geopotential.
+         *
+         * gz carries two different unit conventions inside one substep, and the
+         * seed belongs to the first:
+         *   dyn_core.F90:433-455 (the it==1 fill)  gz(npz+1)=zs; gz(k)=gz(k+1)-delz(k)
+         *       -- no grav, so METRES, since zs is a height and delz is in metres.
+         *   update_dz_c (nh_utils.F90:188-203)     ws=(zs-gz(km+1))*rdt -- metres.
+         *   Riem_Solver_c tail (nh_utils.F90:421-426)  gz(km+1)=hs;
+         *       gz(k)=gz(k+1)-dz2(k)*grav -- converts to grav*height on OUTPUT,
+         *       per its own comment "Compute Height * grav (for p-gradient
+         *       computation)", because p_grad_c consumes a geopotential.
+         * dyn_core.F90:552-560 then copies zh = gz over the full box, so zh is
+         * metres too and the two seeds must agree.
+         *
+         * The previous grav* factor made them disagree by 9.80665. It was mostly
+         * invisible because the it==1 fill overwrites gz's interior and the edge
+         * exchange overwrites rings 1-3 -- but neither reaches the four DIAGONAL
+         * halo corner blocks, so exactly those cells kept a value 9.8x too large.
+         * That is the root of the gz/zh xgrav corner recurrence, which had
+         * previously only been characterised as a device-residency artefact.
+         *
+         * Numerical semantics changed: NO for every cell any consumer reads in
+         * this configuration; the corrected cells are ones the authoritative
+         * Fortran never reads either (it reallocates gz per init_step). */
+        h.gz[idx] = (fv_real)zh_col[(size_t)k];
+      }
+    }
   }
   // Milestone 3A.8: uc/vc must start as genuinely nonzero C-grid winds.
   //
@@ -376,44 +961,44 @@ HostState make_host_state() {
     for (int64_t j = 0; j < h.nj_h; ++j) {
       for (int64_t i = 0; i < h.ni_h; ++i) {
         const size_t idx = (size_t)(i + j * h.ni_h + k * h.ni_h * h.nj_h);
-        const double x = 0.29 * (double)i, y = 0.23 * (double)j,
-                     z = 0.17 * (double)k;
-        h.uc[idx] = (fv_real)(10.0 + 4.0 * std::sin(x + 0.5 * z) * std::cos(y));
-        h.vc[idx] = (fv_real)(-6.0 + 3.0 * std::cos(x) * std::sin(y + 0.5 * z));
+        // 3A.11V Task 1: was sin/cos of 0.29*i, 0.23*j, 0.17*k -- a tile-local
+        // index pattern, identical on all six tiles, discontinuous at every
+        // seam. Now the solid-body wind projected onto this tile's C-grid
+        // stagger, which is a genuinely global tangent vector field and so
+        // actually exercises the halo exchange's vector sign/swap transform
+        // (fv3_gpu_halo_topology.hpp seam_vector_transform) instead of feeding
+        // it a field no transform could make consistent.
+        //
+        // The k-dependence the old pattern carried is retained as a mild shear
+        // so the levels are not degenerate copies of one another; without it a
+        // vertical-index defect could not change the answer.
+        const double shear = 1.0 + 0.03 * (double)k;
+        h.uc[idx] = (fv_real)(ws * shear * cube::cgrid_uc(cg, fv(i), fv(j), flow));
+        h.vc[idx] = (fv_real)(ws * shear * cube::cgrid_vc(cg, fv(i), fv(j), flow));
       }
     }
   }
+  // Interface pressures. zh/gz are NOT set here any more -- they come from the
+  // balanced delz above, which is the only way the two can agree. pk is an
+  // exact pk = pe^akap pair with pe and carries no horizontal perturbation:
+  // the pressure column is identical in every column of this state, and the
+  // horizontal signal p_grad_c needs lives in gz (hence in temperature).
   for (size_t k = 0; k < (size_t)h.npz1; ++k) {
-    fv_real p = h.ptop + k * dp_uniform;
-    fv_real z = 10000.0 - k * 1000.0;
+    fv_real p = (fv_real)pe_face[k];
     for (size_t j = 0; j < (size_t)h.nj_h; ++j) {
       for (size_t i = 0; i < (size_t)h.ni_h; ++i) {
         size_t idx = i + j * h.ni_h + k * h.ni_h * h.nj_h;
-        // A small horizontal (i,j) perturbation is required: p_grad_c is a
-        // horizontal-difference operator, and if gz/pkc are perfectly
-        // uniform across i,j (varying only with k), its first/second terms
-        // cancel EXACTLY in exact arithmetic (first == -second), regardless
-        // of dispatch correctness. Without this, an apparently-nonzero R4
-        // result would just be float32 rounding noise, not a real signal.
-        const fv_real horiz = 0.02 * std::sin(0.35 * (fv_real)i) *
-                               std::cos(0.35 * (fv_real)j);
-        // pe/peln live kPelnHaloPad slices further into their own
-        // k-padded buffer (see kPelnHaloPad's comment) -- the vertical
-        // solver's k=0..npz loop reaches exactly this shifted range via
-        // its view's registered lower[2] = -kPelnHaloPad.
-        const size_t idx_pe = i + j * (size_t)h.ni_h +
-                              (k + (size_t)kPelnHaloPad) * (size_t)h.ni_h * (size_t)h.nj_h;
+        // pe/peln are (i, k, j): k is the MIDDLE axis, so it strides by ni_h
+        // and j strides by ni_h*npz1. Compare `idx` above, which is the
+        // ordinary (i,j,k). Seeding through this index rather than `idx` is
+        // what makes the host state agree with the registered descriptor.
+        const size_t idx_pe = i + k * (size_t)h.ni_h +
+                              j * (size_t)h.ni_h * (size_t)h.npz1;
         h.pe[idx_pe] = p;
         h.peln[idx_pe] = std::log(p);
-        h.pk[idx] = std::pow(p, h.akap) * (1.0 + horiz);
+        h.pk[idx] = std::pow(p, h.akap);
         h.pk3[idx] = h.pk[idx];
         h.pkc[idx] = h.pk[idx];
-        h.zh[idx] = z;
-        // gz is geopotential (grav*height); must vary with k like zh does,
-        // otherwise pressure_gradient_c_{x,y}'s gz(i-1,j,ki+1)-gz(i,j,ki)
-        // term is identically zero and uc/vc never pick up a real update
-        // regardless of dispatch correctness.
-        h.gz[idx] = h.grav * z * (1.0 + horiz);
       }
     }
   }
@@ -429,8 +1014,33 @@ HostState make_host_state() {
       // perturbation on the angle/area-like terms so they are not perfectly
       // uniform (avoiding the same exact-cancellation failure mode fixed for
       // gz/pkc in Milestone 3A.1).
-      const fv_real horiz = 0.02 * std::sin(0.31 * (fv_real)i) *
-                             std::cos(0.31 * (fv_real)j);
+      // Scaled by FV3_BENCH_HORIZ_SCALE: at 0 the metrics become exactly
+      // uniform, which is what makes the exact-rest invariant rigorous rather
+      // than approximate -- a horizontally varying area alone is enough to make
+      // the (gz2*area)/area round-trip in update_dz_c_update_gz round
+      // differently per cell, which shows up as a hash change at ulp level.
+      // 3A.11V Task 1: was `0.02*sin(0.31*i)*cos(0.31*j)` -- a tile-local index
+      // pattern, identical on all six tiles, hence NOT single-valued across a
+      // seam. area and rarea_c matter here: rarea multiplies the mass-flux
+      // divergence in d_sw, so a seam-discontinuous area is a discontinuity in
+      // the divergence operator itself, sitting exactly where the damping
+      // operators are most sensitive.
+      //
+      // Replaced by the same global shape function used for the state. This is
+      // safe for the del-2n stability calibration in a way that replacing dx/dy/
+      // area outright would NOT be: the AMPLITUDE is unchanged. sin*cos and
+      // flow_shape both range over [-1,1], so area still spans 1e10*(1 +- 0.02)
+      // and da_min/area is unchanged to within that same 2%. The shape's only
+      // requirement here was "small and not perfectly uniform" (see above), and
+      // a globally consistent small perturbation satisfies that strictly better
+      // than a tile-local one at no cost.
+      //
+      // Contrast edge_w/e/s/n below, which are deliberately NOT converted --
+      // there the authoritative value is a function of real grid spacing this
+      // harness does not have, so there is nothing faithful to write.
+      const fv_real horiz = (fv_real)bench_horiz_scale() * 0.02 *
+                             (fv_real)cube::flow_shape(cg.center(fv(i), fv(j)),
+                                                       flow);
       h.rdx[idx] = 1.0 / 100000.0;
       h.rdy[idx] = 1.0 / 100000.0;
       h.dx[idx] = 100000.0;
@@ -448,43 +1058,82 @@ HostState make_host_state() {
       h.rarea[idx] = 1.0 / h.area[idx];
       // rarea_c is the dual-cell (corner) area reciprocal; same scale.
       h.rarea_c[idx] = 1.0 / (1.0e10 * (1.0 + 0.5 * horiz));
-      h.del6_u[idx] = 0.5 * (1.0 + horiz);
-      h.del6_v[idx] = 0.5 * (1.0 + horiz);
-      h.sina_u[idx] = 1.0;
-      h.sina_v[idx] = 1.0;
       h.divg2[idx] = 0.0;
-      // d_sw grid metrics. A near-orthogonal grid: sina == 1, so every rsin*
-      // is 1 and the cosa* terms are small but deliberately nonzero -- setting
-      // them to exactly zero would make the contravariant transforms (S1/K1)
-      // degenerate and hide an ordering error there.
       h.dxc[idx] = 100000.0;
       h.dyc[idx] = 100000.0;
       h.rdxa[idx] = 1.0 / 100000.0;
       h.rdya[idx] = 1.0 / 100000.0;
-      h.divg_u[idx] = 1.0 * (1.0 + horiz);
-      h.divg_v[idx] = 1.0 * (1.0 - horiz);
-      h.cosa_u[idx] = 0.05 * horiz / 0.02;   // ~0.05*sin*cos, i.e. |cosa| <= 0.05
-      h.cosa_v[idx] = 0.04 * horiz / 0.02;
-      h.cosa[idx] = 0.045 * horiz / 0.02;
-      h.cosa_s[idx] = 0.03 * horiz / 0.02;
-      h.rsin2[idx] = 1.0;
-      h.rsina[idx] = 1.0;
-      h.rsin_u[idx] = 1.0;
-      h.rsin_v[idx] = 1.0;
       h.f0[idx] = 1.0e-4 * (1.0 + 0.1 * horiz / 0.02); // Coriolis, mid-latitude
-      // sin_sg's four cell-edge components (CUDA views index them 0-based).
-      // Strictly positive: S1's upwind arms divide by them.
-      for (int c = 0; c < 4; ++c)
-        h.sin_sg[idx + (size_t)c * h.size_2d] = 1.0 - 0.01 * (fv_real)c;
-      // --- Milestone 3A.9 C-grid metrics/state --------------------------
-      // cos_sg is sin_sg's companion: the cosine of the same four cell-edge
-      // angles. This grid is near-orthogonal (sin_sg ~ 1), so cos_sg is small
-      // -- but deliberately NOT zero, for the same reason cosa_u/cosa_v above
-      // are not: d2a2c_vect's edge_interpolate4 arms multiply by it, and exact
-      // zeros would make a transcription error there invisible.
-      for (int c = 0; c < 4; ++c)
-        h.cos_sg[idx + (size_t)c * h.size_2d] =
-            (fv_real)(0.03 - 0.005 * (fv_real)c);
+      /* --- Milestone 3A.11T: authoritative metric assembly ---------------
+       *
+       * Every angle-like grid metric is now DERIVED from cos_sg using the
+       * exact relations in fv_grid_utils.F90, instead of each being given an
+       * independent made-up value.  The previous block set
+       *   rsin2 = rsina = rsin_u = rsin_v = 1.0   exactly
+       * while simultaneously setting cosa_u/cosa_v/cosa/cosa_s to nonzero
+       * values up to 0.05, and paired sin_sg = 1-0.01c with
+       * cos_sg = 0.03-0.005c.  That is not a metric: it violates
+       * sin_sg**2 + cos_sg**2 == 1 (:430) by up to 3%, and it violates
+       * rsin_u == 1/sina_u**2 (:579), rsin_v == 1/sina_v**2 (:587),
+       * rsin2 == 1/sin_sg5**2 (:595) and rsina == 1/sina**2 (:612).  The
+       * cube-vertex corner algebra (divergence_corner's corner-term removal,
+       * fill_4corners, a2b_ord4's extrap_corner) is derived assuming those
+       * identities hold, so feeding it a non-metric leaves it with no
+       * restoring geometry.
+       *
+       * The angles stay small and spatially varying, so the deliberate
+       * coverage the old comment defended is preserved: the contravariant
+       * transforms (S1/K1) and d2a2c_vect's edge_interpolate4 arms still
+       * multiply by nonzero cosa/cos_sg, and an ordering error there is still
+       * visible.  What changes is only that the values are now mutually
+       * consistent.
+       *
+       * FV3 sg component numbering is 1..9; the CUDA views carry the four
+       * cell-edge components 1..4 as 0-based 0..3.  sg5 (A-grid cell centre)
+       * and sg6/sg8 (B-grid corner) are not stored as fields -- they enter
+       * only through cosa_s/rsin2 and cosa/rsina -- so representative small
+       * values are used for them here.
+       */
+      const fv_real sg_scale = 1.0 + 0.5 * horiz / 0.02;  // |sg_scale-1| <= 0.5
+      fv_real cs[6];
+      for (int c = 0; c < 4; ++c)                      // sg1..sg4
+        cs[c] = (fv_real)(0.03 - 0.005 * (fv_real)c) * sg_scale;
+      cs[4] = (fv_real)0.030 * sg_scale;               // sg5, cell centre
+      cs[5] = (fv_real)0.028 * sg_scale;               // sg6/sg8, cell corner
+      if (h.ortho_metric)                              // exact flat metric,
+        for (int c = 0; c < 6; ++c) cs[c] = 0.0;       // fv_grid_utils.F90:492-493
+      auto sn = [](fv_real c) {
+        return std::sqrt(std::max((fv_real)0.0, (fv_real)1.0 - c * c));
+      };                                               // :430
+      for (int c = 0; c < 4; ++c) {
+        h.cos_sg[idx + (size_t)c * h.size_2d] = cs[c];
+        h.sin_sg[idx + (size_t)c * h.size_2d] = sn(cs[c]);
+      }
+      // :576-577 / :579 -- sg3 and sg1 are bench components 2 and 0.
+      const fv_real cosa_u = 0.5 * (cs[2] + cs[0]);
+      const fv_real sina_u = 0.5 * (sn(cs[2]) + sn(cs[0]));
+      h.cosa_u[idx] = cosa_u;
+      h.sina_u[idx] = sina_u;
+      h.rsin_u[idx] = 1.0 / (sina_u * sina_u);
+      // :584-585 / :587 -- sg4 and sg2 are bench components 3 and 1.
+      const fv_real cosa_v = 0.5 * (cs[3] + cs[1]);
+      const fv_real sina_v = 0.5 * (sn(cs[3]) + sn(cs[1]));
+      h.cosa_v[idx] = cosa_v;
+      h.sina_v[idx] = sina_v;
+      h.rsin_v[idx] = 1.0 / (sina_v * sina_v);
+      // :593 / :595
+      h.cosa_s[idx] = cs[4];
+      h.rsin2[idx] = 1.0 / (sn(cs[4]) * sn(cs[4]));
+      // :563-564 / :612
+      h.cosa[idx] = cs[5];
+      h.rsina[idx] = 1.0 / (sn(cs[5]) * sn(cs[5]));
+      // :786-787 / :793-794 -- with dx == dyc == dxc == dy == 1e5 the length
+      // ratios are 1, so these reduce to the sines.  del6_u was 0.5 before,
+      // which corresponded to no grid at all.
+      h.divg_u[idx] = sina_v * h.dyc[idx] * h.rdx[idx];
+      h.del6_u[idx] = h.del6_scale * sina_v * h.dx[idx] / h.dyc[idx];
+      h.divg_v[idx] = sina_u * h.dxc[idx] * h.rdy[idx];
+      h.del6_v[idx] = h.del6_scale * sina_u * h.dy[idx] / h.dxc[idx];
       // f_c is Coriolis on the DUAL (corner) mesh, a different FieldId from
       // f0 above. Slightly offset from f0 so a mix-up between the two shows
       // up as a changed answer rather than silently agreeing.
@@ -502,15 +1151,50 @@ HostState make_host_state() {
       // consistency, not a degenerate input, and inventing a nonzero phis here
       // would contradict zs and break the closure.
       h.phis[idx] = h.grav * h.zs[idx];
-      // grid_lonlat/agrid_lonlat: small idealized lon/lat (radians) grid,
-      // trailing dim 0=lon, 1=lat.
+      // grid_lonlat/agrid_lonlat: trailing dim 0=lon, 1=lat, radians.
+      //
+      // 3A.11V Task 1: these were `0.01*i` and `0.01*j` -- the array index in
+      // disguise, identical on all six tiles, and not lon/lat of anything. They
+      // are now the TRUE gnomonic corner and cell-centre coordinates of this
+      // tile, including the production 10-degree westward shift, so a consumer
+      // that computes anything from them (a Coriolis term, a metric, a
+      // diagnostic) now gets a coherent cubed sphere instead of six identical
+      // patches of a fictional plane.
+      const cube::LonLat gll = cg.corner(fv(i), fv(j));
+      const cube::LonLat all_ = cg.center(fv(i), fv(j));
       const size_t idx_ll = idx * 2;
-      h.grid_lonlat[idx_ll + 0] = 0.01 * (fv_real)i;
-      h.grid_lonlat[idx_ll + 1] = 0.01 * (fv_real)j;
-      h.agrid_lonlat[idx_ll + 0] = 0.01 * (fv_real)i + 0.005;
-      h.agrid_lonlat[idx_ll + 1] = 0.01 * (fv_real)j + 0.005;
+      h.grid_lonlat[idx_ll + 0] = (fv_real)gll.lon;
+      h.grid_lonlat[idx_ll + 1] = (fv_real)gll.lat;
+      h.agrid_lonlat[idx_ll + 0] = (fv_real)all_.lon;
+      h.agrid_lonlat[idx_ll + 1] = (fv_real)all_.lat;
     }
   }
+  // edge_w/e/s/n are the cubed-sphere edge-interpolation weights consumed by the
+  // contravariant edge corrections. They are DELIBERATELY LEFT as fabricated
+  // local-index ramps, and that has to be stated rather than left implicit,
+  // because it is the one place where 3A.11V Task 1's "no tile-local index
+  // seeding" rule is knowingly not applied.
+  //
+  // Why left alone:
+  //   - These are GRID METRICS, not state. Task 1's scope is the initial state;
+  //     the harness's metrics stay fabricated as a whole (dx = dy = dxc = dyc =
+  //     1e5, uniform area), because the 3A.11V del-2n stability calibration is
+  //     expressed in da_min/area and replacing the metrics would invalidate it.
+  //     Replacing only these four while dx/dy/area stay uniform would produce a
+  //     metric set that is internally LESS coherent, not more.
+  //   - The authoritative values come from edge_factors / efactor_a2c_v
+  //     (REF/tools/fv_grid_tools.F90), which are functions of the real grid
+  //     spacing this harness does not have. There is no faithful value to write
+  //     here that is consistent with a uniform 1e5 grid.
+  //
+  // What is given up, so it is not silently claimed: these four arrays are not
+  // single-valued across a seam -- edge_w[j] on tile T and the corresponding
+  // weight on its west neighbour disagree -- so the edge corrections see an O(1)
+  // metric inconsistency at the panel boundaries. That is a residual forcing in
+  // this benchmark. It is bounded (a smooth 1% ramp, not a grid-scale cliff) and
+  // it is NOT the discontinuity that drove the multi-step instability, which was
+  // in the STATE and was measured at +4182.3 Pa in ring-1 pkc. Do not read this
+  // note as reopening that finding.
   for (size_t j = 0; j < (size_t)h.nj_h; ++j)
     h.edge_w[j] = h.edge_e[j] = 1.0 + 0.01 * (double)j;
   for (size_t i = 0; i < (size_t)h.ni_h; ++i)
@@ -523,8 +1207,24 @@ HostState make_host_state() {
     // stale/garbage-free host-mirrored zeros) is distinguishable from one
     // that genuinely executed and overwrote them.
     h.u[idx] = 0.0; h.v[idx] = 0.0; h.du[idx] = 0.0; h.dv[idx] = 0.0;
-    h.pkz[idx] = 1.0 + 0.1 * (fv_real)(idx % NPZ) / NPZ;
-    h.heat_source[idx] = 10.0 + 0.5 * std::sin(0.4 * (fv_real)(idx % h.ni_h));
+    // pkz is NOT re-seeded here. It is set from pm2^akap alongside pt and delz,
+    // because dyn_core.F90:1075 derives it from the same X the SIM1 invariant
+    // fixes; pkz and pt cannot be chosen independently. The value this replaces
+    // was 1.0..1.1, which made pt = T/pkz numerically indistinguishable from an
+    // absolute temperature and so hid the imbalance. Real pkz for this column
+    // is 5.7 at the top and 26.4 at the surface.
+    // 3A.11V Task 1: was `sin(0.4 * (idx % ni_h))`. Besides being tile-local and
+    // seam-discontinuous, `idx % ni_h` is only the i index -- it carried no j or
+    // k structure at all. Now the global shape function at the cell centre, so
+    // heat_source is single-valued across seams like everything else.
+    const size_t k_hs = idx / (size_t)(h.ni_h * h.nj_h);
+    const size_t rem_hs = idx % (size_t)(h.ni_h * h.nj_h);
+    const int64_t j_hs = (int64_t)(rem_hs / (size_t)h.ni_h);
+    const int64_t i_hs = (int64_t)(rem_hs % (size_t)h.ni_h);
+    (void)k_hs;
+    h.heat_source[idx] =
+        (fv_real)(10.0 + (double)bench_horiz_scale() * 0.5 *
+                             cube::flow_shape(cg.center(fv(i_hs), fv(j_hs)), flow));
   }
 
   // --- Milestone 3A.8: d_sw state ------------------------------------------
@@ -535,26 +1235,48 @@ HostState make_host_state() {
   // defect could not change the answer. Phase B's u/v probe is therefore
   // upgraded to any_changed() against a pre-step snapshot, which is a strictly
   // stronger statement than "nonzero" ever was.
+  const double hs = (double)bench_horiz_scale();
   for (int64_t k = 0; k < NPZ; ++k) {
     for (int64_t j = 0; j < h.nj_h; ++j) {
       for (int64_t i = 0; i < h.ni_h; ++i) {
         const size_t idx = (size_t)(i + j * h.ni_h + k * h.ni_h * h.nj_h);
-        const double x = 0.29 * (double)i, y = 0.23 * (double)j,
-                     z = 0.17 * (double)k;
-        h.u[idx] = (fv_real)(12.0 + 3.0 * std::sin(x + z) * std::cos(y));
-        h.v[idx] = (fv_real)(-7.0 + 2.5 * std::cos(x) * std::sin(y + z));
-        h.ua[idx] = (fv_real)(11.0 + 2.0 * std::sin(x + 0.5 * y));
-        h.va[idx] = (fv_real)(-6.0 + 1.5 * std::cos(y + 0.5 * x));
+        // 3A.11V Task 1: the prognostic D-grid winds, projected from the global
+        // solid-body flow onto this tile's D-grid stagger exactly as
+        // REF/tools/test_cases.F90:485-521 (init_winds, defOnGrid==5) does it.
+        // Same k-shear rationale as uc/vc above. These are the fields the seam
+        // test verifies edge-by-edge, and the sign/swap table it derives from
+        // them from geometry alone matches the independent FMS audit on all 24
+        // (tile, side) seams.
+        const double shear = 1.0 + 0.03 * (double)k;
+        h.u[idx] = (fv_real)(ws * shear * cube::dgrid_u(cg, fv(i), fv(j), flow));
+        h.v[idx] = (fv_real)(ws * shear * cube::dgrid_v(cg, fv(i), fv(j), flow));
+        double ua = 0.0, va = 0.0;
+        cube::agrid_wind(cg, fv(i), fv(j), flow, &ua, &va);
+        h.ua[idx] = (fv_real)(ws * shear * ua);
+        h.va[idx] = (fv_real)(ws * shear * va);
         // ut/vt/crx/cry/xfx/yfx are d_sw OUTPUTS (S1 and S2 overwrite them
         // before any read), so a nonzero seed here would only mask a
         // missing write. Left at zero deliberately.
-        h.ptc[idx] = (fv_real)(280.0 + 4.0 * std::sin(x + y));
+        // ptc is a DIRECT Riem_Solver_C input, and the historical record is that
+        // its local-index horizontal pattern was one of the two columns whose
+        // mutual inconsistency at ring 1 produced the measured pkc overshoot.
+        // 3A.11V Task 1: that pattern (`sin(0.29*i + 0.23*j)`) is replaced by the
+        // global shape function, so ptc is now single-valued across every seam and
+        // is consistent with the pt/delz/zh/gz column, which uses the same shape.
+        // Amplitude unchanged: both old and new factors are in [-1,1].
+        // Scaled by FV3_BENCH_HORIZ_SCALE.
+        h.ptc[idx] =
+            (fv_real)(280.0 + hs * 4.0 *
+                                  cube::flow_shape(cg.center(fv(i), fv(j)), flow));
         h.divgd[idx] = 0.0;
         h.diss_est[idx] = 0.0;
         // z_rat is a read-only nonhydrostatic thickness ratio that scales the
         // damping terms; 1.0 is the neutral value, perturbed so it cannot
         // cancel out of a product.
-        h.z_rat[idx] = (fv_real)(1.0 + 0.02 * std::sin(x - y));
+        // 3A.11V Task 1: `sin(0.29*i - 0.23*j)` -> shape2, a global function
+        // independent of the one ptp/ptc use, preserving the original intent that
+        // z_rat cannot cancel out of a product with them.
+        h.z_rat[idx] = (fv_real)(1.0 + hs * 0.02 * shape2(i, j));
         // Milestone 3A.9. omga is BOTH d2a2c_vect's A-grid vertical velocity
         // and Riem_Solver_C's w3 argument (dyn_core.F90:583), where it is
         // intent(in) and enters the implicit column solve's forcing. Zero
@@ -562,7 +1284,18 @@ HostState make_host_state() {
         // it would remove w3 from the Riem_Solver_C right-hand side entirely,
         // so a transcription error in that term could not change the answer.
         // Same order of magnitude as w (0.01 m/s), sign-varying in i,j,k.
-        h.omga[idx] = (fv_real)(0.01 * std::sin(x + y - z));
+        // omga is w3 in Riem_Solver_C, so at HORIZ_SCALE=0 it must go to exactly
+        // zero along with the winds -- a nonzero w3 forcing would keep the
+        // nonhydrostatic column solve evolving and make the rest-state reading
+        // ambiguous, which is the same reason w itself is scaled by WIND_SCALE.
+        // 3A.11V Task 1: `sin(0.29*i + 0.23*j - 0.11*k)` -> shape3 times a
+        // separate cos(0.11*k). The k dependence is kept because it was there
+        // deliberately -- omga is Riem_Solver_C's w3 and a k-uniform forcing would
+        // be a weaker input -- but it now multiplies a global horizontal shape
+        // instead of being folded into a local-index phase. Still exactly zero at
+        // HORIZ_SCALE=0, which the rest-state leg requires.
+        h.omga[idx] =
+            (fv_real)(hs * 0.01 * shape3(i, j) * std::cos(0.11 * (double)k));
         // The five flux capacitors get a nonzero seed on purpose: d_sw ADDS to
         // them and never initializes them (§5 of wp_b_dsw_cuda.cuh). Seeding
         // them at zero would make "accumulated" and "overwrote" indistinguish-
@@ -579,40 +1312,182 @@ HostState make_host_state() {
   // state carries, because update_dz_c's wind extrapolation weights the
   // top-two and bottom-two levels by dp0 ratios (nh_utils.F90's dp0(1)/dp0(0)
   // and dp0(km-1)/dp0(km-2) terms); an inconsistent dp_ref would silently
-  // change those weights. This state is a uniform-dp column, so dp_ref is
-  // uniform too, with a small k variation so the ratios are not exactly 1 and
-  // a swapped index would be visible.
+  // change those weights.
+  //
+  // 3A.11T: this is now simply delp_col, the log-spaced profile the state
+  // actually carries. The previous `dp_uniform * (1 + 0.01*k)` fudge existed to
+  // keep the dp0 ratios away from exactly 1 so a swapped index would be visible;
+  // log spacing gives a ratio of 1.585 between adjacent levels on its own, so
+  // the fudge is no longer needed and would now be an inconsistency.
   for (size_t k = 0; k < (size_t)NPZ; ++k)
-    h.dp_ref[k] = dp_uniform * (fv_real)(1.0 + 0.01 * (double)k);
+    h.dp_ref[k] = (fv_real)delp_col[k];
 
-  // --- Milestone 3A.8: the ten per-level damping controls -------------------
-  // This is §4's required production behavior: a sponge top where nord_k is
-  // forced to 0 sitting above an interior that takes the higher-order arm, in
-  // ONE dgrid_dynamics invocation. The four-level pattern below is exactly the
-  // mixed_levels() set the focused d_sw test (Part I) validated level-by-level
-  // against four uniform-parameter runs; cycling it over NPZ reproduces those
-  // same validated combinations here, so all three high-order nord groups plus
-  // the nord == 0 group are live simultaneously and every LevelFilter gate
-  // (damp_v, damp_w, damp_t, d_con) has both arms live.
+  // --- The ten per-level damping controls ----------------------------------
+  //
+  // MILESTONE 3A.11V TASK 2. These are no longer fabricated here.
+  //
+  // What used to be here was a hand-invented four-level cycle
+  //     nord_k {0,2,0,1}  nord_v {0,2,1,2}  nord_w {0,1,0,2}
+  //     d2_bg {0.02,0,0.03,0}  d4_bg {0.12,0.16,0.14,0.10}
+  //     damp_v {0,0.10,0.05,0.12}  damp_w {0,0.06,0,0.09}
+  //     damp_t {0,0.08,0,0.03}  d_con {0,1.0,0.5,0}  kgb {0,0,1e-4,5e-5}
+  // cycled as k % 4. It was written to maximize kernel-path COVERAGE -- every
+  // LevelFilter gate live in one dgrid_dynamics invocation -- and it succeeded
+  // at that. But 8 of its 10 arrays were STRUCTURALLY unreachable from the
+  // authoritative configuration path, not merely mis-valued, and one of the
+  // pairings it invented (d4_bg = 0.16 at nord_k = 2) violates the del-2n
+  // stability bound. That single fabricated pairing produced a slow amplifying
+  // mode which was, across three milestones, repeatedly suspected of being a
+  // CUDA port defect. It was not. Full account:
+  //   docs/agent_handoff/milestone_3A11V_dt_sensitivity.md
+  //
+  // The two measurements that settled it, both on a seam-free IC:
+  //   d4_bg = 0.16, nord_k = 2  ->  gamma_d4 = 2.097 > 2, nonfinite at ~570
+  //                                 acoustic substeps, growth +0.0685 per
+  //                                 substep and dt-INDEPENDENT over a 24x dt
+  //                                 range (so not a CFL failure).
+  //   d4_bg = 0.12, nord_k = 2  ->  gamma_d4 = 0.885, bounded for 300 calls at
+  //                                 8x8x10 (three bitwise-identical repeats),
+  //                                 16x16 and 32x32.
+  // The threshold was then bracketed parameter-free at two different nord and
+  // matched the derived critical d4_bg of 2^(1/(nord+1))/8 in both cases.
+  //
+  // So the values now come from the shared translation layer, which is a
+  // statement-ordered reimplementation of dyn_core.F90:677-765 with the GEOS
+  // scalar overrides of FV_StateMod.F90:569-793:
+  //     include/fv3_damping_translation.hpp
+  //     runtime/fv3_damping_translation.cpp
+  //     tests/runtime/test_damping_translation.cpp   (asserts the column)
+  // The same layer is what the GEOS bridge should call, so the benchmark and
+  // production cannot drift apart again.
+  //
+  // COVERAGE COST, stated plainly rather than glossed. The authoritative
+  // npz = 10 column is 90% sponge: nord_k = 0 at k = 0..8 and nord_k = 2 only
+  // at k = 9; nord_v = 0 at k = 0..7 and 2 at k = 8,9. So this benchmark now
+  // exercises FEWER nord combinations than the invented cycle did -- the
+  // nord == 1 arm is not reachable at all under the GEOS overrides, since
+  // FV_StateMod.F90:681 sets nord = 2 and dyn_core.F90:713 takes min(2,nord).
+  // That is the correct trade: this is a PERFORMANCE and STABILITY harness for
+  // the production configuration, and per-arm kernel coverage belongs in the
+  // focused d_sw test (tests/dgrid/test_wp_b_cuda_smoke.cpp Part I), which
+  // still drives all four groups from uniform parameters. Do not restore a
+  // synthetic cycle here to recover coverage; add the case there instead.
+  //
+  // The env knobs below (FV3_BENCH_DAMP / DIVDAMP / D4_SCALE / DAMPV_SCALE)
+  // still work, and still perturb these arrays, because the diagnostic
+  // discriminators of 3A.11V need to be reproducible. All of them default to
+  // no-ops, and the applied table is printed unconditionally, so an acceptance
+  // run with no environment set is self-evidently unmodified in its own log.
   {
-    const fv_real nord_k[4] = {0, 2, 0, 1};
-    const fv_real nord_v[4] = {0, 2, 1, 2};
-    const fv_real nord_w[4] = {0, 1, 0, 2};
-    const fv_real d2_bg[4] = {fv_real(0.02), fv_real(0.0), fv_real(0.03), fv_real(0.0)};
-    const fv_real d4_bg[4] = {fv_real(0.12), fv_real(0.16), fv_real(0.14), fv_real(0.10)};
-    const fv_real damp_v[4] = {fv_real(0.0), fv_real(0.10), fv_real(0.05), fv_real(0.20)};
-    const fv_real damp_w[4] = {fv_real(0.0), fv_real(0.06), fv_real(0.0), fv_real(0.09)};
-    const fv_real damp_t[4] = {fv_real(0.0), fv_real(0.08), fv_real(0.0), fv_real(0.03)};
-    const fv_real d_con[4] = {fv_real(0.0), fv_real(1.0), fv_real(0.5), fv_real(0.0)};
-    const fv_real kgb[4] = {fv_real(0.0), fv_real(0.0), fv_real(1.0e-4), fv_real(5.0e-5)};
+    namespace dmp = fv3::gpu::damping;
+    /* high_resolution selects the FV_StateMod.F90:685/:687 d4_bg_bot branch.
+     * false is the npx*CEILING(stretch_fac) < 1200 case, which is what an
+     * 8x8/16x16/32x32 benchmark grid is. */
+    dmp::DampingFlags dflags =
+        dmp::geos_production_flags((int)NPZ, (double)h.ptop,
+                                   /*high_resolution=*/false);
+    /* pm2_col is the layer-mean pressure of the column this harness built, i.e.
+     * FV3's pfull(1:npz). Read only by the d4dmp() sine profile, which is
+     * inactive at d4_bg_top == d4_bg_bot; passed anyway so the profile is
+     * correct if a future leg sets high_resolution. */
+    const dmp::DampingColumn dcol = dmp::translate_damping(dflags, pm2_col.data());
     for (size_t k = 0; k < (size_t)NPZ; ++k) {
-      const size_t s = k % 4;
-      h.lv_nord_k[k] = nord_k[s]; h.lv_ndif[k] = nord_v[s];
-      h.lv_nord_w[k] = nord_w[s]; h.lv_d2_bg[k] = d2_bg[s];
-      h.lv_d4_bg[k] = d4_bg[s];   h.lv_damp_v[k] = damp_v[s];
-      h.lv_damp_w[k] = damp_w[s]; h.lv_damp_t[k] = damp_t[s];
-      h.lv_d_con[k] = d_con[s];   h.lv_kgb[k] = kgb[s];
+      h.lv_nord_k[k] = (fv_real)dcol.nord_k[k];
+      h.lv_ndif[k]   = (fv_real)dcol.ndif[k];
+      h.lv_nord_w[k] = (fv_real)dcol.nord_w[k];
+      h.lv_d2_bg[k]  = (fv_real)dcol.d2_bg[k];
+      h.lv_d4_bg[k]  = (fv_real)dcol.d4_bg[k];
+      h.lv_damp_v[k] = (fv_real)dcol.damp_v[k];
+      h.lv_damp_w[k] = (fv_real)dcol.damp_w[k];
+      h.lv_damp_t[k] = (fv_real)dcol.damp_t[k];
+      h.lv_d_con[k]  = (fv_real)dcol.d_con[k];
+      h.lv_kgb[k]    = (fv_real)dcol.kgb[k];
     }
+    /* nord, nord_t, dddmp and d_con are scalars in NumericalConfig; carry the
+     * translated values through so a scalar cannot disagree with the column
+     * derived from it. Consumed where cfg is filled. */
+    h.tr_flags = dflags;
+    h.tr_col = dcol;
+    h.tr_nord = dflags.nord;
+    h.tr_nord_t = dcol.nord_t;
+    h.tr_dddmp = (fv_real)dcol.dddmp;
+    h.tr_d_con = (fv_real)dflags.d_con;
+    const DampSelection d = damp_selection();
+    for (size_t k = 0; k < (size_t)NPZ; ++k) {
+      if (d.no_divdamp) {
+        h.lv_d2_bg[k] = 0.0; h.lv_d4_bg[k] = 0.0; h.lv_nord_k[k] = 0.0;
+      }
+      if (d.no_del6) {
+        h.lv_damp_v[k] = 0.0; h.lv_damp_w[k] = 0.0; h.lv_damp_t[k] = 0.0;
+        h.lv_ndif[k] = 0.0;   h.lv_nord_w[k] = 0.0; h.lv_kgb[k] = 0.0;
+      }
+      if (d.no_heat) h.lv_d_con[k] = 0.0;
+      if (d.d2only) h.lv_d4_bg[k] = 0.0;
+      if (d.d4only) h.lv_d2_bg[k] = 0.0;
+      if (d.force_nord >= 0) h.lv_nord_k[k] = (fv_real)d.force_nord;
+      /* Last, so it scales whatever the branch selections above left behind
+       * (and is a no-op on the d2only leg, where d4_bg is already 0). */
+      h.lv_d4_bg[k] *= d.d4_scale;
+      h.lv_damp_v[k] *= d.dampv_scale;
+    }
+    if (d.no_divdamp || d.no_del6 || d.no_heat)
+      std::fprintf(stderr, "[BENCH] FV3_BENCH_DAMP: divdamp=%d del6=%d heat=%d\n",
+                   d.no_divdamp ? 0 : 1, d.no_del6 ? 0 : 1, d.no_heat ? 0 : 1);
+    if (d.d4_scale != (fv_real)1.0)
+      std::fprintf(stderr,
+                   "[BENCH] FV3_BENCH_D4_SCALE=%.6g -> d4_bg[0]=%.6g\n",
+                   (double)d.d4_scale, (double)h.lv_d4_bg[0]);
+    /* Milestone 3A.11V Task 2: mirror the env-var perturbations back into
+     * h.tr_col so the stability report printed at config time reports on the
+     * coefficients AS APPLIED, not on the unmodified translation. Without this
+     * a diagnostic leg would print a clean table while running a perturbed one
+     * -- the exact failure mode the old "print the knob, not the value" habit
+     * caused twice during 3A.11. */
+    for (size_t k = 0; k < (size_t)NPZ; ++k) {
+      h.tr_col.nord_k[k] = (int)h.lv_nord_k[k];
+      h.tr_col.ndif[k] = (int)h.lv_ndif[k];
+      h.tr_col.nord_w[k] = (int)h.lv_nord_w[k];
+      h.tr_col.d2_bg[k] = (double)h.lv_d2_bg[k];
+      h.tr_col.d4_bg[k] = (double)h.lv_d4_bg[k];
+      h.tr_col.damp_v[k] = (double)h.lv_damp_v[k];
+      h.tr_col.damp_w[k] = (double)h.lv_damp_w[k];
+      h.tr_col.damp_t[k] = (double)h.lv_damp_t[k];
+      h.tr_col.d_con[k] = (double)h.lv_d_con[k];
+      h.tr_col.kgb[k] = (double)h.lv_kgb[k];
+    }
+    if (d.nosmag) h.tr_col.dddmp = 0.0;
+    if (d.no_del6) h.tr_col.nord_t = 0;
+    /* Printed unconditionally so a leg whose env var never reached the binary is
+     * visible as WIND_SCALE=1 rather than being read as a rest-state result. */
+    std::fprintf(stderr, "[BENCH] WIND_SCALE=%.6g (scales initial uc,vc,u,v,ua,va,w)\n",
+                 (double)ws);
+    /* Same reason, and it is the more dangerous of the two to miss: WIND_SCALE=0
+     * alone still leaves every scalar's horizontal structure live, so a leg
+     * intended as a rest state but run without HORIZ_SCALE=0 would show
+     * legitimately changing delp and read as a port defect. It did, once.
+     *
+     * 3A.11V: the word "local-index" is gone from this message on purpose. The
+     * structure is now the global cube shape function, so a nonzero HORIZ_SCALE
+     * no longer implies a seam discontinuity -- reading it that way would be
+     * reading the pre-3A.11V harness. */
+    std::fprintf(stderr, "[BENCH] HORIZ_SCALE=%.6g (scales the global cube shape "
+                         "function on pt,delz,zh,gz,ptc,z_rat,omga,heat_source "
+                         "and the area/rarea_c/f0/f_c metrics)\n",
+                 (double)bench_horiz_scale());
+    std::fprintf(stderr, "[BENCH] DAMPV_SCALE=%.6g  D4_SCALE=%.6g (both 1 means "
+                         "the authoritative translation is used unmodified)\n",
+                 (double)d.dampv_scale, (double)d.d4_scale);
+    /* The full applied per-level table. Replaces the old four-row k%%4 gamma_v
+     * summary, which could only describe a 4-cycle and printed a formula that
+     * later turned out to be 2x too small. The stability table itself is
+     * printed at config time, where da_min and da_min_c exist. */
+    std::fprintf(stderr, "%s",
+                 fv3::gpu::damping::format_damping_column(h.tr_col).c_str());
+    if (d.d2only || d.d4only || d.nosmag || d.force_nord >= 0)
+      std::fprintf(stderr,
+                   "[BENCH] FV3_BENCH_DIVDAMP: d2only=%d d4only=%d nosmag=%d "
+                   "force_nord=%d\n",
+                   d.d2only, d.d4only, d.nosmag, d.force_nord);
   }
   return h;
 }
@@ -643,18 +1518,22 @@ std::vector<fv3_gpu_field_desc> make_fields(HostState &h) {
   st_3d[1] = st_3d_if[1] = h.ni_h;
   st_3d[2] = st_3d_if[2] = h.ni_h * h.nj_h;
 
-  // pe/peln: own k-padded shape (see kPelnHaloPad's comment) -- same (i,j)
-  // box and stride as lo_3d_if, but lower[2] shifted to -kPelnHaloPad and
-  // extent[2] grown to match, so bind_wp_d's coverage check on axis 2
-  // (lower[2] <= js-p) can pass while the vertical solver's k=0..npz
-  // accesses still land on the real data at buffer offset kPelnHaloPad+k.
+  /* pe/peln: authoritative (i, k, j) -- slot 1 is the VERTICAL axis and slot 2
+   * is j. See the file-header note. Mapping, slot by slot:
+   *   slot 0 = i : same box and unit stride as every other field
+   *   slot 1 = k : 0-based, npz1 deep, strides by ni_h
+   *   slot 2 = j : same box as slot 1 of an (i,j,k) field, strides ni_h*npz1
+   * k stays 0-based to match riem_solver3_kernel's documented convention
+   * (Fortran k=1..npz+1 -> 0..npz); the kernel now hands k to the middle
+   * argument of View3::at, so descriptor and kernel agree by construction.
+   * bind_wp_d's `lower[2] <= js - 2` is now a genuine j-halo test and passes
+   * as jsd <= js-2 for any domain with HALO >= 2. */
   static thread_local int64_t lo_pe[3];
   static thread_local uint64_t ex_pe[3];
   static thread_local int64_t st_pe[3];
-  lo_pe[0] = lo_3d_if[0]; lo_pe[1] = lo_3d_if[1]; lo_pe[2] = -kPelnHaloPad;
-  ex_pe[0] = ex_3d_if[0]; ex_pe[1] = ex_3d_if[1];
-  ex_pe[2] = (uint64_t)(h.npz1 + kPelnHaloPad);
-  st_pe[0] = st_3d_if[0]; st_pe[1] = st_3d_if[1]; st_pe[2] = st_3d_if[2];
+  lo_pe[0] = lo_3d_if[0]; lo_pe[1] = 0;               lo_pe[2] = lo_3d_if[1];
+  ex_pe[0] = ex_3d_if[0]; ex_pe[1] = (uint64_t)h.npz1; ex_pe[2] = ex_3d_if[1];
+  st_pe[0] = 1;           st_pe[1] = h.ni_h;           st_pe[2] = h.ni_h * h.npz1;
   const uint64_t bytes_pe = h.size_3d_pe * sizeof(fv_real);
 
   lo_2d[0] = 1 - (int64_t)HALO; lo_2d[1] = 1 - (int64_t)HALO;
@@ -827,9 +1706,10 @@ std::vector<fv3_gpu_field_desc> make_fields(HostState &h) {
   // are therefore load-bearing, not defensive.
   //
   // omga must use lo_3d EXACTLY, not lo_3d_if and not lo_pe: the predictor
-  // requires every one of its 15 mutable-state 3-D fields to share
-  // delp's lower[2], so a -kPelnHaloPad or interface-level registration is
-  // rejected even though it would "cover" the range.
+  // requires every one of its 15 mutable-state 3-D fields to share delp's
+  // lower[2], so an interface-level registration is rejected even though it
+  // would "cover" the range -- and lo_pe is doubly wrong here, since pe/peln
+  // deliberately carry a different axis ORDER, not just different bounds.
   fields.push_back(make_field(FieldId::omga, h.omga.data(), 3, lo_3d, ex_3d, st_3d, bytes_3d));
   // f_c is the dual-mesh Coriolis term (B stagger), a different field from f0
   // registered in group 3 above. ws3 and phis are the C-grid surface pair
@@ -898,7 +1778,9 @@ NumericalConfig production_config(const HostState &h) {
   // call inside post_loop_heating (only reached when nt>0) is skipped,
   // avoiding this milestone's unimplemented corner_edge_service stub.
   cfg.n_con = 1;
-  cfg.d_con = 1.0;
+  // 3A.11V Task 2: from the translation. FV_StateMod.F90:742 sets d_con = 1.0,
+  // so the value is unchanged -- but it is now sourced rather than asserted.
+  cfg.d_con = h.tr_d_con;
   cfg.nf_ke = 1;
   cfg.moist_cappa = 0;
   cfg.use_sg = 0;
@@ -911,19 +1793,120 @@ NumericalConfig production_config(const HostState &h) {
   cfg.hord_tm = 6;
   cfg.hord_dp = -6;
   cfg.lim_fac = 1.0;
-  cfg.nord = 2;    // => nord_cap_k = 2, so the nord_k = 1 and 2 groups are live
-  cfg.nord_t = 2;  // must be <= ng-1 = 2
-  cfg.dddmp = 0.5; // >= 1.e-5, so S31 takes the smag_corner arm, not vort := 0
-  // Minimum cell / dual-cell areas. Same values the focused d_sw test used, so
-  // the deln_flux (damp_c*da_min)**(nord+1) and del6_vt_flux
-  // (damp*da_min_c)**(nord+1) coefficients stay in the magnitude range already
-  // demonstrated finite in both R8 and R4.
-  cfg.da_min = 1.15e10;
-  cfg.da_min_c = 1.0e10;
+  // Milestone 3A.11V Task 2: these three came from the same invented table as
+  // the per-level arrays and are now taken from the translation, so a scalar
+  // cannot disagree with the column that was derived from it.
+  //   nord   FV_StateMod.F90:681 sets 2, which also caps nord_cap_k at 2.
+  //   nord_t dyn_core.F90:715, min(2,nord) at every level. Must be <= ng-1 = 2.
+  //   dddmp  FV_StateMod.F90:682 sets 0.2. The previous value here was 0.5,
+  //          chosen only to clear the 1.e-5 gate so S31 takes the smag_corner
+  //          arm rather than vort := 0. 0.2 clears it just as well, so that
+  //          coverage is unchanged -- but 0.2 is also what production runs, and
+  //          it halves the worst-case Smagorinsky contribution to the del-2n
+  //          stability metric (a saturated term needs |div*dt| >= 0.20/dddmp,
+  //          i.e. 1.0 at 0.2 versus 0.4 at 0.5).
+  cfg.nord = (int32_t)h.tr_nord;
+  cfg.nord_t = (int32_t)h.tr_nord_t;
+  cfg.dddmp = h.tr_dddmp;
+  // Minimum cell / dual-cell areas. DERIVED from the fabricated metric arrays,
+  // not hard-coded: fv_grid_utils.F90:809-812 defines these as
+  //     call global_mx  (area,   ..., da_min,   da_max)
+  //     call global_mx_c(area_c, ..., da_min_c, da_max_c)
+  // i.e. da_min IS min(area) and da_min_c IS min(area_c), by construction.
+  //
+  // Milestone 3A.11T: the previous hard-coded 1.15e10 was not merely imprecise,
+  // it was larger than this harness's own max(area) = 1.02e10, so da_min/area
+  // came out > 1 at every cell where real FV3 guarantees <= 1 everywhere. That
+  // inflates every (coeff*da_min)**(nord+1) damping coefficient -- the del-2n
+  // divergence damping by 1.17x, deln_flux by 1.17**3 = 1.61x at nord = 2 --
+  // which is the wrong direction for a stability margin and makes the bench a
+  // harder test than production for a reason that has nothing to do with the
+  // port. Computing the minima cannot drift when the metric fabrication changes.
+  //
+  // rarea_c is stored rather than area_c, so the dual-cell minimum is the
+  // reciprocal of the rarea_c MAXIMUM. Zeros are skipped: the arrays span the
+  // padding row/column, which the metric loop never writes.
+  {
+    fv_real amin = std::numeric_limits<fv_real>::max();
+    fv_real rcmax = 0;
+    for (size_t n = 0; n < h.area.size(); ++n)
+      if (h.area[n] > 0 && h.area[n] < amin) amin = h.area[n];
+    for (size_t n = 0; n < h.rarea_c.size(); ++n)
+      if (h.rarea_c[n] > rcmax) rcmax = h.rarea_c[n];
+    cfg.da_min = amin;
+    cfg.da_min_c = (rcmax > 0) ? (fv_real)(1.0 / rcmax) : amin;
+    std::fprintf(stderr, "[BENCH] da_min=%.6e da_min_c=%.6e (derived)\n",
+                 (double)cfg.da_min, (double)cfg.da_min_c);
+  }
   cfg.inline_q = 0;
   cfg.rot3 = 0;
   cfg.do_f3d = 0;
   cfg.do_skeb = 0;
+
+  /* --- Milestone 3A.11T §7 damping bisection --------------------------------
+   *
+   * FV3_BENCH_DAMP selects which damping families are live, so the residual
+   * multi-step growing mode can be attributed to one of them without touching
+   * production code.  Default (unset) is the full production-coverage set
+   * above.  This is a DIAGNOSTIC control on benchmark INPUT only; it disables
+   * no guard and changes no kernel.
+   *
+   *   none       every damping family off
+   *   nodivdamp  divergence damping off (d2_bg / d4_bg / dddmp), del6 flux on
+   *   nodel6     del6_vt_flux family off (damp_v / damp_w / damp_t), divg on
+   *   noheat     d_con / n_con off (the KE-dissipation heating path)
+   */
+  {
+    const DampSelection d = damp_selection();
+    if (d.no_divdamp) {
+      cfg.dddmp = 0.0;   // < 1e-5 => the smag_corner arm is skipped, vort := 0
+      cfg.nord = 0;
+    }
+    if (d.no_del6) cfg.nord_t = 0;
+    if (d.no_heat) { cfg.d_con = 0.0; cfg.n_con = 0; }
+    if (d.nosmag) cfg.dddmp = 0.0;
+    // cfg.nord caps nord_cap_k, so branch H is only reachable when it is >= 1.
+    if (d.force_nord >= 0) cfg.nord = d.force_nord;
+  }
+
+  /* --- Milestone 3A.11V Task 3: the permanent stability table ---------------
+   *
+   * Printed here rather than in make_host_state because da_min and da_min_c are
+   * only known once the metric arrays exist, and the metric ratio is part of
+   * the norm. Printed UNCONDITIONALLY, not behind a debug flag: an unstable
+   * damping column should be visible in every log, including the one nobody
+   * thought to instrument. The whole report is string building over npz rows,
+   * so its cost is not measurable against a 100-call benchmark.
+   *
+   * da_min is passed as BOTH the numerator and the local-area denominator, so
+   * the ratio is exactly 1. That is the worst case over the panel, not an
+   * approximation: da_min is by definition min(area), so da_min/area <= 1
+   * everywhere and the ratio attains 1 at the smallest cell. A stability
+   * verdict has to be taken at the least stable cell, which is that one.
+   *
+   * This REPORTS and never mutates. dyn_core.F90:677-765 does not clip these
+   * coefficients for stability, so neither does this: silently clipping would
+   * make the CUDA backend disagree with the numerical source of truth in
+   * exactly the configurations where the disagreement matters. */
+  {
+    namespace dmp = fv3::gpu::damping;
+    const dmp::StabilityReport rep =
+        dmp::damping_stability(h.tr_col, (double)cfg.da_min, (double)cfg.da_min,
+                               (double)cfg.da_min_c, (double)cfg.da_min_c);
+    std::fprintf(stderr, "%s",
+                 dmp::format_stability_report(h.tr_col, rep).c_str());
+    if (rep.any_unstable_static || rep.any_unstable_other) {
+      /* Loud, and on its own line, because this is the signature that three
+       * milestones of 3A.11 chased as a suspected port defect. Not fatal: a
+       * diagnostic leg may deliberately want an unstable column in order to
+       * measure a threshold, which is exactly how the 3A.11V root cause was
+       * established. An ACCEPTANCE run must not print this. */
+      std::fprintf(stderr,
+                   "[BENCH] *** WARNING: the damping column above is UNSTABLE by"
+                   " the del-2n metric. Any growth observed in this run is"
+                   " EXPECTED and is NOT evidence of a port defect. ***\n");
+    }
+  }
   return cfg;
 }
 
@@ -1034,22 +2017,55 @@ using fv3::gpu::halo::HaloPeerGroup;
 
 constexpr int kTiles = 6;
 
+// HISTORICAL NOTE -- the function this describes no longer exists. Retained
+// because it records what the old asymmetry knob was for and what it measured;
+// the 3A.11V note that follows it explains why it was removed. Read the two
+// together, and read the second as authoritative where they conflict.
+//
 // Per-tile asymmetry. u/v are the prognostic D-grid winds and carry no
 // consistency constraint with delz/zh (unlike delp/pt, whose perturbation would
 // have to be matched in the hydrostatic column), so a phase shift keyed on the
 // tile is a safe way to make all six tiles genuinely different. Without this,
 // six identical tiles would exchange values indistinguishable from their own and
 // a wrong neighbour mapping would go unnoticed.
-void make_tile_asymmetric(HostState &h, int tile) {
-  const double s = 0.37 * (double)tile;
-  for (int64_t k = 0; k < NPZ; ++k)
-    for (int64_t j = 0; j < h.nj_h; ++j)
-      for (int64_t i = 0; i < h.ni_h; ++i) {
-        const size_t idx = (size_t)(i + j * h.ni_h + k * h.ni_h * h.nj_h);
-        h.u[idx] = (fv_real)((double)h.u[idx] + 0.8 * std::sin(s + 0.11 * (double)i));
-        h.v[idx] = (fv_real)((double)h.v[idx] + 0.6 * std::cos(s + 0.13 * (double)j));
-      }
-}
+// This perturbation is ADDITIVE and is applied at :1599, after make_host_state has
+// already returned, so it is a SECOND writer of u/v that FV3_BENCH_WIND_SCALE must
+// also cover. It is scaled by the same factor for one reason: WIND_SCALE=0 has to
+// mean "no wind from any source". Measured before this was scaled, WIND_SCALE=0 still
+// left u over [-0.600, +0.800] and v over [-0.656, +0.800] -- exactly the 0.8 and 0.6
+// amplitudes below -- so the intended rest state was never actually at rest and any
+// "delp changed at rest" reading taken from it would have been unsound.
+//
+// Note what is given up at ws == 0, so it is not claimed as coverage: with the tile
+// phase scaled away all six tiles become identical, which is precisely the situation
+// the comment above warns about -- a wrong neighbour mapping cannot be detected,
+// because a tile exchanging with an identical neighbour sees its own values back. The
+// rest-state leg is therefore blind to seam mapping, stagger and sign defects, and
+// exchanging a uniform scalar or a zero vector is invariant under any of them. Those
+// need the separate seam-sensitive test, not this knob.
+// 3A.11V Task 1: make_tile_asymmetric() is DELETED, not disabled. It existed to
+// stop the six tiles being identical -- "a wrong neighbour mapping would go
+// unnoticed", as the note above says -- by adding a tile-keyed phase shift
+// 0.8*sin(0.37*tile + 0.11*i) / 0.6*cos(0.37*tile + 0.13*j) to u and v.
+//
+// It is now both unnecessary and actively wrong:
+//   - Unnecessary: make_host_state(tile) builds each tile on its own part of the
+//     real cubed sphere, so the six tiles differ by construction and differ in
+//     the way the physical problem actually differs. A wrong neighbour mapping
+//     now shows up as a genuine field discontinuity, not as a mismatch between
+//     two arbitrary phase offsets.
+//   - Actively wrong: it was a SECOND, tile-local, index-keyed writer of u and v
+//     applied after make_host_state returned. It would have re-introduced
+//     precisely the seam discontinuity Task 1 removes, on top of the globally
+//     consistent winds, and it would have done so invisibly.
+//
+// The rest-state caveat recorded in that old note still stands and still needs
+// the separate seam-sensitive test rather than this harness: at ws == 0 the wind
+// field is zero everywhere, and exchanging a zero vector is invariant under any
+// sign, swap or stagger error. What has changed is that the SCALARS are no longer
+// uniform at ws == 0 -- pt, delz, zh, gz and heat_source still carry the global
+// shape function -- so the rest-state leg is no longer blind to scalar seam
+// mapping the way it was when all six tiles were identical.
 
 // The extra kick applied to ONE tile in the second run. Deliberately small
 // enough to stay physical and large enough to survive R4 rounding through a full
@@ -1110,8 +2126,12 @@ bool setup(Member &m, int tile, HaloPeerGroup &pg, bool perturb_this_tile) {
     return false;
   }
 
-  m.h = std::make_unique<HostState>(make_host_state());
-  make_tile_asymmetric(*m.h, tile);
+  // 3A.11V Task 1: the tile index now enters the IC here, at the ONE place that
+  // builds the state, and it enters as geometry (which part of the sphere this
+  // panel occupies) rather than as an additive tile-keyed phase. There is no
+  // longer a second post-hoc writer of u/v; see the note at
+  // make_tile_asymmetric's former site.
+  m.h = std::make_unique<HostState>(make_host_state(tile));
   if (perturb_this_tile) perturb(*m.h);
   m.fields = make_fields(*m.h);
 
@@ -1255,7 +2275,14 @@ double run_mode_a(Member &m, int32_t n_split, int warmup, int iters) {
   };
 
   for (int w = 0; w < warmup; ++w) if (!one_step()) return -1.0;
-  if (fv3_gpu_event_wait(m.ctx, prev_ev, &err) != FV3_GPU_SUCCESS) return -1.0;
+  // Guard on prev_ev: with warmup == 0 no step has run, so prev_ev is still the
+  // null event and the wait fails. That used to abort the repeat before a single
+  // fv3_gpu_dyn_core_step call, and the only symptom was "did not complete
+  // cleanly" with no per-stage diagnostics at all -- indistinguishable, from the
+  // log, from a mid-loop numerical failure.
+  if (prev_ev != 0 &&
+      fv3_gpu_event_wait(m.ctx, prev_ev, &err) != FV3_GPU_SUCCESS)
+    return -1.0;
 
   const auto t0 = std::chrono::steady_clock::now();
   for (int it = 0; it < iters; ++it) if (!one_step()) return -1.0;
@@ -1332,10 +2359,62 @@ double run_mode_b(Member &m, int32_t n_split, int warmup, int iters) {
   return std::chrono::duration<double, std::milli>(t1 - t0).count();
 }
 
+// Milestone 3A.11V: scan the OWNED box only.
+//
+// The harness allocates every 3-D field over [1-HALO, NI+HALO] x same x [0,npz),
+// i.e. ni_h = NI + 2*HALO + 1, so owned index i in [1, NI] lives at array
+// offset i - (1 - HALO) = i + HALO - 1. Halo cells are deliberately excluded
+// from the positivity criterion for two reasons:
+//
+//   1. The four outer cube-corner halo blocks have no owner anywhere on the
+//      cube, so no exchange ever writes them. Whatever the harness seeded is
+//      what stays there; judging the model state by those cells would report
+//      initialization, not evolution.
+//   2. gz/pk3 are deliberately poisoned with huge_r each substep (restored in
+//      Milestone 3A.11-series work to match FV3), so "the whole array is
+//      physical" is not a property this state has by design.
+//
+// "delp > 0 over the owned box" is the criterion the acceptance matrix asks
+// for and the one that is physically meaningful.
+template <typename T>
+bool check_positive_owned(const T *data, int64_t ni_h, int64_t nj_h, int64_t npz,
+                          const char *name) {
+  const int64_t off = (int64_t)HALO - 1; // owned i -> array index i + off
+  size_t bad = 0;
+  double worst = 1.0e300;
+  int64_t wi = 0, wj = 0, wk = 0;
+  for (int64_t k = 0; k < npz; ++k)
+    for (int64_t j = 1; j <= NJ; ++j)
+      for (int64_t i = 1; i <= NI; ++i) {
+        const double v =
+            (double)data[(size_t)((k * nj_h + (j + off)) * ni_h + (i + off))];
+        if (!(v > 0.0)) {
+          ++bad;
+          if (!(v >= worst)) { worst = v; wi = i; wj = j; wk = k; }
+        }
+      }
+  if (bad > 0) {
+    printf("  %s: FAIL positivity (%zu owned cells <= 0; worst %.6e at "
+           "i=%lld j=%lld k=%lld)\n",
+           name, bad, worst, (long long)wi, (long long)wj, (long long)wk);
+    return false;
+  }
+  printf("  %s: positive over owned box (%lldx%lldx%lld)\n", name,
+         (long long)NI, (long long)NJ, (long long)npz);
+  return true;
+}
+
 // SS16: verify the timed work was not skipped/optimized away. Runs a D2H of
 // the resident mask (outside all timing) and reports finiteness plus
 // max|delta| against the H2D-uploaded initial value captured by setup().
 // Returns false if the state did not change or is non-finite.
+//
+// Milestone 3A.11V widened this from {u, delp} finite to the full set the
+// acceptance matrix names: delp positivity over the owned box, and finiteness
+// of the representative winds (u, v) and scalars (delp, pt, w, delz). Before
+// this change a run could report PASS with a NaN in pt or a negative delp,
+// because neither was inspected. gz/pk3/pkc are intentionally NOT checked --
+// see check_positive_owned's note 2 on the deliberate huge_r poison.
 bool verify_work_executed(Member &m, int tile) {
   fv3_gpu_error err{};
   const fv3_gpu_field_mask mask = resident_field_mask();
@@ -1346,11 +2425,18 @@ bool verify_work_executed(Member &m, int tile) {
     printf("  FAIL: tile %d verify D2H returned %d: %s\n", tile, rc, err.message);
     return false;
   }
-  char label[32];
-  std::snprintf(label, sizeof(label), "tile%d u", tile);
-  bool ok = check_finite(m.h->u.data(), m.h->u.size(), label);
+  char label[40];
+  bool ok = true;
+  const struct { const std::vector<fv_real> *v; const char *n; } fin[] = {
+      {&m.h->u, "u"}, {&m.h->v, "v"}, {&m.h->delp, "delp"},
+      {&m.h->pt, "pt"}, {&m.h->w, "w"}, {&m.h->delz, "delz"},
+  };
+  for (const auto &f : fin) {
+    std::snprintf(label, sizeof(label), "tile%d %s", tile, f.n);
+    ok &= check_finite(f.v->data(), f.v->size(), label);
+  }
   std::snprintf(label, sizeof(label), "tile%d delp", tile);
-  ok &= check_finite(m.h->delp.data(), m.h->delp.size(), label);
+  ok &= check_positive_owned(m.h->delp.data(), m.h->ni_h, m.h->nj_h, NPZ, label);
   const bool u_changed = report_changed(m.u_h2d.data(), m.h->u.data(), m.h->u.size(), "u");
   const bool delp_changed =
       report_changed(m.delp_h2d.data(), m.h->delp.data(), m.h->delp.size(), "delp");

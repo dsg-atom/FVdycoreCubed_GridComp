@@ -22,6 +22,7 @@
 #include "fv3_gpu_errors.hpp"
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <cstdlib>  // std::getenv, for the 3A.11T precondition-probe gate
 
 namespace fv3::gpu::vertical {
 namespace {
@@ -123,6 +124,40 @@ __global__ void riem_solver_c_kernel(const RiemSolverCArgs a) {
     w2[k] = a.w3.at(i, j, k);                        // :397
     // pt(is1:ie1,j,1:km) actual argument staged for :410.
     pt2[k] = a.pt.at(i, j, k);
+  }
+
+  /* ---- Milestone 3A.11T precondition probe (diagnostic only) ------------
+   * Evaluates SIM1_solver's own implicit preconditions on the exact arrays
+   * about to be handed to sim1_column. Neither Riem_Solver_c nor SIM1_solver
+   * guards any of these in the authoritative Fortran, so a violation here
+   * means the Fortran would produce a NaN from the same input -- which is the
+   * discriminator between a port defect and an invalid input state.
+   *
+   *   dz2 < 0        : update_dz_c's dz_min clamp (:196-200) must guarantee it
+   *   -dm/dz2*R*pt>0 : the log argument at :1232
+   *   pem increasing : the log(pem(k+1)/pem(k)) ratio at :394
+   *   pg > 0         : the max(p_fac*pm2, p1+pm2) log argument at :1272/:1320
+   *                    (only its pm2-dependent lower bound is checkable here)
+   * Reports at most one level per column to keep the output bounded. */
+  if (a.diag_preconditions) {
+    for (int k = 0; k < km; ++k) {
+      const fv_real logarg = -dm[k] / dz2[k] * a.rdgas * pt2[k];
+      const bool bad_dz = !(dz2[k] < fv_real(0));
+      const bool bad_log = !(logarg > fv_real(0));
+      const bool bad_pem = !(pem[k + 1] > pem[k]);
+      const bool bad_pm = !(a.p_fac * pm2[k] > fv_real(0));
+      if (bad_dz || bad_log || bad_pem || bad_pm) {
+        printf("[RIEMC-PRE tile=%d step=%lld] i=%lld j=%lld k=%d "
+               "dz2=%.9e dm=%.9e pt=%.9e pm2=%.9e pem_k=%.9e pem_k1=%.9e "
+               "logarg=%.9e bad{dz=%d log=%d pem=%d pm=%d}\n",
+               a.diag_tile, static_cast<long long>(a.diag_step),
+               static_cast<long long>(i), static_cast<long long>(j), k,
+               double(dz2[k]), double(dm[k]), double(pt2[k]), double(pm2[k]),
+               double(pem[k]), double(pem[k + 1]), double(logarg),
+               int(bad_dz), int(bad_log), int(bad_pem), int(bad_pm));
+        break;
+      }
+    }
   }
 
   // :402-411  a_imp branch selection. Riem_Solver_c has exactly THREE
@@ -373,6 +408,17 @@ int launch_riem_solver_c_ctx(const ExecutionContext &x,
   a.hydrostatic = cfg.hydrostatic != 0;
   a.nested      = x.immutable->topology->nested != 0;
   a.grid_type   = static_cast<int32_t>(cfg.grid_type);
+
+  /* Milestone 3A.11T: same gate as the runtime's stage checkpoint, so one env
+   * var turns the whole diagnostic set on and neither costs anything when it is
+   * unset. getenv is called once per launch, which is acceptable for a
+   * diagnostic and keeps the flag out of the ABI config. */
+  {
+    const char *dbg = std::getenv("FV3_GPU_DEBUG_FAIL");
+    a.diag_preconditions = (dbg && *dbg);
+    a.diag_tile = static_cast<int32_t>(x.immutable->topology->tile);
+    a.diag_step = p.model_step;
+  }
 
   // Prefer the persistent WP-E vertical workspace; fall back to per-thread
   // local scratch only when it cannot hold this (wider) column count.

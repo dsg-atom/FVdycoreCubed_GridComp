@@ -164,6 +164,10 @@ int main() {
   // Allocate core state fields
   std::vector<fv_real> h_delp(size_3d), h_pt(size_3d), h_w(size_3d);
   std::vector<fv_real> h_delz(size_3d), h_q_con(size_3d), h_cappa(size_3d);
+  // pe/peln are the FV3 exception to (i,j,k): every authoritative declaration
+  // site orders them (i, k, j) -- nh_core.F90:87-88, dyn_core.F90:202-203,
+  // fv_arrays.F90:1472/1474. Same element count, different axis order, so they
+  // get their own index expression below and their own descriptor at step 4.
   std::vector<fv_real> h_pe(size_3d_if), h_peln(size_3d_if);
   std::vector<fv_real> h_pk(size_3d_if), h_pk3(size_3d_if), h_pkc(size_3d_if);
   std::vector<fv_real> h_zh(size_3d_if), h_gz(size_3d_if);
@@ -191,8 +195,9 @@ int main() {
     for (size_t j = 0; j < (size_t)nj_h; ++j) {
       for (size_t i = 0; i < (size_t)ni_h; ++i) {
         size_t idx = i + j * ni_h + k * ni_h * nj_h;
-        h_pe[idx] = p;
-        h_peln[idx] = std::log(p);
+        const size_t idx_pe = i + k * ni_h + j * ni_h * npz1; // (i, k, j)
+        h_pe[idx_pe] = p;
+        h_peln[idx_pe] = std::log(p);
         h_pk[idx] = std::pow(p, fv_real(0.286));
         h_pk3[idx] = h_pk[idx];
         h_pkc[idx] = 0.0;
@@ -226,6 +231,13 @@ int main() {
   const int64_t st_3d_if[] = {1, ni_h, ni_h * nj_h};
   const uint64_t bytes_3d_if = size_3d_if * sizeof(fv_real);
 
+  // pe/peln descriptor: slot 0 = i, slot 1 = k, slot 2 = j, mirroring the
+  // authoritative (i, k, j) declaration order. Same allocation size as an
+  // interface field, different strides.
+  const int64_t lo_pe[] = {lo_3d_if[0], 0, lo_3d_if[1]};
+  const uint64_t ex_pe[] = {ex_3d_if[0], (uint64_t)npz1, ex_3d_if[1]};
+  const int64_t st_pe[] = {1, ni_h, ni_h * npz1};
+
   const int64_t lo_2d[] = {1 - (int64_t)HALO, 1 - (int64_t)HALO};
   const uint64_t ex_2d[] = {(uint64_t)ni_h, (uint64_t)nj_h};
   const int64_t st_2d[] = {1, ni_h};
@@ -238,8 +250,8 @@ int main() {
   fields.push_back(make_field(FieldId::delz, h_delz.data(), 3, lo_3d, ex_3d, st_3d, bytes_3d));
   fields.push_back(make_field(FieldId::q_con, h_q_con.data(), 3, lo_3d, ex_3d, st_3d, bytes_3d));
   fields.push_back(make_field(FieldId::cappa, h_cappa.data(), 3, lo_3d, ex_3d, st_3d, bytes_3d));
-  fields.push_back(make_field(FieldId::pe, h_pe.data(), 3, lo_3d_if, ex_3d_if, st_3d_if, bytes_3d_if));
-  fields.push_back(make_field(FieldId::peln, h_peln.data(), 3, lo_3d_if, ex_3d_if, st_3d_if, bytes_3d_if));
+  fields.push_back(make_field(FieldId::pe, h_pe.data(), 3, lo_pe, ex_pe, st_pe, bytes_3d_if));
+  fields.push_back(make_field(FieldId::peln, h_peln.data(), 3, lo_pe, ex_pe, st_pe, bytes_3d_if));
   fields.push_back(make_field(FieldId::pk, h_pk.data(), 3, lo_3d_if, ex_3d_if, st_3d_if, bytes_3d_if));
   fields.push_back(make_field(FieldId::pk3, h_pk3.data(), 3, lo_3d_if, ex_3d_if, st_3d_if, bytes_3d_if));
   fields.push_back(make_field(FieldId::pkc, h_pkc.data(), 3, lo_3d_if, ex_3d_if, st_3d_if, bytes_3d_if));

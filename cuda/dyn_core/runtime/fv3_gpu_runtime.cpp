@@ -17,6 +17,7 @@
 
 #ifdef FV3_GPU_ENABLE_CUDA
 #include <cuda_runtime_api.h>
+#include "fv3_gpu_state_poison.hpp"
 #endif
 
 struct fv3_gpu_context { fv3::gpu::ContextData data; };
@@ -108,6 +109,93 @@ int zero_accumulators(ContextData &d, fv3_gpu_error *e, const char *api) {
   return FV3_GPU_SUCCESS;
 }
 
+/* Milestone 3A.11T. Restores the init_step initialization of the transient work
+ * arrays that this port had dropped, and which is load-bearing rather than
+ * defensive.
+ *
+ * dyn_core.F90:328-350, inside `if ( init_step )`:
+ *
+ *     allocate(    gz(isd:ied, jsd:jed ,npz+1) )
+ *       call init_ijk_mem(isd,ied, jsd,jed, npz+1, gz, huge_r)
+ *     ...
+ *          allocate( zh(isd:ied, jsd:jed, npz+1) )
+ *   !      call init_ijk_mem(isd,ied, jsd,jed, npz+1, zh, huge_r )
+ *          allocate ( pk3(isd:ied,jsd:jed,npz+1) )
+ *          call init_ijk_mem(isd,ied, jsd,jed, npz+1, pk3, huge_r )
+ *
+ * In the Fortran these arrays are ALLOCATED per init_step and deallocated at
+ * end_step, so gz and pk3 are re-poisoned at the top of every dynamics call for
+ * free. This runtime holds them as persistent WP-E device fields, which is the
+ * intended architecture -- but persistence silently converted a Fortran
+ * transient into a Fortran SAVEd array, and that changes the arithmetic:
+ *
+ *   :444-454  gz := height, over the OWNED box is:ie, js:je only
+ *   :459/:552 halo-exchange gz (i_pack(5)) -- fills the four EDGE halos
+ *   :557-563  zh := gz, over the FULL box isd:ied, jsd:jed   (it == 1)
+ *   :970-977  gz := zh*grav, over is-2:ie+2, js-2:je+2       (end of substep)
+ *
+ * The four DIAGONAL corner ghost blocks are written by neither :444-454 (owned
+ * only) nor the exchange (a four-edge exchange never fills them; FMS leaves the
+ * cube-corner diagonals undefined too, which is the entire reason fill_corners
+ * exists). But they ARE inside :970-977's box and inside :557-563's box. So the
+ * pair of copies closes a loop through cells nothing ever defines:
+ *
+ *     zh(corner) := gz(corner) ; gz(corner) := zh(corner)*grav
+ *
+ * With a fresh huge_r each call that loop is harmless -- it reads a constant
+ * sentinel and FV3 tolerates it because no stage reads gz or zh there. With a
+ * persistent gz it becomes a geometric amplifier that multiplies those cells by
+ * grav EVERY step. Measured on the 8x8x10 R8 bench at cell (i=10, j=9, k=1),
+ * gz went 3.369e6 -> 3.303e7 -> 3.240e8 -> 3.177e9 -> 3.116e10 -> 3.055e11 over
+ * steps 0..5, with zh(step N) bit-identical to gz(step N-1) and every ratio
+ * exactly 9.8065 = grav. It stayed latent until a stencil reached far enough out
+ * to read it: nord >= 2 makes the divergence-damping sweep run with nt /= 0,
+ * whose two-ring reach touches the diagonal corner blocks, and that is exactly
+ * the nord0-PASS / nord1-PASS / nord2-FAIL bisection observed.
+ *
+ * zh is deliberately NOT poisoned: its init_ijk_mem call is commented out at
+ * :347, so the authoritative zh enters the first substep as allocate-garbage and
+ * is defined by the :557-563 copy. Poisoning it here would be a change the
+ * Fortran does not make.
+ *
+ * Numerical algorithm changed: NO. Every cell any stage legitimately reads is
+ * overwritten before its first read -- gz by :444-454 plus the exchange, pk3 by
+ * pk3_halo. What changes is only the value seen in cells the Fortran leaves
+ * undefined, and it changes them FROM an accumulating product TO the Fortran's
+ * own sentinel.
+ *
+ * SCOPE: the four diagonal corner ghost blocks only, not the whole allocation.
+ * init_ijk_mem does cover the whole declared extent, but by the time any stage
+ * reads gz the Fortran has already redefined the owned box (:444-454) and the
+ * four edge halos (the :459 exchange), so huge_r SURVIVES only in the diagonal
+ * corners -- which are exactly the cells the ×grav loop above amplifies. A flat
+ * fill reproduces the Fortran's intermediate state but not its observable one,
+ * and it destroys edge-halo values in any context where the caller rather than
+ * an exchange owns them. That is not hypothetical: the flat version made
+ * fv3_dispatch_smoke fail in BOTH R8 and R4 (whole Riem input columns NaN),
+ * and passed again under FV3_GPU_NO_INIT_POISON=1, because that harness's
+ * Phase A supplies gz's halo itself and nothing here restores it. Narrowing to
+ * the corners keeps the fix and drops the collateral damage.
+ *
+ * Deliberately gated on init_step, not on every call: for k_split > 1 the
+ * Fortran allocates once and lets gz carry across the k_split sub-calls, so
+ * poisoning per call would destroy state the Fortran keeps. */
+int poison_init_step_transients(ContextData &d, fv3_gpu_error *e,
+                                const char *api) {
+  auto stream = static_cast<cudaStream_t>(d.compute_stream);
+  for (auto &x : d.state.fields) {
+    const FieldId id = field_id_from_abi(x.host.field_id);
+    if (id != FieldId::gz && id != FieldId::pk3) continue;
+    if (x.host.rank != 3) continue;
+    const int rc = fv3_fill_device_corner_ghosts(
+        x.device, x.host.lower, x.host.extent, x.host.stride_elements,
+        x.host.compute_lower[0], x.host.compute_upper[0],
+        x.host.compute_lower[1], x.host.compute_upper[1], fv3_huge_r, stream);
+    if (rc != 0) return cuda_fail(static_cast<cudaError_t>(rc), e, api, &d);
+  }
+  return FV3_GPU_SUCCESS;
+}
+
 /* TEMPORARY diagnostic for the Milestone 3A.11 bounded cross-step NaN pass.
  * Gated on FV3_GPU_DEBUG_FAIL and model_step>=1 (call #2 onward) so it is a
  * no-op in every normal build/run. To be reverted once the bounded pass
@@ -115,6 +203,23 @@ int zero_accumulators(ContextData &d, fv3_gpu_error *e, const char *api) {
 void debug_check_finite_stage(ContextData &d, const char *stage, int64_t model_step) {
   const char *dbg = std::getenv("FV3_GPU_DEBUG_FAIL");
   if (!dbg || !*dbg) return;
+  /* Milestone 3A.11V: cost filters. Without them this probe is unusable for the
+   * dt matrix. It D2H-copies EVERY one of the 22 target fields at EVERY
+   * checkpoint for EVERY tile, so an n_split=12 run of 300 calls would move
+   * 22 fields x 17 stages x 12 substeps x 300 calls x 6 tiles x ~40 KB, on the
+   * order of hundreds of GB of transfers to answer a question about three
+   * fields on one tile. These knobs narrow the sampling; none of them changes a
+   * single numerical result, only what is observed.
+   *   FV3_GPU_DEBUG_TILE=N     sample only tile N
+   *   FV3_GPU_DEBUG_FIELDS=a,b sample only these field names
+   *   FV3_GPU_DEBUG_EVERY=N    sample only when model_step % N == 0 */
+  if (const char *ts = std::getenv("FV3_GPU_DEBUG_TILE"))
+    if (std::atoi(ts) != static_cast<int>(d.topology.tile)) return;
+  if (const char *es = std::getenv("FV3_GPU_DEBUG_EVERY")) {
+    const int every = std::atoi(es);
+    if (every > 1 && (model_step % every) != 0) return;
+  }
+  const char *field_filter = std::getenv("FV3_GPU_DEBUG_FIELDS");
   /* BOTH streams. Syncing only the compute stream made the checkpoint itself
    * nondeterministic: a pending unpack on the transfer stream may or may not
    * have landed by the time the D2H copy runs, so the checksum would differ
@@ -127,14 +232,39 @@ void debug_check_finite_stage(ContextData &d, const char *stage, int64_t model_s
    * stream/event edge is excluded and the defect is in kernel or stage logic. */
   cudaStreamSynchronize(static_cast<cudaStream_t>(d.compute_stream));
   cudaStreamSynchronize(static_cast<cudaStream_t>(d.transfer_stream));
+  /* Milestone 3A.11T: delpc/ptc/omga/pt ADDED. The 3A.11S diagnostic covered
+   * `delp` and reported it clean, which was read as "Riem_Solver_C's inputs are
+   * clean". It is not: Riem_Solver_c (nh_utils.F90:325-432, called at
+   * dyn_core.F90:583) consumes `delpc` and `ptc` -- the C-grid predictor's
+   * outputs -- as its `delp` and `pt` dummies, NOT the D-grid `delp`/`pt`.
+   * Neither delpc nor ptc was sampled, so the one hypothesis the log appeared
+   * to exclude had in fact never been tested. omga is Riem's w3 dummy. */
   static const FieldId targets[] = {FieldId::u, FieldId::delp, FieldId::v, FieldId::w,
                                      FieldId::delz, FieldId::uc, FieldId::vc, FieldId::ut,
                                      FieldId::vt, FieldId::divgd, FieldId::crx, FieldId::cry,
                                      FieldId::xfx, FieldId::yfx, FieldId::gz, FieldId::zh,
-                                     FieldId::pkc, FieldId::ws3};
+                                     FieldId::pkc, FieldId::ws3,
+                                     FieldId::delpc, FieldId::ptc, FieldId::omga, FieldId::pt};
   static const char *names[] = {"u", "delp", "v", "w", "delz", "uc", "vc", "ut", "vt",
-                                 "divgd", "crx", "cry", "xfx", "yfx", "gz", "zh", "pkc", "ws3"};
+                                 "divgd", "crx", "cry", "xfx", "yfx", "gz", "zh", "pkc", "ws3",
+                                 "delpc", "ptc", "omga", "pt"};
+  /* Whole-token comma-list match. Substring matching would be wrong here in a
+   * way that silently widens the sample: "pt" is a substring of "ptc", "w" of
+   * "ws3", "delp" of "delpc", "u" of "ut". */
+  auto field_selected = [&](const char *nm) {
+    if (!field_filter || !*field_filter) return true;
+    const size_t n = std::strlen(nm);
+    for (const char *p = field_filter; *p;) {
+      const char *e = std::strchr(p, ',');
+      const size_t len = e ? static_cast<size_t>(e - p) : std::strlen(p);
+      if (len == n && std::strncmp(p, nm, n) == 0) return true;
+      if (!e) break;
+      p = e + 1;
+    }
+    return false;
+  };
   for (int t = 0; t < static_cast<int>(sizeof(targets) / sizeof(targets[0])); ++t) {
+    if (!field_selected(names[t])) continue;
     for (auto &x : d.state.fields) {
       if (field_id_from_abi(x.host.field_id) != targets[t]) continue;
       const size_t count = x.host.allocation_bytes / sizeof(fv_real);
@@ -152,19 +282,158 @@ void debug_check_finite_stage(ContextData &d, const char *stage, int64_t model_s
         h ^= raw[b];
         h *= 1099511628211ull;
       }
+      /* Milestone 3A.11T: extrema over the FINITE subset, with locations.
+       * Finiteness alone cannot answer the question this pass asks. SIM1_solver
+       * (nh_utils.F90:1232) evaluates log(-dm2/dz2*rgas*pt2); update_dz_c's
+       * dz_min clamp (nh_utils.F90:196-200) already guarantees dz2 <= -dz_min,
+       * so the ONLY way that log can see a non-positive argument is delp <= 0
+       * or pt <= 0. Both are perfectly finite. A finite-only probe is therefore
+       * blind to the single remaining precondition, which is why min/argmin are
+       * reported here rather than inferred. */
+      double vmin = 0.0, vmax = 0.0;
+      size_t imin = count, imax = count, finite_count = 0;
       for (size_t i = 0; i < count; ++i) {
-        if (std::isnan(static_cast<double>(tmp[i])) || std::isinf(static_cast<double>(tmp[i]))) {
+        const double v = static_cast<double>(tmp[i]);
+        if (std::isnan(v) || std::isinf(v)) {
           ++bad_count;
           if (first == count) first = i;
+          continue;
+        }
+        if (finite_count == 0 || v < vmin) { vmin = v; imin = i; }
+        if (finite_count == 0 || v > vmax) { vmax = v; imax = i; }
+        ++finite_count;
+      }
+      /* Milestone 3A.11T: the SAME extrema restricted to the OWNED interior
+       * (is..ie, js..je), reported alongside the whole-allocation pair.
+       *
+       * This is the measurement that separates the two surviving hypotheses
+       * for delpc's drift into negative pressure thickness. The whole-box
+       * extremum sat on the j=js-1 ring at the bottom level for three
+       * consecutive steps, but a whole-box figure cannot distinguish
+       *   (a) a genuine instability of the synthetic state, which would show
+       *       up in the interior too, from
+       *   (b) an edge/halo defect, where the owned interior stays healthy and
+       *       only the outermost computed ring diverges.
+       * Riem_Solver_c computes is-1..ie+1 / js-1..je+1 (nh_utils.F90:350-351,
+       * 356), one ring WIDER than the owned box, so a ring-only defect is
+       * consumed as if it were valid state and is invisible to any
+       * interior-only check -- and equally invisible to a whole-box one. */
+      double omin = 0.0, omax = 0.0;
+      size_t oimin = count, oimax = count, own_count = 0, own_bad = 0;
+      {
+        const int64_t hw = static_cast<int64_t>(d.immutable.bounds.halo_width);
+        const int64_t isd = d.immutable.bounds.is - hw;
+        const int64_t jsd = d.immutable.bounds.js - hw;
+        int64_t ni = (d.immutable.bounds.ie - d.immutable.bounds.is + 1) + 2 * hw;
+        int64_t nj = (d.immutable.bounds.je - d.immutable.bounds.js + 1) + 2 * hw;
+        if (ni > 0 && nj > 0 && count % static_cast<size_t>(ni * nj) != 0) { ++ni; ++nj; }
+        if (ni > 0 && nj > 0 && count % static_cast<size_t>(ni * nj) == 0) {
+          for (size_t idx = 0; idx < count; ++idx) {
+            const int64_t ib = static_cast<int64_t>(idx % static_cast<size_t>(ni));
+            const int64_t jb =
+                static_cast<int64_t>((idx / static_cast<size_t>(ni)) % static_cast<size_t>(nj));
+            const int64_t gi = isd + ib, gj = jsd + jb;
+            if (gi < d.immutable.bounds.is || gi > d.immutable.bounds.ie ||
+                gj < d.immutable.bounds.js || gj > d.immutable.bounds.je)
+              continue;
+            const double v = static_cast<double>(tmp[idx]);
+            if (std::isnan(v) || std::isinf(v)) { ++own_bad; continue; }
+            if (own_count == 0 || v < omin) { omin = v; oimin = idx; }
+            if (own_count == 0 || v > omax) { omax = v; oimax = idx; }
+            ++own_count;
+          }
         }
       }
       /* Keyed by TILE, not by context address: a heap pointer changes every run,
        * which makes two runs' logs undiffable, and diffing them is the whole
        * point of the checksum. */
       std::fprintf(stderr,
-                    "[FV3DBG tile=%d step=%lld] %-28s %-6s nan/inf=%zu/%zu first_idx=%zu hash=%016llx\n",
+                    "[FV3DBG tile=%d step=%lld] %-28s %-6s nan/inf=%zu/%zu first_idx=%zu hash=%016llx"
+                    " min=%.9e@%zu max=%.9e@%zu ownnan=%zu ownmin=%.9e@%zu ownmax=%.9e@%zu\n",
                     static_cast<int>(d.topology.tile), static_cast<long long>(model_step), stage, names[t],
-                    bad_count, count, first, static_cast<unsigned long long>(h));
+                    bad_count, count, first, static_cast<unsigned long long>(h),
+                    vmin, imin, vmax, imax, own_bad, omin, oimin, omax, oimax);
+      /* Milestone 3A.11V §3: the SAME numbers as the line above, but as CSV with
+       * every coordinate ALREADY DECODED, plus the value at up to three named
+       * probe cells. Gated on FV3_GPU_DEBUG_CSV, independent of the text form.
+       *
+       * This exists because 3A.11U produced a wrong intermediate conclusion by
+       * parsing the text line above with fixed awk column numbers. The real
+       * positions are $10=min= and $11=max=, not $11/$12, and post-loop stage
+       * strings carry no `it=` token so every column shifts by one. The probe
+       * printed "u NONZERO ... magnitude 0.000000e+00" -- self-contradictory --
+       * and a wind table of all zeros, which would have "confirmed" the very
+       * premise that was false. Emitting decoded CSV removes that entire failure
+       * mode: no consumer has to know a column number or a token order.
+       *
+       * The probe cells answer §3 directly: the growing mode is at one specific
+       * cell, and a whole-box extremum cannot show whether THAT cell is growing
+       * or whether the extremum merely migrated between cells tied at the same
+       * value -- which is exactly what made delp's argmin move at 3A.11U step 58
+       * while every printed value stayed bit-identical. */
+      if (std::getenv("FV3_GPU_DEBUG_CSV")) {
+        const int64_t hw = static_cast<int64_t>(d.immutable.bounds.halo_width);
+        const int64_t isd = d.immutable.bounds.is - hw;
+        const int64_t jsd = d.immutable.bounds.js - hw;
+        int64_t ni = (d.immutable.bounds.ie - d.immutable.bounds.is + 1) + 2 * hw;
+        int64_t nj = (d.immutable.bounds.je - d.immutable.bounds.js + 1) + 2 * hw;
+        if (ni > 0 && nj > 0 && count % static_cast<size_t>(ni * nj) != 0) { ++ni; ++nj; }
+        const bool shaped = (ni > 0 && nj > 0 && count % static_cast<size_t>(ni * nj) == 0);
+        const int64_t nk = shaped ? static_cast<int64_t>(count) / (ni * nj) : 0;
+        /* Decode a flat index to (i,j,k) in GLOBAL tile coordinates. */
+        auto dec_i = [&](size_t f) { return shaped ? isd + static_cast<int64_t>(f) % ni : -9999; };
+        auto dec_j = [&](size_t f) { return shaped ? jsd + (static_cast<int64_t>(f) / ni) % nj : -9999; };
+        auto dec_k = [&](size_t f) { return shaped ? static_cast<int64_t>(f) / (ni * nj) : -9999; };
+        /* Probe cells as "i:j:k,i:j:k,..." -- the mode cell plus controls. */
+        double pv[3] = {0.0, 0.0, 0.0};
+        int pn = 0;
+        if (const char *ps = std::getenv("FV3_GPU_DEBUG_PROBE")) {
+          int pi = 0, pj = 0, pk = 0;
+          const char *c = ps;
+          while (pn < 3 && *c) {
+            if (std::sscanf(c, "%d:%d:%d", &pi, &pj, &pk) == 3) {
+              double v = std::nan("");
+              if (shaped) {
+                const int64_t bi = pi - isd, bj = pj - jsd;
+                if (bi >= 0 && bi < ni && bj >= 0 && bj < nj && pk >= 0 && pk < nk) {
+                  const size_t f = (static_cast<size_t>(pk) * static_cast<size_t>(nj) +
+                                    static_cast<size_t>(bj)) * static_cast<size_t>(ni) +
+                                   static_cast<size_t>(bi);
+                  if (f < count) v = static_cast<double>(tmp[f]);
+                }
+              }
+              pv[pn++] = v;
+            }
+            const char *comma = std::strchr(c, ',');
+            if (!comma) break;
+            c = comma + 1;
+          }
+        }
+        /* `stage` carries embedded spaces ("it=1 dgrid_dynamics"), which would
+         * break the field count. Collapse them so the row stays one CSV field. */
+        char sclean[64];
+        {
+          size_t si = 0;
+          for (const char *p = stage; *p && si + 1 < sizeof(sclean); ++p)
+            sclean[si++] = (*p == ' ' || *p == ',') ? '_' : *p;
+          while (si > 0 && sclean[si - 1] == '_') --si;   /* trim %-28s padding */
+          sclean[si] = '\0';
+        }
+        std::fprintf(stderr,
+                      "CSVPROBE,%d,%lld,%s,%s,%lld,%lld,%lld,%zu,%zu,%zu,"
+                      "%.17e,%lld,%lld,%lld,%.17e,%lld,%lld,%lld,"
+                      "%.17e,%lld,%lld,%lld,%.17e,%lld,%lld,%lld,"
+                      "%.17e,%.17e,%.17e\n",
+                      static_cast<int>(d.topology.tile), static_cast<long long>(model_step),
+                      sclean, names[t],
+                      static_cast<long long>(ni), static_cast<long long>(nj),
+                      static_cast<long long>(nk), count, bad_count, own_bad,
+                      vmin, (long long)dec_i(imin), (long long)dec_j(imin), (long long)dec_k(imin),
+                      vmax, (long long)dec_i(imax), (long long)dec_j(imax), (long long)dec_k(imax),
+                      omin, (long long)dec_i(oimin), (long long)dec_j(oimin), (long long)dec_k(oimin),
+                      omax, (long long)dec_i(oimax), (long long)dec_j(oimax), (long long)dec_k(oimax),
+                      pv[0], pv[1], pv[2]);
+      }
       /* Decode the bad cells' (i,j,k). Which CELLS go bad first separates the
        * candidate mechanisms: an interior plane implicates the stage's own
        * arithmetic, an edge strip implicates the halo exchange, and a 3-wide
@@ -1236,6 +1505,22 @@ extern "C" int fv3_gpu_dyn_core_step(fv3_gpu_context *c,const fv3_gpu_step_desc 
   // dyn_core.F90:368-379, once per call, BEFORE the acoustic loop.
   rc=zero_accumulators(c->data,e,__func__);
   if(rc){ c->data.phase=ContextPhase::failed; return rc; }
+  /* dyn_core.F90:328-350, inside `if (init_step)`, BEFORE the acoustic loop and
+   * before the :444-454 height reconstruction that defines gz's owned box. See
+   * poison_init_step_transients for why a persistent gz makes this load-bearing
+   * rather than defensive. */
+  /* TEMPORARY escape hatch, Milestone 3A.11T. Lets one job measure both arms so
+   * a regression can be ATTRIBUTED to the poison rather than guessed at. Read
+   * once and cached: getenv per step would be a per-call syscall on the hot path.
+   * Classify KEEP/REMOVE under section 11 once stability is proven. */
+  static const bool poison_disabled = [] {
+    const char *s = std::getenv("FV3_GPU_NO_INIT_POISON");
+    return s != nullptr && s[0] != '\0' && s[0] != '0';
+  }();
+  if(p.init_step && !poison_disabled){
+    rc=poison_init_step_transients(c->data,e,__func__);
+    if(rc){ c->data.phase=ContextPhase::failed; return rc; }
+  }
 #endif
 
   /* -------------------------------------------------------------------------
@@ -1369,6 +1654,14 @@ extern "C" int fv3_gpu_dyn_core_step(fv3_gpu_context *c,const fv3_gpu_step_desc 
 #define FV3_GPU_DBG_STAGE(name) do {} while (0)
 #endif
 
+    /* Milestone 3A.11V §5: a checkpoint BEFORE the first halo resolve. Every
+     * other checkpoint fires after its stage, so on step 0 / it=1 the earliest
+     * observable state was `halo_in`, i.e. already post-exchange. §5 asks
+     * specifically whether the ~4.7e-10 bottom-level wind exists "immediately
+     * after initialization", which no existing checkpoint could answer: a
+     * nonzero value at halo_in is equally consistent with the IC carrying it and
+     * with the exchange creating it. This separates those two. */
+    FV3_GPU_DBG_STAGE("entry");
     if(!resolve(FV3_GPU_H_DWIND_IN)) return rc;               // :402 -> :504
     if(!resolve(FV3_GPU_H_W_IN)) return rc;                   // :427 -> :507
     FV3_GPU_DBG_STAGE("halo_in");

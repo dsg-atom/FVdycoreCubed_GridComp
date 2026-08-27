@@ -80,6 +80,14 @@ struct PressureConfig {
 void pressure_gradient(const HorizontalBounds &, const PressureInputs &,
                        const PressureOutputs &, const PressureConfig &);
 
+/* nh_p_grad's k==1 branch, dyn_core.F90:1628-1635.  The model top is NOT
+ * interpolated: pp is zero there by definition and pk is the constant
+ * top_value = ptop**akap, so a2b_ord4 is skipped for that level entirely.
+ * Callers that batch the interpolation over all npz+1 levels must apply this
+ * afterwards to restore the authoritative top. */
+void set_pressure_top(const HorizontalBounds &, fv_real top_value,
+                      View3<fv_real> pp, View3<fv_real> pk);
+
 struct OneGradientInputs {
   View3<fv_real> pk_b;
   View3<fv_real> gz_b;

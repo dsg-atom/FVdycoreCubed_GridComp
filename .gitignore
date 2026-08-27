@@ -8,3 +8,16 @@
 __pycache__
 build_cuda_r4/
 build_cuda_r8/
+
+# Any out-of-source CUDA build tree, not just the two named above. The perf
+# benchmark lives in build_cuda_r8_perf/ (it is behind BUILD_FV3_GPU_PERF_BENCH
+# and is deliberately absent from the r8/r4 trees), and further variants are
+# cheap to create, so match the prefix rather than enumerating.
+build_cuda_*/
+
+# Slurm job output and compute-sanitizer / diagnostic logs. These are produced in
+# the repository root by the GPU legs, are large, and are never source.
+slurm-*.out
+*.log
+*.stdout
+*.sorted

@@ -2,6 +2,8 @@
 #include "wp_d_cuda.hpp"
 #include "fv3_gpu_errors.hpp"
 
+#include <cmath>
+
 namespace fv3::gpu::operators {
 
 int launch_nh_pressure_cuda(const ExecutionContext &x, fv3_gpu_error *e) noexcept {
@@ -36,14 +38,31 @@ int launch_nh_pressure_cuda(const ExecutionContext &x, fv3_gpu_error *e) noexcep
   const auto topology = *x.immutable->topology;
   const auto edges = physical_edges(topology);
   const auto corners = physical_corners(topology);
-  const fv_real grav = static_cast<fv_real>(x.immutable->config.grav);
+  const auto &cfg = x.immutable->config;
+  const fv_real grav = static_cast<fv_real>(cfg.grav);
   const fv_real dt = static_cast<fv_real>(x.dispatch_params->dt);
+  const fv_real ptop = static_cast<fv_real>(cfg.ptop);
+  const fv_real akap = static_cast<fv_real>(cfg.akap);
+  // top_value = ptk = ptop**akap, dyn_core.F90:296 / :1623 (use_logp is
+  // rejected by the guard above, so the peln1 branch cannot be taken here).
+  const fv_real ptk = static_cast<fv_real>(std::pow(cfg.ptop, cfg.akap));
   HorizontalBounds hb{b.is, b.ie, b.js, b.je, b.npz};
 
   fv3_gpu_status s = launch_geopotential_from_height_cuda(
       hb, 2, grav, view3_const(views.zh), view3<fv_real>(views.gz), stream);
   if (s != FV3_GPU_SUCCESS)
     return fail(e, s, __func__, "geopotential_from_height CUDA launch failed");
+
+  /* dyn_core.F90:946 -- pk3_halo is called on EVERY acoustic substep,
+   * unconditionally, immediately before the gz/nh_p_grad block. It is required
+   * here, not optional: riem_solver3 writes pk3 only over is..ie/js..je
+   * (fv3_vertical_kernels.cu:271,356), while a2b_ord4 reads is-2..ie+2 to form
+   * corner values over is..ie+1. Without this, the pk3 interpolation below
+   * would consume a stale two-ring halo. */
+  s = launch_reconstruct_pk3_halo_cuda(hb, ptop, akap, view3_const(views.delp),
+                                       view3<fv_real>(views.pk3), stream);
+  if (s != FV3_GPU_SUCCESS)
+    return fail(e, s, __func__, "reconstruct_pk3_halo CUDA launch failed");
 
   A2BGeometry geom{view2<const fv_real>(views.dxa), view2<const fv_real>(views.dya),
                    view3<const fv_real>(views.grid_lonlat), view3<const fv_real>(views.agrid_lonlat),
@@ -54,6 +73,7 @@ int launch_nh_pressure_cuda(const ExecutionContext &x, fv3_gpu_error *e) noexcep
   auto *qy = static_cast<fv_real*>(arena.arrays[1]);
   auto *qxx = static_cast<fv_real*>(arena.arrays[2]);
   auto *qyy = static_cast<fv_real*>(arena.arrays[3]);
+  auto *pk3_b = static_cast<fv_real*>(arena.arrays[4]);
   auto *pk_b = static_cast<fv_real*>(arena.arrays[5]);
   auto *gz_b = static_cast<fv_real*>(arena.arrays[6]);
   auto *delp_b = static_cast<fv_real*>(arena.arrays[7]);
@@ -70,10 +90,17 @@ int launch_nh_pressure_cuda(const ExecutionContext &x, fv3_gpu_error *e) noexcep
   };
   View3<fv_real> qx_v = slice3(qx), qy_v = slice3(qy), qxx_v = slice3(qxx), qyy_v = slice3(qyy);
   View3<fv_real> pk_v = slice3(pk_b), gz_v = slice3(gz_b), delp_v = slice3(delp_b);
+  View3<fv_real> pk3_v = slice3(pk3_b);
 
+  /* nh_p_grad interpolates pp (=pkc) and pk (=pk3) INDEPENDENTLY --
+   * dyn_core.F90:1637-1638 -- because they are different fields: pkc is the
+   * nonhydrostatic perturbation pressure and pk3 is p**kappa. */
   s = launch_a2b_ord4_global_cuda(hb, edges, corners, b.npz + 1, view3<fv_real>(views.pkc), pk_v,
                                    geom, qx_v, qy_v, qxx_v, qyy_v, true, stream);
   if (s != FV3_GPU_SUCCESS) return fail(e, s, __func__, "A2B (pkc) CUDA launch failed");
+  s = launch_a2b_ord4_global_cuda(hb, edges, corners, b.npz + 1, view3<fv_real>(views.pk3), pk3_v,
+                                   geom, qx_v, qy_v, qxx_v, qyy_v, true, stream);
+  if (s != FV3_GPU_SUCCESS) return fail(e, s, __func__, "A2B (pk3) CUDA launch failed");
   s = launch_a2b_ord4_global_cuda(hb, edges, corners, b.npz + 1, view3<fv_real>(views.gz), gz_v,
                                    geom, qx_v, qy_v, qxx_v, qyy_v, true, stream);
   if (s != FV3_GPU_SUCCESS) return fail(e, s, __func__, "A2B (gz) CUDA launch failed");
@@ -81,7 +108,16 @@ int launch_nh_pressure_cuda(const ExecutionContext &x, fv3_gpu_error *e) noexcep
                                    geom, qx_v, qy_v, qxx_v, qyy_v, false, stream);
   if (s != FV3_GPU_SUCCESS) return fail(e, s, __func__, "A2B (delp) CUDA launch failed");
 
-  PressureInputs pin{pk_v, gz_v, delp_v, pk_v, view2<const fv_real>(views.rdx), view2<const fv_real>(views.rdy)};
+  /* dyn_core.F90:1628-1635 -- the k==1 level is NOT interpolated. The batched
+   * launcher above covers all npz+1 levels, so overwrite the top afterwards to
+   * land on the authoritative values. This also makes pk3's level-0 halo, which
+   * pk3_halo deliberately does not write (it fills levels 1..npz, matching
+   * dyn_core.F90:1289-1341), unable to reach the pressure gradient. gz IS
+   * interpolated at k==1: that a2b_ord4 call sits outside the if/else. */
+  s = launch_set_pressure_top_cuda(hb, ptk, pk_v, pk3_v, stream);
+  if (s != FV3_GPU_SUCCESS) return fail(e, s, __func__, "set_pressure_top CUDA launch failed");
+
+  PressureInputs pin{pk_v, gz_v, delp_v, pk3_v, view2<const fv_real>(views.rdx), view2<const fv_real>(views.rdy)};
   PressureOutputs pout{view3<fv_real>(views.u), view3<fv_real>(views.v),
                        view3<fv_real>(views.du), view3<fv_real>(views.dv)};
   PressureConfig pcfg{PressureVariant::normal_nh, dt, 0};

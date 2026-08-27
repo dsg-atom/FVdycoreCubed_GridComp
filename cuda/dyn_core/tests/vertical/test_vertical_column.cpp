@@ -57,7 +57,7 @@ int main() {
   double s3_bet[km+1]{}, s3_p1[km+1]{};
 
   fv3::gpu::vertical::sim3p0_column(
-      10., 287., 1.4, 0.286, 0.1, 0.0,
+      10., 287., 1.4, 0.286, 0.1, 0.0, 9.80665,
       s3_dm, s3_pt, s3_pem, s3_w, s3_dz, 0.01,
       s3_pe2, s3_aa, s3_bb, s3_dd, s3_w1, s3_gr, s3_gam, s3_pp, s3_bet, s3_p1, km);
 
@@ -78,7 +78,7 @@ int main() {
   double s3b_pp[km+1]{}, s3b_bet[km+1]{}, s3b_p1[km+1]{};
 
   fv3::gpu::vertical::sim3_column(
-      10., 287., 1.4, 0.286, 0.75, 0.1, 0.0,
+      10., 287., 1.4, 0.286, 0.75, 0.1, 0.0, 9.80665,
       s3b_dm, s3b_pt, s3b_pem, s3b_w, s3b_dz, 0.01,
       s3b_pe2, s3b_aa, s3b_bb, s3b_dd, s3b_w1, s3b_wk, s3b_gr, s3b_gam,
       s3b_pp, s3b_bet, s3b_p1, km);
@@ -165,7 +165,7 @@ int main() {
   double r3_dm_tmp[km+1]{}, r3_wm[km+1]{}, r3_dz_tmp[km+1]{};
 
   fv3::gpu::vertical::riem_solver3_column(
-      2, 10., 287., 1.4, 0.286, 10., 0.1, 1.0, 0.0,
+      2, 10., 287., 1.4, 0.286, 10., 0.1, 1.0, 0.0, 9.80665,
       true, false, true, false, false,
       r3_delp, r3_pt, r3_q_con, r3_cappa, r3_zh_in, r3_w_in,
       0., 0.01, r3_w_out, r3_dz_out, r3_zh_out,
@@ -189,7 +189,7 @@ int main() {
   printf("  Riem_Solver3 full (a_imp=1.0, SIM1): PASS\n");
 
   fv3::gpu::vertical::riem_solver3_column(
-      2, 10., 287., 1.4, 0.286, 10., 0.1, 0.3, 0.0,
+      2, 10., 287., 1.4, 0.286, 10., 0.1, 0.3, 0.0, 9.80665,
       true, false, false, true, false,
       r3_delp, r3_pt, r3_q_con, r3_cappa, r3_zh_in, r3_w_in,
       0., 0.01, r3_w_out, r3_dz_out, r3_zh_out,
@@ -208,7 +208,7 @@ int main() {
   printf("  Riem_Solver3 full (a_imp=0.3, RIM_2D): PASS\n");
 
   fv3::gpu::vertical::riem_solver3_column(
-      2, 10., 287., 1.4, 0.286, 10., 0.1, -1.0, 0.0,
+      2, 10., 287., 1.4, 0.286, 10., 0.1, -1.0, 0.0, 9.80665,
       true, false, false, false, false,
       r3_delp, r3_pt, r3_q_con, r3_cappa, r3_zh_in, r3_w_in,
       0., 0.01, r3_w_out, r3_dz_out, r3_zh_out,
