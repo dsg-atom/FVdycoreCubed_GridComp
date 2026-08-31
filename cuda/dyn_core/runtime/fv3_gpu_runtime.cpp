@@ -10,6 +10,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <new>
 #include <string>
@@ -18,6 +20,7 @@
 #ifdef FV3_GPU_ENABLE_CUDA
 #include <cuda_runtime_api.h>
 #include "fv3_gpu_state_poison.hpp"
+#include "fv3_gpu_heat_accumulator.hpp"
 #endif
 
 struct fv3_gpu_context { fv3::gpu::ContextData data; };
@@ -244,10 +247,42 @@ void debug_check_finite_stage(ContextData &d, const char *stage, int64_t model_s
                                      FieldId::vt, FieldId::divgd, FieldId::crx, FieldId::cry,
                                      FieldId::xfx, FieldId::yfx, FieldId::gz, FieldId::zh,
                                      FieldId::pkc, FieldId::ws3,
-                                     FieldId::delpc, FieldId::ptc, FieldId::omga, FieldId::pt};
+                                     FieldId::delpc, FieldId::ptc, FieldId::omga, FieldId::pt,
+  /* Prompt 6B SP1 ws3 reconciliation: update_dz_c's three remaining
+   * non-dynamical inputs, added so device-side identity of the authoritative
+   * --sp1-boundary load can be PROVEN by D2H readback rather than inferred
+   * from the host-side print. phis/zs are static per run and dp_ref is a 1-D
+   * reference profile, so sampling them costs one extra small copy per
+   * checkpoint and only when FV3_GPU_DEBUG_FIELDS selects them. */
+                                     FieldId::phis, FieldId::zs, FieldId::dp_ref,
+  /* Prompt 6B Task H (SP2 = post-d_sw, dyn_core.F90:871-880): the four
+   * remaining SP2 savepoint fields. Without them SP2 coverage would be 6/10
+   * and the mass/tracer fluxes -- d_sw's own outputs, not derived state --
+   * would go uncompared. Only copied when FV3_GPU_DEBUG_FIELDS selects them. */
+                                     FieldId::mfx, FieldId::mfy,
+                                     FieldId::cx, FieldId::cy,
+  /* Prompt 6B Task J (savepoints A/B = post-Riem_Solver3 / post-nh_p_grad,
+   * dyn_core.F90:972 / :1067): pk3 is Riem_Solver3's intent(out) pressure^kappa
+   * on the full k+1 range and nh_p_grad's second corner-transformed input; ws
+   * is update_dz_d's intent(out) and Riem_Solver3's intent(in), so it
+   * discriminates the two vertical operators without a fourth savepoint.
+   * Neither was sampled before, which is why the SP2 -> end-of-it=1 window had
+   * no CUDA-side observable at all. */
+                                     FieldId::pk3, FieldId::ws,
+  /* Prompt 6B dyn_core-EXIT closure: the six sp3 fields that had no CUDA-side
+   * observable at all. pe/peln/pk are Riem_Solver3's last_call writeback, pkz is
+   * rewritten by the diffusive-heating tail, and ua/va are the A-grid winds the
+   * exit savepoint carries. Without these, an sp3 comparison would silently be
+   * 7 of 13 fields. Only copied when FV3_GPU_DEBUG_FIELDS selects them. */
+                                     FieldId::pe, FieldId::peln, FieldId::pk,
+                                     FieldId::pkz, FieldId::ua, FieldId::va};
   static const char *names[] = {"u", "delp", "v", "w", "delz", "uc", "vc", "ut", "vt",
                                  "divgd", "crx", "cry", "xfx", "yfx", "gz", "zh", "pkc", "ws3",
-                                 "delpc", "ptc", "omga", "pt"};
+                                 "delpc", "ptc", "omga", "pt",
+                                 "phis", "zs", "dp_ref",
+                                 "mfx", "mfy", "cx", "cy",
+                                 "pk3", "ws",
+                                 "pe", "peln", "pk", "pkz", "ua", "va"};
   /* Whole-token comma-list match. Substring matching would be wrong here in a
    * way that silently widens the sample: "pt" is a substring of "ptc", "w" of
    * "ws3", "delp" of "delpc", "u" of "ut". */
@@ -270,6 +305,58 @@ void debug_check_finite_stage(ContextData &d, const char *stage, int64_t model_s
       const size_t count = x.host.allocation_bytes / sizeof(fv_real);
       std::vector<fv_real> tmp(count);
       cudaMemcpy(tmp.data(), x.device, x.host.allocation_bytes, cudaMemcpyDeviceToHost);
+      /* Prompt 6B: raw-value capture for SP1/SP2/SP3 CUDA-vs-Fortran
+       * comparison. Off by default (FV3_GPU_DEBUG_DUMP_DIR unset) -- this is
+       * purely additional D2H-already-happened disk output; no new D2H call,
+       * no new synchronization, no change to the hash/extrema diagnostics
+       * above or below. Reuses the exact flat layout dump_sp0_state()
+       * (run_small_perf_bench.cpp) already writes, so
+       * tools/savepoints/compare_sp0_identity.py's reader can consume this
+       * directly without a third binary format. FV3_GPU_DEBUG_DUMP_STAGE is
+       * an optional comma-list of stage-name SUBSTRINGS (not whole-token --
+       * stage strings like "it=1 cgrid_pressure" have no fixed token layout
+       * a whole-token matcher could rely on, and stage names don't collide
+       * the way field names do, e.g. "cgrid_pressure" is not a substring of
+       * "dgrid_dynamics" or vice versa). */
+      if (const char *dump_dir = std::getenv("FV3_GPU_DEBUG_DUMP_DIR")) {
+        if (*dump_dir) {
+          bool stage_selected = true;
+          if (const char *stage_filter = std::getenv("FV3_GPU_DEBUG_DUMP_STAGE")) {
+            if (*stage_filter) {
+              stage_selected = false;
+              for (const char *p = stage_filter; *p;) {
+                const char *e = std::strchr(p, ',');
+                const size_t len = e ? static_cast<size_t>(e - p) : std::strlen(p);
+                std::string needle(p, len);
+                if (!needle.empty() && std::strstr(stage, needle.c_str())) { stage_selected = true; break; }
+                if (!e) break;
+                p = e + 1;
+              }
+            }
+          }
+          if (stage_selected) {
+            char sclean[64];
+            size_t si = 0;
+            for (const char *p = stage; *p && si + 1 < sizeof(sclean); ++p)
+              sclean[si++] = (*p == ' ' || *p == ',') ? '_' : *p;
+            while (si > 0 && sclean[si - 1] == '_') --si;
+            sclean[si] = '\0';
+            const std::string tile_dir =
+                std::string(dump_dir) + "/tile" + std::to_string(static_cast<int>(d.topology.tile) - 1);
+            std::error_code ec;
+            std::filesystem::create_directories(tile_dir, ec);
+            std::vector<double> raw(tmp.begin(), tmp.end());
+            const std::string path = tile_dir + "/" + sclean + "__" + names[t] + ".bin";
+            std::ofstream f(path, std::ios::binary);
+            if (f) {
+              f.write(reinterpret_cast<const char *>(raw.data()),
+                      static_cast<std::streamsize>(raw.size() * sizeof(double)));
+            } else {
+              std::fprintf(stderr, "[FV3DBG-DUMP] FAIL: cannot open %s for write\n", path.c_str());
+            }
+          }
+        }
+      }
       size_t bad_count = 0, first = count;
       /* Bitwise FNV-1a over the raw bytes. A hash rather than a sum because the
        * question this answers is "did two runs of identical code produce
@@ -558,6 +645,7 @@ const char *halo_group_name(fv3_gpu_halo_group g) noexcept {
     case FV3_GPU_H_PKC2:       return "H_PKC2 (pkc, :931/:967)";
     case FV3_GPU_H_HEAT:       return "H_HEAT (heat_source, del2_cubed :2288)";
     case FV3_GPU_H_DWIND_NEXT: return "H_DWIND_NEXT (u,v for the next substep, :1109)";
+    case FV3_GPU_H_DWIND_SEAM: return "H_DWIND_SEAM (E11 u,v shared seam line, mpp_get_boundary :1178)";
     default:                   return "unknown halo group";
   }
 }
@@ -1081,7 +1169,7 @@ int attach_halo_peer_group(fv3_gpu_context *c, halo::HaloPeerGroup *pg, int32_t 
     return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,
                 "domain bounds must be set before attaching to a peer group");
   int64_t need = 0;
-  for (uint32_t g = 1; g <= static_cast<uint32_t>(FV3_GPU_H_DWIND_NEXT); ++g) {
+  for (uint32_t g = 1; g <= static_cast<uint32_t>(FV3_GPU_H_GROUP_LAST); ++g) {
     const halo::HaloGroupSpec spec = halo::halo_group_spec(g);
     if (!spec.live) continue;
     const int64_t n = halo::group_buffer_elements(spec, geom);
@@ -1623,6 +1711,99 @@ extern "C" int fv3_gpu_dyn_core_step(fv3_gpu_context *c,const fv3_gpu_step_desc 
     return true;
   };
 
+  /* Prompt 6B -- the per-substep heat_source accumulation of
+   * dyn_core.F90:853-861, which this port was missing.
+   *
+   *     if ( flagstruct%d_con > 1.0E-5 .OR. flagstruct%do_skeb ) then
+   *        do j=js,je ; do i=is,ie
+   *           heat_source(i,j,k) = heat_source(i,j,k) + heat_s(i,j)
+   *
+   * Fortran keeps two arrays: a dyn_core-lifetime heat_source zeroed once at
+   * :377-379, and d_sw's per-level intent(OUT) heat_s. This port has only the
+   * registered 3-D heat_source, which d_sw re-zeroes every substep
+   * (dsw_heat_reset_kernel), so at loop exit it held the LAST substep instead of
+   * the sum. `heat_accum` restores the missing second array; it is persistent
+   * device state so no allocation happens inside the loop.
+   *
+   * `do_skeb` is outside the supported production subset, so the gate is d_con
+   * alone -- the same predicate zero_accumulators() already uses for the
+   * once-per-call zeroing of heat_source itself.
+   *
+   * Numerical algorithm changed: NO -- a summation the authoritative code
+   * performs is now performed; no kernel, stencil or expression is altered. */
+  bool heat_accumulate = false;
+  int64_t hs_i0=0, hs_i1=0, hs_j0=0, hs_j1=0, hs_k0=0, hs_k1=0;
+  int64_t hs_lo_i=0, hs_lo_j=0, hs_lo_k=0, hs_st_i=0, hs_st_j=0, hs_st_k=0;
+  fv_real *hs_data = nullptr;
+#ifdef FV3_GPU_ENABLE_CUDA
+  if(config.d_con>1.0e-5){
+    const DeviceViewBase *hv=c->data.state.registry.find(FieldId::heat_source);
+    uint64_t hs_bytes=0;
+    for(auto &fx:c->data.state.fields)
+      if(field_id_from_abi(fx.host.field_id)==FieldId::heat_source)
+        hs_bytes=fx.host.allocation_bytes;
+    /* The accumulation box is the AUTHORITATIVE loop nest -- dyn_core.F90:855-857
+     * is `do j=js,je / do i=is,ie` -- taken from the domain bounds, not from
+     * heat_source's own compute_lower/compute_upper. On this path the caller
+     * registers heat_source with its compute box set to the full halo box
+     * (-2..12 at c8), so using it would accumulate the halo as well. That is not
+     * what Fortran does, and the halo is refreshed by FV3_GPU_H_HEAT before
+     * del2_cubed reads it in any case. */
+    const auto &hb=c->data.immutable.bounds;
+    /* heat_source unregistered, or registered without a usable rank-3 view, is
+     * the "d_con active but the caller does not use the diffusive-heating tail"
+     * case. post_loop_heating is skipped for the same reason further down, so
+     * this is silently inactive rather than an error. */
+    if(hv && hv->data && hv->rank>=3 && hs_bytes>0 && hb.ie>=hb.is && hb.je>=hb.js
+       && hb.npz>0 && static_cast<int64_t>(hv->extent[2])>=hb.npz){
+      hs_data=static_cast<fv_real*>(hv->data);
+      hs_lo_i=hv->lower[0];  hs_lo_j=hv->lower[1];  hs_lo_k=hv->lower[2];
+      hs_st_i=hv->stride[0]; hs_st_j=hv->stride[1]; hs_st_k=hv->stride[2];
+      hs_i0=hb.is; hs_i1=hb.ie;
+      hs_j0=hb.js; hs_j1=hb.je;
+      /* k is stated in the VIEW'S index space. The registered heat_source view
+       * has lower[2] == 0 here while Fortran's loop is `do k=1,npz`, so the npz
+       * levels are view indices lo_k .. lo_k+npz-1. Reconstructing this from npz
+       * alone is exactly the mistake that addresses one level past the
+       * allocation. */
+      hs_k0=hs_lo_k; hs_k1=hs_lo_k+hb.npz-1;
+      if(c->data.heat_accum==nullptr || c->data.heat_accum_bytes<hs_bytes){
+        if(c->data.heat_accum) cudaFree(c->data.heat_accum);
+        c->data.heat_accum=nullptr; c->data.heat_accum_bytes=0;
+        void *acc=nullptr;
+        const cudaError_t arc=cudaMalloc(&acc,static_cast<size_t>(hs_bytes));
+        if(arc!=cudaSuccess) return cuda_fail(arc,e,__func__,&c->data);
+        c->data.heat_accum=static_cast<fv_real*>(acc);
+        c->data.heat_accum_bytes=hs_bytes;
+      }
+      /* Zeroed once per dyn_core call, mirroring the Fortran's allocate-and-zero
+       * at :377-379 rather than the per-substep reset d_sw applies to its own
+       * scratch. Whole-allocation, so the halo starts defined too. */
+      const cudaError_t zrc=cudaMemsetAsync(c->data.heat_accum,0,
+                                            static_cast<size_t>(hs_bytes),
+                                            static_cast<cudaStream_t>(c->data.compute_stream));
+      if(zrc!=cudaSuccess) return cuda_fail(zrc,e,__func__,&c->data);
+      /* Refuse rather than corrupt. The kernel addresses dst/src with
+       * heat_source's own lowers and strides, so an accumulation box that can
+       * reach past the allocation writes into whichever field cudaMalloc placed
+       * next -- a silent, per-tile-random corruption of an unrelated field, which
+       * is the hardest class of defect to attribute. This guard is what caught
+       * the original off-by-one-level form of this code. */
+      const int64_t hs_elems=static_cast<int64_t>(hs_bytes/sizeof(fv_real));
+      const int64_t hs_max_off=(hs_i1-hs_lo_i)*hs_st_i+(hs_j1-hs_lo_j)*hs_st_j
+                              +(hs_k1-hs_lo_k)*hs_st_k;
+      const int64_t hs_min_off=(hs_i0-hs_lo_i)*hs_st_i+(hs_j0-hs_lo_j)*hs_st_j
+                              +(hs_k0-hs_lo_k)*hs_st_k;
+      if(hs_min_off<0 || hs_max_off>=hs_elems)
+        return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,
+                    "the heat_source accumulation box does not fit inside "
+                    "heat_source's registered allocation; the per-substep "
+                    "accumulation is refused rather than writing outside it");
+      heat_accumulate=true;
+    }
+  }
+#endif
+
   for(int32_t it=1;it<=n_split;++it){
     p.acoustic_index=it-1;
 
@@ -1664,7 +1845,51 @@ extern "C" int fv3_gpu_dyn_core_step(fv3_gpu_context *c,const fv3_gpu_step_desc 
     FV3_GPU_DBG_STAGE("entry");
     if(!resolve(FV3_GPU_H_DWIND_IN)) return rc;               // :402 -> :504
     if(!resolve(FV3_GPU_H_W_IN)) return rc;                   // :427 -> :507
+    /* Prompt 6B "E5": the pre-c_sw scalar halo. dyn_core.F90:494-497 completes
+     * i_pack(1) inside `if (it==1)`, before c_sw at :535; the matching START is
+     * fv_dynamics.F90:620-627, i.e. OUTSIDE dyn_core, over {q_con, cappa, delp,
+     * pt}. For it >= 2 no pre-c_sw completion exists because the previous
+     * substep's :892-895/:926 start/complete pair already refreshed the same
+     * group -- which is exactly what the existing :844/:878 resolve below
+     * mirrors. So the only missing edge is the it==1 one, and this is it.
+     *
+     * FV3_GPU_H_DSCALAR is reused rather than a new group added because its
+     * descriptor (fv3_gpu_halo_exchange.hpp:220-228) is already field-for-field
+     * i_pack(1): q_con, delp, pt, cappa, all CENTER scalars at
+     * fv3_domain_halo_width. Same fields, same staggering, same width, same
+     * seams -- so this is a missing resolve of a correct group, not a new or
+     * repurposed one.
+     *
+     * Why it was silent until now: every prior harness IC was uniform per tile,
+     * so an unexchanged delp/pt halo held the same values a correct exchange
+     * would have delivered. Run from real authoritative Fortran SP0 state the
+     * halo instead carries FV3's 1e-15 pre-exchange sentinel, c_sw consumes it,
+     * and delpc/ptc emerge wrong over the whole is-1..ie+1 / js-1..je+1 ring;
+     * on the subset of ring columns where that reaches Riem_Solver_c's log/
+     * divide arguments it becomes NaN in gz and pkc, which p_grad_c then reads
+     * into uc/vc. Numerical algorithm changed: NO -- no kernel, stencil or
+     * expression is touched; a halo the Fortran exchanges is now exchanged. */
+    if(it==1 && !resolve(FV3_GPU_H_DSCALAR)) return rc;        // :496 -> :535
     FV3_GPU_DBG_STAGE("halo_in");
+    /* Prompt 6B -- pem snapshot, dyn_core.F90:503-517.
+     *
+     *     if ( it==n_split .and. end_step ) then
+     *        if ( flagstruct%use_old_omega ) then
+     *           allocate ( pem(is-1:ie+1,npz+1,js-1:je+1) )
+     *           pem(i,1,j) = ptop
+     *           pem(i,k+1,j) = pem(i,k,j) + delp(i,j,k)
+     *
+     * The snapshot is INSIDE the acoustic loop, at the top of the final substep,
+     * and it is taken from that moment's delp -- not from the dyn_core entry
+     * state. Its position relative to the H_DSCALAR completion above matches the
+     * Fortran: :503 sits after complete_group_halo_update(i_pack(1)) at :496.
+     * The i/j range is one ring wide, which the previous substep's post-dynamics
+     * H_DSCALAR resolve (:844 -> :878) leaves current.
+     *
+     * pem then has to survive the whole substep until the finalize at :1205, so
+     * it lives in the WP-D operator arena (slot 10) rather than on the host --
+     * no transfer is added and device residency is preserved. */
+    if(it==n_split && p.end_step && !run(dispatch.omega_pem_snapshot)) return rc;
     if(!run(dispatch.cgrid_predictor)) return rc;             // :515-523
     FV3_GPU_DBG_STAGE("cgrid_predictor");
     /* :525-531 is gated on `nord > 0`; when nord == 0 the Fortran neither packs
@@ -1688,6 +1913,29 @@ extern "C" int fv3_gpu_dyn_core_step(fv3_gpu_context *c,const fv3_gpu_step_desc 
     if(!resolve(FV3_GPU_H_CWIND)) return rc;                  // :618 -> :640
     if(!run(dispatch.dgrid_dynamics)) return rc;              // :700-829
     FV3_GPU_DBG_STAGE("dgrid_dynamics");
+#ifdef FV3_GPU_ENABLE_CUDA
+    /* :853-861, immediately after the d_sw k-loop closes at :862 and therefore
+     * before anything else in the substep -- in particular before the post-loop
+     * resolve(FV3_GPU_H_HEAT), which is what refreshes the halo del2_cubed
+     * needs. At it < n_split the substep's contribution is banked; at
+     * it == n_split the bank is folded back into heat_source, which is the array
+     * post_loop_heating reads. The result is the same sum the Fortran holds at
+     * :1311, reached in n_split adds rather than n_split adds into a separate
+     * array, because the port's heat_source doubles as d_sw's scratch. */
+    if(heat_accumulate){
+      const int hrc = (it<n_split)
+        ? fv3_heat_source_accumulate(c->data.heat_accum, hs_data,
+                                     hs_lo_i,hs_lo_j,hs_lo_k, hs_st_i,hs_st_j,hs_st_k,
+                                     hs_i0,hs_i1, hs_j0,hs_j1, hs_k0,hs_k1,
+                                     c->data.compute_stream)
+        : fv3_heat_source_accumulate(hs_data, c->data.heat_accum,
+                                     hs_lo_i,hs_lo_j,hs_lo_k, hs_st_i,hs_st_j,hs_st_k,
+                                     hs_i0,hs_i1, hs_j0,hs_j1, hs_k0,hs_k1,
+                                     c->data.compute_stream);
+      if(hrc!=static_cast<int>(cudaSuccess))
+        return cuda_fail(static_cast<cudaError_t>(hrc),e,__func__,&c->data);
+    }
+#endif
     if(!resolve(FV3_GPU_H_DSCALAR)) return rc;                // :844 -> :878
     if(!run(dispatch.dgrid_height)) return rc;                // :905-906
     FV3_GPU_DBG_STAGE("dgrid_height");
@@ -1697,6 +1945,66 @@ extern "C" int fv3_gpu_dyn_core_step(fv3_gpu_context *c,const fv3_gpu_step_desc 
     if(!resolve(FV3_GPU_H_PKC2)) return rc;                   // :931 -> :967
     if(!run(dispatch.nh_pressure)) return rc;                 // :940-1019
     FV3_GPU_DBG_STAGE("nh_pressure");
+
+    /* E11 -- dyn_core.F90:1176-1189, the last statement of the acoustic substep
+     * that touches u or v:
+     *
+     *   if( it==n_split .and. gridstruct%grid_type<4 .and. .not.gridstruct%nested)
+     *      call mpp_get_boundary(u, v, domain, ebuffery=ebuffer,
+     *                            nbufferx=nbuffer, gridtype=DGRID_NE)
+     *      u(is:ie, je+1, k) = nbuffer(...);  v(ie+1, js:je, k) = ebuffer(...)
+     *
+     * Not a halo exchange: u's je+1 line and v's ie+1 line are OWNED cells that
+     * the neighbour tile computes redundantly, and this replaces my copy with the
+     * neighbour's so the two cannot drift apart across substeps. Implemented as
+     * the FV3_GPU_H_DWIND_SEAM group, which is the existing seam algebra
+     * evaluated at ring h = 0 with an unpack restricted to one edge per field;
+     * see halo_group_spec() for the map and for the evidence that it reproduces
+     * the authoritative Fortran result bit for bit.
+     *
+     * Placement: after nh_pressure, which is the last writer of u/v in the
+     * substep (:1637-1660 via nh_p_grad), and inside the loop so the guard is
+     * the authoritative `it==n_split` rather than a post-loop assumption. All
+     * three clauses of the Fortran guard are reproduced; grid_type and nested are
+     * fenced elsewhere to 0 and false for this configuration, so the gate reduces
+     * to it==n_split here, but the full condition is written out because a nested
+     * or grid_type>=4 configuration must NOT perform this operation.
+     *
+     * Numerical algorithm changed: NO -- an authoritative operation that was
+     * absent is now performed; no kernel, stencil or expression is altered. */
+    if(it==n_split && config.grid_type<4 && !c->data.topology.nested){
+      if(!resolve(FV3_GPU_H_DWIND_SEAM)) return rc;           // :1178 -> :1188
+      FV3_GPU_DBG_STAGE("seam_reconcile");
+    }
+
+    /* Prompt 6B -- omega finalization, dyn_core.F90:1204-1218.
+     *
+     *     if ( last_step ) then
+     *       if ( flagstruct%use_old_omega ) then
+     *         omga(i,j,k) = (pe(i,k+1,j) - pem(i,k+1,j)) * rdt
+     *         call adv_pe(ua, va, pem, omga, gridstruct, bd, npx, npy, npz, ng)
+     *
+     * Placement is authoritative: strictly AFTER the E11 seam block above (:1176-
+     * :1188) and still inside the acoustic loop. `last_step` is the same
+     * it==n_split .and. end_step predicate the :503 snapshot uses (:518 sets it).
+     * Nothing between here and the dyn_core exit writes pe, ua or va, so this is
+     * the final value of omga.
+     *
+     * The om2d cumulative-sum form at :1219-1237 is the `.not. use_old_omega`
+     * branch and is DEAD for this configuration (use_old_omega defaults .true.,
+     * fv_arrays.F90:465, and is not overridden). It is deliberately not
+     * implemented, and there is no NumericalConfig knob that could select it --
+     * see omega_preconditions() in wp_d_contract.cpp.
+     *
+     * Numerical algorithm changed: NO -- an authoritative stage that was entirely
+     * absent is now performed. Before this, omga's last CUDA writer was
+     * Riem_Solver_c using it as the `w3` scratch argument (faithful as an
+     * intermediate, since Fortran aliases the same array at :518, but not the
+     * exit value). */
+    if(it==n_split && p.end_step){
+      if(!run(dispatch.omega_finalize)) return rc;             // :1205 -> :1218
+      FV3_GPU_DBG_STAGE("omega_finalize");
+    }
   }
 #ifdef FV3_GPU_ENABLE_CUDA
 #undef FV3_GPU_DBG_STAGE
@@ -1740,6 +2048,22 @@ extern "C" int fv3_gpu_dyn_core_step(fv3_gpu_context *c,const fv3_gpu_step_desc 
 #endif
   }
 
+#ifdef FV3_GPU_ENABLE_CUDA
+  /* Prompt 6B: the dyn_core EXIT checkpoint, the CUDA comparand for the
+   * authoritative sp3 savepoint (dyn_core.F90, after the acoustic loop and after
+   * the heat_source application). Deliberately OUTSIDE the post_loop_heating
+   * gate: when that gate is closed the exit state is still a valid comparison
+   * target, and a checkpoint that disappears with a configuration knob is worse
+   * than useless. Labelled with n_split so the dump filename carries the same
+   * `it` the Fortran sp3 block records. */
+  {
+    char exit_lbl[80];
+    std::snprintf(exit_lbl, sizeof(exit_lbl), "it=%d dyn_core_exit",
+                  static_cast<int>(n_split));
+    debug_check_finite_stage(c->data, exit_lbl, p.model_step);
+  }
+#endif
+
   *ev=issue_event(c->data);
   return FV3_GPU_SUCCESS;
 }
@@ -1773,6 +2097,6 @@ extern "C" int fv3_gpu_get_capabilities(fv3_gpu_context*,fv3_gpu_capabilities *p
   p->precision_mask=(1u<<fv3::gpu::active_precision);p->communication_stage=1;p->feature_mask=0;return 0;}
 extern "C" int fv3_gpu_finalize(fv3_gpu_context **pc,fv3_gpu_error *e){using namespace fv3::gpu;clear_error(e);if(!pc||!*pc)return 0;auto*c=*pc;
 #ifdef FV3_GPU_ENABLE_CUDA
-  cudaSetDevice(c->data.create.device_ordinal);cudaStreamSynchronize((cudaStream_t)c->data.compute_stream);cudaStreamSynchronize((cudaStream_t)c->data.transfer_stream);for(auto &x:c->data.state.fields)cudaFree(x.device);if(c->data.workspace.allocation)cudaFree(c->data.workspace.allocation);if(c->data.event_compute_done)cudaEventDestroy((cudaEvent_t)c->data.event_compute_done);if(c->data.event_transfer_done)cudaEventDestroy((cudaEvent_t)c->data.event_transfer_done);cudaStreamDestroy((cudaStream_t)c->data.compute_stream);cudaStreamDestroy((cudaStream_t)c->data.transfer_stream);
+  cudaSetDevice(c->data.create.device_ordinal);cudaStreamSynchronize((cudaStream_t)c->data.compute_stream);cudaStreamSynchronize((cudaStream_t)c->data.transfer_stream);for(auto &x:c->data.state.fields)cudaFree(x.device);if(c->data.workspace.allocation)cudaFree(c->data.workspace.allocation);if(c->data.heat_accum){cudaFree(c->data.heat_accum);c->data.heat_accum=nullptr;c->data.heat_accum_bytes=0;}if(c->data.event_compute_done)cudaEventDestroy((cudaEvent_t)c->data.event_compute_done);if(c->data.event_transfer_done)cudaEventDestroy((cudaEvent_t)c->data.event_transfer_done);cudaStreamDestroy((cudaStream_t)c->data.compute_stream);cudaStreamDestroy((cudaStream_t)c->data.transfer_stream);
 #endif
   delete c;*pc=nullptr;return 0;}

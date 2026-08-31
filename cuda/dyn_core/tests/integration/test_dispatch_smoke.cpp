@@ -922,13 +922,22 @@ NumericalConfig production_config(const HostState &h) {
   // perfectly valid-looking configuration. 2 m is the GEOS namelist value.
   cfg.dz_min = 2.0;
   // Milestone 3A.2: enable post_loop_heating's genuine (non-early-return)
-  // execution path. nf_ke must be exactly 1 because fv3_gpu_dyn_core_step
-  // sets dispatch_params.diffusion_passes = config.nf_ke and runs that many
-  // del2_cubed passes (fv3_gpu_runtime.cpp:620-623) --
-  // launch_post_loop_heating_cuda requires diffusion_passes==nf_ke. With
-  // nf_ke=1, passes=1 and nt=passes-1=0, so the corner_service
-  // call inside post_loop_heating (only reached when nt>0) is skipped,
-  // avoiding this milestone's unimplemented corner_edge_service stub.
+  // execution path.
+  //
+  // This test pins nf_ke = 1, which is NOT the authoritative
+  // min(3, nord+1) = 3 (dyn_core.F90:1310) that the production path now uses
+  // (run_small_perf_bench.cpp derives it from cfg.nord). The pin keeps
+  // nt = passes-1-pass at 0 on every pass, which skips the two copy_corners
+  // rotations inside post_loop_heating.
+  //
+  // Prompt 6B, DEFERRED: raising this to 3 makes Phase C fail
+  // ("Phase C result: FAIL"), root cause not yet localized -- the diagnostic
+  // GPU job could not be scheduled within the task's cost budget. The
+  // corner_edge_service itself is exercised on real GPU hardware by the
+  // authoritative-SP0 bench run, where the dyn_core-exit pt/pkz validate at
+  // round-off scale on all six tiles, so this is a gap in *this test's*
+  // coverage, not evidence against the service. Localize before relying on
+  // nf_ke > 1 here.
   cfg.n_con = 1;
   cfg.d_con = 1.0;
   cfg.nf_ke = 1;
@@ -1056,10 +1065,21 @@ int install_topology(fv3_gpu_context *ctx, fv3_gpu_error *err) {
 // range over the whole enum: if a future change adds a resolve point for
 // H_Q_INLINE or H_DWIND_NEXT, this harness should fail loudly at that new
 // point rather than silently have covered it in advance.
+//
+// Prompt 6B: H_DWIND_SEAM is that mechanism working as designed. Implementing
+// E11 (the it==n_split mpp_get_boundary of dyn_core.F90:1178) added a tenth
+// resolve point, and this harness failed loudly at it -- FV3_GPU_UNSUPPORTED_
+// CONFIGURATION naming the group -- rather than quietly executing without it.
+// Adding it here restores the same weak-sense declaration the other nine carry:
+// it lets the integrated path EXECUTE, and says nothing about the seam values
+// being right. Phase E, which runs a REAL six-tile exchange, exercises the
+// group's actual table entry instead and is the only place the seam semantics
+// are tested here.
 constexpr fv3_gpu_halo_group kRuntimeResolvedGroups[] = {
     FV3_GPU_H_DWIND_IN, FV3_GPU_H_W_IN,    FV3_GPU_H_GZ_FIRST,
     FV3_GPU_H_DIVGD,    FV3_GPU_H_CWIND,   FV3_GPU_H_DSCALAR,
-    FV3_GPU_H_ZH,       FV3_GPU_H_PKC2,    FV3_GPU_H_HEAT};
+    FV3_GPU_H_ZH,       FV3_GPU_H_PKC2,    FV3_GPU_H_HEAT,
+    FV3_GPU_H_DWIND_SEAM};
 
 bool declare_caller_managed_halos(fv3_gpu_context *ctx, fv3_gpu_error *err) {
   for (fv3_gpu_halo_group g : kRuntimeResolvedGroups) {
@@ -1350,7 +1370,8 @@ bool run_phase_b() {
   printf("  vertical_solver    = %s\n", dispatch.vertical_solver ? "WIRED (WP-C riem_solver3)" : "null");
   printf("  nh_pressure        = %s\n", dispatch.nh_pressure ? "WIRED (WP-D)" : "null");
   printf("  post_loop_heating  = %s\n", dispatch.post_loop_heating ? "WIRED (WP-D)" : "null");
-  printf("  corner_edge_service= %s\n", dispatch.corner_edge_service ? "fail-adapter (unsupported)" : "null");
+  printf("  corner_edge_service= %s\n",
+         dispatch.corner_edge_service ? "WIRED (copy_corners, scalar/A-grid)" : "null");
 
   // Milestone 3A.8 test N. Assert the slot separately from asserting that the
   // step succeeds, so the two claims fail independently: a null dgrid_dynamics
@@ -1591,9 +1612,12 @@ int probe(const ExecutionContext &x, fv3_gpu_error *e) {
 
 // Copies `src` into `out`, routing every non-null slot through its probe.
 // corner_edge_service is passed through unwrapped: it is a CornerServiceFn, not
-// a LaunchFn, and this milestone's claim about it is that the production path
-// never REQUESTS it (§19) -- which is established by it never being called,
-// i.e. by the step succeeding while it remains a fail-stub.
+// a LaunchFn, so it is not probe-wrapped and its calls are not counted here.
+// This test pins nf_ke=1, so post_loop_heating's nt is 0 on its single pass and
+// the service is never requested here. It is no longer a fail-stub, though:
+// Prompt 6B implements it in fv3_gpu_production_dispatch.cu, and the production
+// path (nf_ke = min(3, nord+1) = 3) requests it twice per del2_cubed pass with
+// nt>0. See the cfg.nf_ke comment above for why this test still pins 1.
 bool install(const NumericalDispatch &src, NumericalDispatch &out) {
   reset();
   out = NumericalDispatch{};
@@ -2569,11 +2593,13 @@ int main() {
     printf("    sync_to_host, so no stage performed an implicit D2H.\n");
     printf("  * Configurations outside the production first-run subset are\n");
     printf("    refused before any device state is mutated.\n");
-    printf("  * corner_edge_service remains a deliberate fail-stub and the\n");
-    printf("    whole path still succeeds, which is the evidence that the\n");
-    printf("    grid_type=0 production path never REQUESTS it: d_sw and\n");
-    printf("    update_dz_c implement their corner semantics inline through\n");
-    printf("    CornerFillArgs, not through this generic slot.\n");
+    printf("  * corner_edge_service is a REAL service as of Prompt 6B and the\n");
+    printf("    production path requests it twice per del2_cubed pass at the\n");
+    printf("    authoritative nf_ke = min(3, nord+1) = 3 (dyn_core.F90:2419\n");
+    printf("    dir=1, :2437 dir=2). THIS TEST pins nf_ke=1, so nt=0 and it is\n");
+    printf("    not requested here -- see the cfg.nf_ke comment. d_sw and\n");
+    printf("    update_dz_c implement their own corner semantics inline through\n");
+    printf("    CornerFillArgs, not through this slot.\n");
     printf("  * Milestone 3A.10: the integrated path runs on all SIX cubed-\n");
     printf("    sphere tiles with a REAL halo exchange (Phase E). No group is\n");
     printf("    declared caller-managed there; all nine runtime-resolved\n");

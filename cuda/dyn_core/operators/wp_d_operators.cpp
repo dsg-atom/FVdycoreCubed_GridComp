@@ -498,22 +498,51 @@ void a2b_ord4_global(const HorizontalBounds &b, PhysicalEdges edge,
   if(replace) replace_a2b_output(b,q,out);
 }
 
-void del2_pass(const HorizontalBounds &b, int nt, accumulator_real cd,
-               View3<fv_real> q,
-               const Del2Metrics &m, View3<fv_real> fx, View3<fv_real> fy) {
+void del2_zonal_flux(const HorizontalBounds &b, int nt, bool use_sg,
+                     View3<fv_real> q, const Del2Metrics &m,
+                     const Del2SgMetrics &sg, View3<fv_real> fx) {
+  for (int64_t level=0;level<b.npz;++level) {
+    const int64_t kq=q.lo_k+level,kx=fx.lo_k+level;
+    for (int64_t j=b.js-nt;j<=b.je+nt;++j)
+      for (int64_t i=b.is-nt;i<=b.ie+1+nt;++i)
+        fx(i,j,kx)= use_sg
+          ? sg.dy(i,j)*sg.sina_u(i,j)*(q(i-1,j,kq)-q(i,j,kq))*sg.rdxc(i,j)
+          : m.del6_v(i,j)*(q(i-1,j,kq)-q(i,j,kq));
+  }
+}
+
+void del2_meridional_flux(const HorizontalBounds &b, int nt, bool use_sg,
+                          View3<fv_real> q, const Del2Metrics &m,
+                          const Del2SgMetrics &sg, View3<fv_real> fy) {
+  for (int64_t level=0;level<b.npz;++level) {
+    const int64_t kq=q.lo_k+level,ky=fy.lo_k+level;
+    for (int64_t j=b.js-nt;j<=b.je+1+nt;++j)
+      for (int64_t i=b.is-nt;i<=b.ie+nt;++i)
+        fy(i,j,ky)= use_sg
+          ? sg.dx(i,j)*sg.sina_v(i,j)*(q(i,j-1,kq)-q(i,j,kq))*sg.rdyc(i,j)
+          : m.del6_u(i,j)*(q(i,j-1,kq)-q(i,j,kq));
+  }
+}
+
+void del2_update(const HorizontalBounds &b, int nt, accumulator_real cd,
+                 View3<fv_real> q, View2<const fv_real> rarea,
+                 View3<fv_real> fx, View3<fv_real> fy) {
   for (int64_t level=0;level<b.npz;++level) {
     const int64_t kq=q.lo_k+level,kx=fx.lo_k+level,ky=fy.lo_k+level;
     for (int64_t j=b.js-nt;j<=b.je+nt;++j)
-      for (int64_t i=b.is-nt;i<=b.ie+1+nt;++i)
-        fx(i,j,kx)=m.del6_v(i,j)*(q(i-1,j,kq)-q(i,j,kq));
-    for (int64_t j=b.js-nt;j<=b.je+1+nt;++j)
       for (int64_t i=b.is-nt;i<=b.ie+nt;++i)
-        fy(i,j,ky)=m.del6_u(i,j)*(q(i,j-1,kq)-q(i,j,kq));
-    for (int64_t j=b.js-nt;j<=b.je+nt;++j)
-      for (int64_t i=b.is-nt;i<=b.ie+nt;++i)
-        q(i,j,kq)=q(i,j,kq)+cd*m.rarea(i,j)*
+        q(i,j,kq)=q(i,j,kq)+cd*rarea(i,j)*
           (fx(i,j,kx)-fx(i+1,j,kx)+fy(i,j,ky)-fy(i,j+1,ky));
   }
+}
+
+void del2_pass(const HorizontalBounds &b, int nt, accumulator_real cd,
+               View3<fv_real> q,
+               const Del2Metrics &m, View3<fv_real> fx, View3<fv_real> fy) {
+  const Del2SgMetrics unused{};
+  del2_zonal_flux(b,nt,false,q,m,unused,fx);
+  del2_meridional_flux(b,nt,false,q,m,unused,fy);
+  del2_update(b,nt,cd,q,m.rarea,fx,fy);
 }
 
 void average_del2_corners(const HorizontalBounds &b, PhysicalCorners c,
@@ -531,19 +560,10 @@ void average_del2_corners(const HorizontalBounds &b, PhysicalCorners c,
 void del2_pass_sg(const HorizontalBounds &b, int nt, accumulator_real cd,
                   View3<fv_real> q, const Del2SgMetrics &m,
                   View3<fv_real> fx, View3<fv_real> fy) {
-  for(int64_t level=0;level<b.npz;++level) {
-    const int64_t kq=q.lo_k+level,kx=fx.lo_k+level,ky=fy.lo_k+level;
-    for(int64_t j=b.js-nt;j<=b.je+nt;++j)
-      for(int64_t i=b.is-nt;i<=b.ie+1+nt;++i)
-        fx(i,j,kx)=m.dy(i,j)*m.sina_u(i,j)*(q(i-1,j,kq)-q(i,j,kq))*m.rdxc(i,j);
-    for(int64_t j=b.js-nt;j<=b.je+1+nt;++j)
-      for(int64_t i=b.is-nt;i<=b.ie+nt;++i)
-        fy(i,j,ky)=m.dx(i,j)*m.sina_v(i,j)*(q(i,j-1,kq)-q(i,j,kq))*m.rdyc(i,j);
-    for(int64_t j=b.js-nt;j<=b.je+nt;++j)
-      for(int64_t i=b.is-nt;i<=b.ie+nt;++i)
-        q(i,j,kq)=q(i,j,kq)+cd*m.rarea(i,j)*
-          (fx(i,j,kx)-fx(i+1,j,kx)+fy(i,j,ky)-fy(i,j+1,ky));
-  }
+  const Del2Metrics unused{};
+  del2_zonal_flux(b,nt,true,q,unused,m,fx);
+  del2_meridional_flux(b,nt,true,q,unused,m,fy);
+  del2_update(b,nt,cd,q,m.rarea,fx,fy);
 }
 
 void apply_diffusive_heating_nh(const HorizontalBounds &b, fv_real bdt,
@@ -584,6 +604,53 @@ void apply_diffusive_heating_hydrostatic(
           std::min(std::abs(bdt)*delt_max,std::abs(dtmp)),dtmp);
         pt(i,j,pt.lo_k+level)+=delta/pkz(i,j,pkz.lo_k+level);
       }
+}
+
+// dyn_core.F90:505-516.  pem level k0 of this workspace is Fortran k0+2.
+void omega_pem_snapshot(const HorizontalBounds &b, fv_real ptop,
+                        View3<const fv_real> delp, View3<fv_real> pem) {
+  for (int64_t j=b.js-1;j<=b.je+1;++j)
+    for (int64_t i=b.is-1;i<=b.ie+1;++i) {
+      fv_real p=ptop;
+      for (int64_t level=0;level<b.npz;++level) {
+        p+=delp(i,j,delp.lo_k+level);
+        pem(i,j,pem.lo_k+level)=p;
+      }
+    }
+}
+
+// dyn_core.F90:1208-1212.  pe keeps its Fortran (i,k,j) descriptor order, so
+// Fortran pe(i,k+1,j) with k=level+1 is pe(i, pe.lo_j+level+1, j).
+void omega_from_pe(const HorizontalBounds &b, fv_real rdt,
+                   View3<const fv_real> pe, View3<fv_real> pem,
+                   View3<fv_real> omga) {
+  for (int64_t level=0;level<b.npz;++level)
+    for (int64_t j=b.js;j<=b.je;++j)
+      for (int64_t i=b.is;i<=b.ie;++i)
+        omga(i,j,omga.lo_k+level)=
+          (pe(i,pe.lo_j+level+1,j)-pem(i,j,pem.lo_k+level))*rdt;
+}
+
+// dyn_core.F90:1535-1636, with a2b_ord2 already applied into pb.
+void adv_pe(const HorizontalBounds &b, View3<const fv_real> ua,
+            View3<const fv_real> va, View3<fv_real> pb, const AdvPeMetrics &m,
+            View3<fv_real> om) {
+  for (int64_t level=0;level<b.npz;++level) {
+    const int64_t ku=ua.lo_k+level,kv=va.lo_k+level;
+    const bool surface=(level==b.npz-1);   // Fortran k==npz
+    for (int64_t j=b.js;j<=b.je;++j)
+      for (int64_t i=b.is;i<=b.ie;++i) {
+        const fv_real up=surface?ua(i,j,ku)
+          :fv_real(0.5)*(ua(i,j,ku)+ua(i,j,ku+1));
+        const fv_real vp=surface?va(i,j,kv)
+          :fv_real(0.5)*(va(i,j,kv)+va(i,j,kv+1));
+        const accumulator_real inc=
+          adv_pe_cell_increment(m,pb,pb.lo_k+level,i,j,up,vp);
+        const int64_t ko=om.lo_k+level;
+        om(i,j,ko)=static_cast<fv_real>(
+          static_cast<accumulator_real>(om(i,j,ko))+inc);
+      }
+  }
 }
 
 } // namespace fv3::gpu::operators

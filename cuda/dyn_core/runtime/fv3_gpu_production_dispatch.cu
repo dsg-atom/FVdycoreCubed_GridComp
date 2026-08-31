@@ -3,15 +3,112 @@
 #include "../cgrid/fv3_cgrid.hpp"
 #include "../vertical/fv3_vertical_kernels.cuh"
 #include "../operators/wp_d_contract_cuda.hpp"
+#include "../operators/wp_d_contract.hpp"
 #include "../dgrid/wp_b_contract_cuda.hpp"
+#include "../dgrid/wp_b_cuda.cuh"
 
 namespace fv3::gpu {
 namespace {
-int corner_service_not_implemented(const ExecutionContext &, const CornerServiceRequest &,
-                                    fv3_gpu_error *e) noexcept {
-  return fail(e, FV3_GPU_UNSUPPORTED_CONFIGURATION, __func__,
-              "corner_edge_service is not integrated in this milestone's production dispatch; "
-              "only configurations that never require it (config.nf_ke<=1) are supported");
+
+/* Prompt 6B -- the production corner service.
+ *
+ * This slot was a deliberate fail-stub through the previous milestone, which is
+ * why the harness had to pin config.nf_ke = 1: del2_cubed calls copy_corners
+ * between its two flux directions on every pass with nt > 0
+ * (dyn_core.F90:2419 and :2437), so nf_ke > 1 could not run at all.
+ *
+ * The authoritative operation is copy_corners (tp_core.F90:247-322): an in-place
+ * rotation of the four ng x ng halo corner blocks of a SCALAR, in the x
+ * direction (dir = 1) or the y direction (dir = 2). A faithful device port
+ * already exists and is exercised by WP-B for both directions
+ * (dgrid/wp_b_cuda.cu:94 copy_corners_kernel, launcher at :681), so this is an
+ * adapter onto existing cubed-sphere topology infrastructure, NOT a second
+ * corner subsystem -- per the reuse rule in CLAUDE.md.
+ *
+ * ng is the fv_mp_mod compile-time PARAMETER (= 3, tools/fv_mp_mod.F90:108)
+ * that tp_core.F90 `use`s directly, so the rotated block is always 3 x 3
+ * regardless of the caller's nt. CornerServiceRequest::halo_width therefore
+ * describes the requester's WRITE band (nt), not the corner-block size, and is
+ * deliberately not forwarded to the kernel.
+ *
+ * Numerical semantics changed: NO -- it makes a previously unreachable
+ * authoritative operation reachable.
+ */
+int corner_edge_service_cuda(const ExecutionContext &x, const CornerServiceRequest &r,
+                             fv3_gpu_error *e) noexcept {
+  int rc = validate_corner_request(x, r, e);
+  if (rc) return rc;
+  if (r.operation != CornerOperation::copy ||
+      r.orientation != ComponentOrientation::scalar ||
+      r.stagger != FV3_GPU_STAGGER_A ||
+      (r.axis != Axis::x && r.axis != Axis::y))
+    return fail(e, FV3_GPU_UNSUPPORTED_CONFIGURATION, __func__,
+                "the production corner service implements only the scalar A-grid "
+                "copy_corners rotation of tp_core.F90:247 (operation=copy, "
+                "orientation=scalar, stagger=A, axis=x|y)");
+  if (x.submission.stream_id != StreamId::compute)
+    return fail(e, FV3_GPU_INVALID_ARGUMENT, __func__,
+                "the corner service requires the borrowed compute stream");
+
+  const DeviceViewBase *base = x.fields->find(r.first);
+  if (!base || base->rank != 3 || !view_element_width_is(base, sizeof(fv_real)))
+    return fail(e, FV3_GPU_INVALID_ARGUMENT, __func__,
+                "copy_corners requires a rank-3 fv_real field");
+  /* copy_corners_kernel derives its level from blockIdx.z and indexes the view
+   * with that absolute k, so the descriptor must be 0-based in the vertical --
+   * the same convention riem_solver3_kernel documents. */
+  if (base->lower[2] != 0)
+    return fail(e, FV3_GPU_UNSUPPORTED_CONFIGURATION, __func__,
+                "copy_corners requires a 0-based vertical descriptor");
+
+  const auto &db = x.immutable->bounds;
+  const auto &cfg = x.immutable->config;
+  const auto &topo = *x.immutable->topology;
+  constexpr int64_t ng = 3;
+  /* The rotation reads and writes i,j in [1-ng, 0] and [npx, npx+ng-1], i.e.
+   * exactly the isd..ied / jsd..jed box of the authoritative declaration. */
+  for (uint32_t axis = 0; axis < 2; ++axis) {
+    const int64_t lo = axis == 0 ? db.is - ng : db.js - ng;
+    const int64_t hi = axis == 0 ? db.ie + ng : db.je + ng;
+    const int64_t view_hi =
+        base->lower[axis] + static_cast<int64_t>(base->extent[axis]) - 1;
+    if (base->lower[axis] > lo || view_hi < hi)
+      return fail(e, FV3_GPU_INVALID_ARGUMENT, __func__,
+                  "copy_corners requires a field declared over isd..ied/jsd..jed");
+  }
+
+  dgrid::TransportBounds b{};
+  b.is = db.is; b.ie = db.ie; b.js = db.js; b.je = db.je;
+  b.npz = db.npz;
+  b.nk = static_cast<int64_t>(base->extent[2]);
+  b.halo_width = static_cast<int64_t>(db.halo_width);
+  b.ng = ng;
+  b.npx = topo.npx;
+  b.npy = topo.npy;
+  // Fortran guard: .not. nested .and. grid_type < 3 (tp_core.F90:255 / :349).
+  b.nested = topo.nested ? 1 : 0;
+  b.cubed_sphere = (topo.global_cubed_sphere && cfg.grid_type < 3) ? 1 : 0;
+  b.west_edge = (db.is == 1) ? 1 : 0;
+  b.east_edge = (db.ie + 1 == topo.npx) ? 1 : 0;
+  b.south_edge = (db.js == 1) ? 1 : 0;
+  b.north_edge = (db.je + 1 == topo.npy) ? 1 : 0;
+  b.sw_corner = topo.sw_corner ? 1 : 0;
+  b.se_corner = topo.se_corner ? 1 : 0;
+  b.ne_corner = topo.ne_corner ? 1 : 0;
+  b.nw_corner = topo.nw_corner ? 1 : 0;
+
+  DeviceView<fv_real> field{};
+  static_cast<DeviceViewBase &>(field) = *base;
+  // LevelFilter{} carries mode = 0, which level_active reads as "every level"
+  // (dgrid/wp_b_ppm_shared.cuh:51). copy_corners is unconditional in the
+  // authoritative source; there is no per-level gate to reproduce here.
+  const int32_t dir = (r.axis == Axis::x) ? 1 : 2;
+  const fv3_gpu_status s = dgrid::launch_copy_corners_cuda(
+      b, dir, dgrid::LevelFilter{}, operators::view3<fv_real>(field),
+      x.submission.stream);
+  if (s != FV3_GPU_SUCCESS)
+    return fail(e, s, __func__, "copy_corners CUDA launch failed");
+  return FV3_GPU_SUCCESS;
 }
 } // namespace
 
@@ -99,7 +196,12 @@ int fv3_build_production_dispatch(NumericalDispatch &out, fv3_gpu_error *e) noex
   d.vertical_solver = &fv3::gpu::vertical::launch_vertical_solver;
   d.nh_pressure = &fv3::gpu::operators::launch_nh_pressure_cuda;
   d.post_loop_heating = &fv3::gpu::operators::launch_post_loop_heating_cuda;
-  d.corner_edge_service = &corner_service_not_implemented;
+  // Prompt 6B: was corner_service_not_implemented, which forced config.nf_ke=1.
+  // See the block comment above corner_edge_service_cuda.
+  d.corner_edge_service = &corner_edge_service_cuda;
+  // Prompt 6B omega finalization (dyn_core.F90:503-517 and :1205-1218).
+  d.omega_pem_snapshot = &fv3::gpu::operators::launch_omega_pem_snapshot_cuda;
+  d.omega_finalize = &fv3::gpu::operators::launch_omega_finalize_cuda;
   out = d;
   return FV3_GPU_SUCCESS;
 }

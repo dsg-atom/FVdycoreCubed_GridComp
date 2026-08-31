@@ -13,5 +13,10 @@ namespace fv3::gpu::operators {
  * NumericalDispatch::post_loop_heating. */
 int launch_nh_pressure_cuda(const ExecutionContext &, fv3_gpu_error *) noexcept;
 int launch_post_loop_heating_cuda(const ExecutionContext &, fv3_gpu_error *) noexcept;
+/* Prompt 6B: CUDA counterparts of the omega finalization entries. Same contract
+ * validation (omega_preconditions / bind_omega are shared with the host twin),
+ * same arena slots 10/11. */
+int launch_omega_pem_snapshot_cuda(const ExecutionContext &, fv3_gpu_error *) noexcept;
+int launch_omega_finalize_cuda(const ExecutionContext &, fv3_gpu_error *) noexcept;
 
 } // namespace fv3::gpu::operators

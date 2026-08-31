@@ -189,7 +189,7 @@ class HaloPeerGroup {
   uint64_t generation_ = 0;
   bool aborted_ = false;
   PeerMember member_[cubed_sphere_tiles + 1]{};
-  std::array<int32_t, FV3_GPU_H_DWIND_NEXT + 1> layout_{};
+  std::array<int32_t, FV3_GPU_H_GROUP_LAST + 1> layout_{};
 
  public:
   void reset_layout() noexcept {

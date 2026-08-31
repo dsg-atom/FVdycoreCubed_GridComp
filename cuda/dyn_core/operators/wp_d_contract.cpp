@@ -204,9 +204,13 @@ int launch_nh_pressure(const ExecutionContext &x, fv3_gpu_error *e) noexcept {
   const fv_real grav = static_cast<fv_real>(cfg.grav);
   const fv_real dt = static_cast<fv_real>(x.dispatch_params->dt);
   const fv_real ptop = static_cast<fv_real>(cfg.ptop);
-  const fv_real akap = static_cast<fv_real>(cfg.akap);
+  /* pk3_halo (dyn_core.F90:1017 -> :1401) and ptk are EXNER consumers of the
+   * scalar akap, not closure consumers, so they take akap_exner when the caller
+   * supplies it. See NumericalConfig::akap_exner. Prompt 6B. */
+  const double akap_exner = cfg.akap_exner > 0.0 ? cfg.akap_exner : cfg.akap;
+  const fv_real akap = static_cast<fv_real>(akap_exner);
   // top_value = ptk = ptop**akap, dyn_core.F90:296 / :1623.
-  const fv_real ptk = static_cast<fv_real>(std::pow(cfg.ptop, cfg.akap));
+  const fv_real ptk = static_cast<fv_real>(std::pow(cfg.ptop, akap_exner));
   HorizontalBounds hb{b.is, b.ie, b.js, b.je, b.npz};
   geopotential_from_height(hb, 2, grav, view3_const(views.zh), view3<fv_real>(views.gz));
   // dyn_core.F90:946 -- every substep, unconditionally. See the CUDA twin in
@@ -336,17 +340,30 @@ int launch_post_loop_heating(const ExecutionContext &x, fv3_gpu_error *e) noexce
     rc = x.corner_service(x, req_x, e);
     if (rc) return rc;
   }
-  if (cfg.use_sg) {
-    Del2SgMetrics sg{view2<const fv_real>(views.dx), view2<const fv_real>(views.dy),
-                     view2<const fv_real>(views.sina_u), view2<const fv_real>(views.sina_v),
-                     view2<const fv_real>(views.rdxc), view2<const fv_real>(views.rdyc),
-                     view2<const fv_real>(views.rarea)};
-    del2_pass_sg(hb, static_cast<int>(nt), cd, view3<fv_real>(views.heat_source), sg, fx_v, fy_v);
-  } else {
-    Del2Metrics m{view2<const fv_real>(views.del6_u), view2<const fv_real>(views.del6_v),
-                  view2<const fv_real>(views.rarea)};
-    del2_pass(hb, static_cast<int>(nt), cd, view3<fv_real>(views.heat_source), m, fx_v, fy_v);
+  /* Prompt 6B: the pass is issued phase by phase because del2_cubed rotates the
+   * corners TWICE -- dir=1 at dyn_core.F90:2419 (above) and dir=2 at :2437,
+   * between the fx and fy loops. Only the dir=1 rotation was issued before; the
+   * fy differences at the four physical panel corners therefore consumed the
+   * x-rotated halo. Numerical algorithm changed: NO -- restores :2437. */
+  const bool use_sg = cfg.use_sg != 0;
+  Del2SgMetrics sg{view2<const fv_real>(views.dx), view2<const fv_real>(views.dy),
+                   view2<const fv_real>(views.sina_u), view2<const fv_real>(views.sina_v),
+                   view2<const fv_real>(views.rdxc), view2<const fv_real>(views.rdyc),
+                   view2<const fv_real>(views.rarea)};
+  Del2Metrics m{view2<const fv_real>(views.del6_u), view2<const fv_real>(views.del6_v),
+                view2<const fv_real>(views.rarea)};
+  del2_zonal_flux(hb, static_cast<int>(nt), use_sg,
+                  view3<fv_real>(views.heat_source), m, sg, fx_v);
+  if (nt > 0) {
+    CornerServiceRequest req_y = diffusion_corner_request(Axis::y, halo_band, pass,
+                                                          DiffusionPhase::y_corner_copy, 0);
+    rc = x.corner_service(x, req_y, e);
+    if (rc) return rc;
   }
+  del2_meridional_flux(hb, static_cast<int>(nt), use_sg,
+                       view3<fv_real>(views.heat_source), m, sg, fy_v);
+  del2_update(hb, static_cast<int>(nt), cd, view3<fv_real>(views.heat_source),
+              view2<const fv_real>(views.rarea), fx_v, fy_v);
   if (pass == ntimes - 1) {
     /* Milestone 3A.9: the BIG timestep, per dyn_core.F90:1231/:1240
      * (abs(bdt*flagstruct%delt_max)). dispatch_params->dt is now authoritatively
@@ -354,7 +371,15 @@ int launch_post_loop_heating(const ExecutionContext &x, fv3_gpu_error *e) noexce
      * Numerical semantics changed: NO. */
     const fv_real bdt = static_cast<fv_real>(x.dispatch_params->bdt);
     const fv_real delt_max = static_cast<fv_real>(cfg.delt_max);
-    const fv_real cv_air = static_cast<fv_real>(cfg.rdgas / cfg.akap);
+    /* Prompt 6B: dyn_core.F90:323 is `cv_air = cp_air - rdgas`, with
+     * cp_air = rdgas/akap. This read the specific heat at constant PRESSURE and
+     * called it cv_air -- 1004.7 where 717.6 is required, so every dtmp at
+     * :1349 was a factor cp_air/cv_air = 1/(1-akap) = 1.4 too small. The
+     * hydrostatic branch's `cp_air = cv_air + rdgas` below was written against
+     * the correct definition and becomes right again once cv_air is.
+     * Numerical algorithm changed: NO -- restores dyn_core.F90:323. */
+    const fv_real cv_air =
+        static_cast<fv_real>(cfg.rdgas / cfg.akap - cfg.rdgas);
     const fv_real rdg = static_cast<fv_real>(-cfg.rdgas / cfg.grav);
     const fv_real akap = static_cast<fv_real>(cfg.akap);
     const int64_t n_con = cfg.n_con;
@@ -376,6 +401,165 @@ int launch_post_loop_heating(const ExecutionContext &x, fv3_gpu_error *e) noexce
                                  view3<fv_real>(views.pt));
     }
   }
+  return FV3_GPU_SUCCESS;
+}
+
+int bind_omega(const ExecutionContext &x, OmegaViews &v, OperatorArena &arena,
+               fv3_gpu_error *e) noexcept {
+  int rc = validate_execution_context(x, e);
+  if (rc) return rc;
+  const auto &state = *x.fields;
+  const auto &grid = *x.immutable->grid;
+#define REQUIRED_STATE(ID, MEMBER, TYPE) \
+  if (!get<TYPE>(state, FieldId::ID, v.MEMBER)) \
+    return fail(e, FV3_GPU_INVALID_ARGUMENT, __func__, "missing required omega field " #ID)
+#define REQUIRED_GRID(ID, MEMBER, TYPE) \
+  if (!get<TYPE>(grid, FieldId::ID, v.MEMBER)) \
+    return fail(e, FV3_GPU_INVALID_ARGUMENT, __func__, "missing required omega grid field " #ID)
+  REQUIRED_STATE(omga,omga,fv_real); REQUIRED_STATE(pe,pe,fv_real);
+  REQUIRED_STATE(delp,delp,fv_real);
+  REQUIRED_STATE(ua,ua,const fv_real); REQUIRED_STATE(va,va,const fv_real);
+  REQUIRED_GRID(dx,dx,const fv_real); REQUIRED_GRID(dy,dy,const fv_real);
+  REQUIRED_GRID(rarea,rarea,const fv_real);
+  REQUIRED_GRID(grid_lonlat,grid_lonlat,const fv_real);
+  REQUIRED_GRID(edge_w,edge_w,const accumulator_real);
+  REQUIRED_GRID(edge_e,edge_e,const accumulator_real);
+  REQUIRED_GRID(edge_s,edge_s,const accumulator_real);
+  REQUIRED_GRID(edge_n,edge_n,const accumulator_real);
+#undef REQUIRED_STATE
+#undef REQUIRED_GRID
+  const auto &b = x.immutable->bounds;
+  if (b.halo_width < 1)
+    return fail(e, FV3_GPU_INVALID_ARGUMENT, __func__,
+                "omega finalization needs at least one halo ring for pem");
+  /* pem is filled over is-1..ie+1 / js-1..je+1 (dyn_core.F90:505-513) and its
+   * a2b_ord2 transform is read at is..ie+1 / js..je+1 by adv_pe. */
+  const bool shape =
+      covers_3d(v.omga, b.is, b.ie, b.js, b.je, b.npz) &&
+      covers_3d(v.delp, b.is - 1, b.ie + 1, b.js - 1, b.je + 1, b.npz) &&
+      covers_3d(v.ua, b.is, b.ie, b.js, b.je, b.npz) &&
+      covers_3d(v.va, b.is, b.ie, b.js, b.je, b.npz) &&
+      covers(v.pe, 0, b.is - 1, b.ie + 1) &&
+      covers(v.pe, 2, b.js - 1, b.je + 1) && v.pe.rank == 3 &&
+      v.pe.extent[1] >= static_cast<uint64_t>(b.npz) + 1 &&
+      covers_2d(v.dx, b.is, b.ie, b.js, b.je + 1) &&
+      covers_2d(v.dy, b.is, b.ie + 1, b.js, b.je) &&
+      covers_2d(v.rarea, b.is, b.ie, b.js, b.je) &&
+      covers(v.grid_lonlat, 0, b.is, b.ie + 1) &&
+      covers(v.grid_lonlat, 1, b.js, b.je + 1) &&
+      v.grid_lonlat.rank == 3 && v.grid_lonlat.extent[2] >= 2;
+  if (!shape)
+    return fail(e, FV3_GPU_INVALID_ARGUMENT, __func__,
+                "omega descriptor does not cover required bounds");
+  const WorkspaceSlice *slice =
+      workspace_slice(*x.workspace, WorkspaceId::operators);
+  if (!slice || !slice->data)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"operator workspace is unavailable");
+  uint64_t ni=uint64_t(b.ie-b.is+1)+2*b.halo_width;
+  uint64_t nj=uint64_t(b.je-b.js+1)+2*b.halo_width;
+  uint64_t values=0, bytes=0;
+  if (!multiply(ni,nj,values) || !multiply(values,uint64_t(b.npz)+1,values) ||
+      !multiply(values,sizeof(fv_real),bytes) || bytes>slice->bytes/arena.array_count)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"operator workspace is too small");
+  arena.values_per_array=values;
+  auto *base=static_cast<unsigned char *>(slice->data);
+  for(size_t n=0;n<arena.array_count;++n) arena.arrays[n]=base+n*bytes;
+  return FV3_GPU_SUCCESS;
+}
+
+/* Common preconditions for both omega entries.  The implemented branch is the
+ * authoritative one for this configuration: use_old_omega = .true.
+ * (fv_arrays.F90:465, not overridden by the fixture namelist).  The
+ * `.not. use_old_omega` om2d form (dyn_core.F90:797-801, :838-842, :1219-1237)
+ * is deliberately not implemented; there is no knob selecting it, so nothing can
+ * silently take it. */
+int omega_preconditions(const ExecutionContext &x, fv3_gpu_error *e) noexcept {
+  if (x.submission.stream_id != StreamId::compute)
+    return fail(e, FV3_GPU_INVALID_ARGUMENT, __func__,
+                "omega finalization requires the borrowed compute stream");
+  if (!x.immutable->topology->global_cubed_sphere ||
+      x.immutable->topology->nested || x.immutable->topology->regional)
+    return fail(e, FV3_GPU_UNSUPPORTED_CONFIGURATION, __func__,
+                "omega finalization requires a global cubed-sphere configuration");
+  if (!x.dispatch_params->end_step)
+    return fail(e, FV3_GPU_INVALID_ARGUMENT, __func__,
+                "omega finalization is only defined on the last_step substep");
+  return FV3_GPU_SUCCESS;
+}
+
+namespace {
+/* Level slice of an arena array laid out (i, j, k) with the standard carve. */
+View2<fv_real> arena_level(void *p, int64_t lo_i, int64_t lo_j, uint64_t ni,
+                           uint64_t nj, int64_t level) noexcept {
+  return {static_cast<fv_real*>(p) + static_cast<int64_t>(ni*nj)*level,
+          lo_i, lo_j, 1, static_cast<int64_t>(ni)};
+}
+} // namespace
+
+int launch_omega_pem_snapshot(const ExecutionContext &x,
+                              fv3_gpu_error *e) noexcept {
+  int rc = validate_execution_context(x, e);
+  if (rc) return rc;
+  rc = omega_preconditions(x, e);
+  if (rc) return rc;
+  OmegaViews v; OperatorArena arena;
+  rc = bind_omega(x, v, arena, e);
+  if (rc) return rc;
+  const auto &b = x.immutable->bounds;
+  HorizontalBounds hb{b.is, b.ie, b.js, b.je, b.npz};
+  const uint64_t ni = static_cast<uint64_t>(b.ie-b.is+1)+2*b.halo_width;
+  const uint64_t nj = static_cast<uint64_t>(b.je-b.js+1)+2*b.halo_width;
+  const int64_t lo_i = b.is-static_cast<int64_t>(b.halo_width);
+  const int64_t lo_j = b.js-static_cast<int64_t>(b.halo_width);
+  View3<fv_real> pem{static_cast<fv_real*>(arena.arrays[10]), lo_i, lo_j, 0, 1,
+                     static_cast<int64_t>(ni), static_cast<int64_t>(ni*nj)};
+  omega_pem_snapshot(hb, static_cast<fv_real>(x.immutable->config.ptop),
+                     view3_const(v.delp), pem);
+  return FV3_GPU_SUCCESS;
+}
+
+int launch_omega_finalize(const ExecutionContext &x, fv3_gpu_error *e) noexcept {
+  int rc = validate_execution_context(x, e);
+  if (rc) return rc;
+  rc = omega_preconditions(x, e);
+  if (rc) return rc;
+  if (x.dispatch_params->rdt == 0)
+    return fail(e, FV3_GPU_INVALID_ARGUMENT, __func__,
+                "rdt is required by the omega finalization");
+  OmegaViews v; OperatorArena arena;
+  rc = bind_omega(x, v, arena, e);
+  if (rc) return rc;
+  const auto &b = x.immutable->bounds;
+  HorizontalBounds hb{b.is, b.ie, b.js, b.je, b.npz};
+  const uint64_t ni = static_cast<uint64_t>(b.ie-b.is+1)+2*b.halo_width;
+  const uint64_t nj = static_cast<uint64_t>(b.je-b.js+1)+2*b.halo_width;
+  const int64_t lo_i = b.is-static_cast<int64_t>(b.halo_width);
+  const int64_t lo_j = b.js-static_cast<int64_t>(b.halo_width);
+  View3<fv_real> pem{static_cast<fv_real*>(arena.arrays[10]), lo_i, lo_j, 0, 1,
+                     static_cast<int64_t>(ni), static_cast<int64_t>(ni*nj)};
+  View3<fv_real> pb{static_cast<fv_real*>(arena.arrays[11]), lo_i, lo_j, 0, 1,
+                    static_cast<int64_t>(ni), static_cast<int64_t>(ni*nj)};
+  // dyn_core.F90:1208-1212
+  omega_from_pe(hb, static_cast<fv_real>(x.dispatch_params->rdt),
+                view3_const(v.pe), pem, view3<fv_real>(v.omga));
+  // dyn_core.F90:1218 -> :1602 call a2b_ord2(pin, pb, ...) per level
+  A2BGeometry geom{{}, {}, view3<const fv_real>(v.grid_lonlat), {},
+                   view1<const accumulator_real>(v.edge_w),
+                   view1<const accumulator_real>(v.edge_e),
+                   view1<const accumulator_real>(v.edge_s),
+                   view1<const accumulator_real>(v.edge_n)};
+  const auto edges = physical_edges(*x.immutable->topology);
+  const auto corners = physical_corners(*x.immutable->topology);
+  for (int64_t level = 0; level < b.npz; ++level)
+    a2b_ord2_global(hb, edges, corners,
+                    arena_level(arena.arrays[10], lo_i, lo_j, ni, nj, level),
+                    arena_level(arena.arrays[11], lo_i, lo_j, ni, nj, level),
+                    geom, false);
+  // dyn_core.F90:1583-1636
+  AdvPeMetrics m{view3<const fv_real>(v.grid_lonlat), view2<const fv_real>(v.dx),
+                 view2<const fv_real>(v.dy), view2<const fv_real>(v.rarea)};
+  adv_pe(hb, view3<const fv_real>(v.ua), view3<const fv_real>(v.va), pb, m,
+         view3<fv_real>(v.omga));
   return FV3_GPU_SUCCESS;
 }
 

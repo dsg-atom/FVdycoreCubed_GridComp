@@ -286,15 +286,26 @@ seam_vector_transform(SeamRotation r, bool scalar_pair = false) noexcept {
  * seam line already sits at index nx+1 / ny+1 there, whereas on the donor's WEST
  * and SOUTH edges it sits at index 1 and the shift is needed to step past it.
  *
- * THE SHARED SEAM LINE IS NOT EXCHANGED. A staggered destination strip starts
- * strictly outside my own outermost owned line -- (nx+I)+h, not nx+I -- so both
- * tiles keep their own copy of the physically identical line and neither
- * overwrites the other. FV3 reconciles those duplicates separately via
- * mpp_get_boundary at dyn_core.F90:1094-1095, which returns into 1-D buffers
- * (ebuffer/nbuffer) and not into the field, with the stated purpose "Prevent
- * accumulation of rounding errors at overlapped domain edges" (:1091). That is
- * exchange E11 in the halo call map and it is a separate operation from these
- * functions.
+ * THE SHARED SEAM LINE IS NOT EXCHANGED BY A HALO GROUP. A staggered destination
+ * strip at h >= 1 starts strictly outside my own outermost owned line --
+ * (nx+I)+h, not nx+I -- so both tiles keep their own copy of the physically
+ * identical line and neither overwrites the other. FV3 reconciles those
+ * duplicates separately via mpp_get_boundary, with the stated purpose "Prevent
+ * accumulation of rounding errors at overlapped domain edges". That is exchange
+ * E11 in the halo call map, and it is a distinct operation -- but it is expressed
+ * by these same functions evaluated at h = 0, and it is now implemented as the
+ * FV3_GPU_H_DWIND_SEAM group.
+ *
+ * TWO CORRECTIONS to what this comment previously asserted. (1) The call is at
+ * dyn_core.F90:1178, not :1094-1095. (2) mpp_get_boundary does NOT stop at the
+ * 1-D ebuffer/nbuffer: :1181-1188 copies both buffers straight back into u and v,
+ * so E11's destination IS the field array -- specifically owned cells
+ * u(is:ie,je+1,:) and v(ie+1,js:je,:). Any reasoning that relied on "never into
+ * the field" was wrong.
+ *
+ * A further inherited claim, that ring h = 0 is "structurally unreachable" in
+ * this API, was never tested and is false: halo_dest_index at h = 0 lands exactly
+ * on those two owned lines, which is precisely why E11 needs no new index algebra.
  * ------------------------------------------------------------------------- */
 struct StaggerShift {
   int8_t i = 0, j = 0;

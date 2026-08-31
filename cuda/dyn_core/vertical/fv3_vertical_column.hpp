@@ -697,6 +697,7 @@ slow_path:
 // Callers provide all workspace arrays from persistent arena.
 template <class T>
 FV3_VERTICAL_HD inline void riem_solver3_column(int ms, T dt, T rgas, T gama, T kappa,
+                                T akap_exner,
                                 T ptop, T p_fac, T a_imp, T scale_m, T grav,
                                 bool use_cond, bool moist_cappa,
                                 bool last_call, bool fp_out, bool use_logp,
@@ -735,7 +736,20 @@ FV3_VERTICAL_HD inline void riem_solver3_column(int ms, T dt, T rgas, T gama, T 
    * historically used 9.80 while GEOS/MAPL uses 9.80665). That ambiguity does
    * not affect this fix: the defect is the DISAGREEMENT, and using the single
    * configured value is correct whichever value the build supplies. */
-  riem3_precompute_column(delp, pt, q_con, cappa_in, zh_in, w_in, ptop, kappa,
+  /* akap_exner, NOT kappa. nh_core.F90 uses the scalar `akap` for the Exner
+   * variable (:102 ptk = exp(akap*peln1), :138 pk3 = exp(akap*peln2)) and the
+   * `cappa` array for the thermodynamic closure (:114,:148 -> cp2/gm2 ->
+   * SIM1_solver). Under MOIST_CAPPA those are two DIFFERENT constants in the
+   * authoritative GEOS build -- MAPL single-precision MAPL_KAPPA for the
+   * former, the FMS double dry rdgas/(3.5*rdgas) = 2/7 for the latter -- and
+   * this call site is the only Exner consumer inside Riem_Solver3. Passing
+   * `kappa` here (the closure value) conflated them; see NumericalConfig::
+   * akap_exner in fv3_gpu_internal.hpp for the provenance and the measurement.
+   * Callers that pass akap_exner == kappa reproduce the previous behaviour
+   * bitwise. Numerical semantics changed: YES -- a repair toward the
+   * authoritative Fortran. Prompt 6B. */
+  riem3_precompute_column(delp, pt, q_con, cappa_in, zh_in, w_in, ptop,
+                          akap_exner,
                           grav, use_cond, moist_cappa, dm, pm, pem, peln2,
                           pk3_tmp, gm, cp, dz, w2, peg, pelng, km);
 

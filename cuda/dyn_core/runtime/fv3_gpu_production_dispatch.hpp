@@ -19,9 +19,14 @@ namespace fv3::gpu {
  * complete acoustic timestep -- it demonstrates that the wired stages
  * genuinely execute on the GPU through fv3_gpu_dyn_core_step.
  *
- * corner_edge_service is populated with an adapter that unconditionally
- * fails: none of the wired stages call it for the single-pass
- * (config.nf_ke<=1) production configuration this milestone targets. */
+ * STALE AS OF MILESTONE 3A.9: every stage listed above as null is now wired,
+ * and fv3_build_production_dispatch is the complete production table. Read the
+ * per-slot comments in fv3_gpu_production_dispatch.cu, which are current.
+ *
+ * corner_edge_service was likewise an adapter that unconditionally failed,
+ * which forced config.nf_ke <= 1. Prompt 6B replaced it with a real scalar
+ * A-grid copy_corners service (tp_core.F90:247) so del2_cubed can run the
+ * authoritative nf_ke = min(3, nord+1) passes. */
 int fv3_build_production_dispatch(NumericalDispatch &out, fv3_gpu_error *e) noexcept;
 
 } // namespace fv3::gpu

@@ -16,6 +16,27 @@ struct WpDViews {
   DeviceView<const accumulator_real> edge_w, edge_e, edge_s, edge_n;
 };
 
+/* State and geometry the omega finalization needs.  Deliberately separate from
+ * WpDViews so nh_pressure / post_loop_heating do not newly *require* ua, va and
+ * omga to be registered. */
+struct OmegaViews {
+  DeviceView<fv_real> omga, pe, delp;
+  DeviceView<const fv_real> ua, va;
+  DeviceView<const fv_real> dx, dy, rarea, grid_lonlat;
+  DeviceView<const accumulator_real> edge_w, edge_e, edge_s, edge_n;
+};
+
+/* Scratch arena shared by every WP-D dispatch entry.  WorkspaceId::operators is
+ * WP-D-exclusive, and the slot assignment is fixed:
+ *   0-7   nh_pressure          qx, qy, qxx, qyy, pk3_b, pk_b, gz_b, delp_b
+ *   8-9   post_loop_heating    fx, fy
+ *   10    omega                pem -- live from the it==n_split snapshot
+ *                              (dyn_core.F90:505-516) through the finalize
+ *                              (:1211 and adv_pe's `pin`), so nothing else may
+ *                              use slot 10 during that substep
+ *   11    omega                pb  -- a2b_ord2 output consumed by adv_pe
+ * Slots 10-11 are untouched by the other two entries, so the pem snapshot taken
+ * at the top of the last substep survives to the finalize at its end. */
 struct OperatorArena {
   static constexpr size_t array_count = 12;
   std::array<void *, array_count> arrays{};
@@ -26,10 +47,19 @@ struct OperatorArena {
  * descriptor metadata.  Device pointers remain borrowed. */
 int bind_wp_d(const ExecutionContext &, WpDViews &, OperatorArena &,
               fv3_gpu_error *) noexcept;
+int bind_omega(const ExecutionContext &, OmegaViews &, OperatorArena &,
+               fv3_gpu_error *) noexcept;
 
 /* Coarse integration-owned dispatch entries. */
 int launch_nh_pressure(const ExecutionContext &, fv3_gpu_error *) noexcept;
 int launch_post_loop_heating(const ExecutionContext &, fv3_gpu_error *) noexcept;
+/* omega finalization, split at the two authoritative call sites: the pem
+ * snapshot at dyn_core.F90:503-517 (top of the it==n_split substep) and the
+ * (pe-pem)*rdt + adv_pe tail at :1205-1218 (end of that substep). */
+int launch_omega_pem_snapshot(const ExecutionContext &, fv3_gpu_error *) noexcept;
+int launch_omega_finalize(const ExecutionContext &, fv3_gpu_error *) noexcept;
+/* Shared by both twins, like bind_wp_d. */
+int omega_preconditions(const ExecutionContext &, fv3_gpu_error *) noexcept;
 
 CornerServiceRequest diffusion_corner_request(Axis axis, uint32_t halo_width,
                                                int32_t pass_index,

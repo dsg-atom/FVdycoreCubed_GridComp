@@ -275,6 +275,7 @@ __global__ void riem_solver3_kernel(
     fv_real *workspace, uint64_t workspace_stride,
     int64_t is, int64_t ie, int64_t js, int64_t je, int km,
     int ms, fv_real dt, fv_real rgas, fv_real gama, fv_real kappa,
+    fv_real akap_exner,
     fv_real ptop, fv_real p_fac, fv_real a_imp, fv_real scale_m, fv_real grav,
     bool use_cond, bool moist_cappa, bool last_call, bool fp_out, bool use_logp,
     const VerticalWorkspaceLayout layout) {
@@ -348,7 +349,7 @@ __global__ void riem_solver3_kernel(
 
   // Call the column solver
   riem_solver3_column(
-      ms, dt, rgas, gama, kappa, ptop, p_fac, a_imp, scale_m, grav,
+      ms, dt, rgas, gama, kappa, akap_exner, ptop, p_fac, a_imp, scale_m, grav,
       use_cond, moist_cappa, last_call, fp_out, use_logp,
       delp_col, pt_col, q_con_col, cappa_col, zh_col, w_col,
       surface_z, ws, w_out_col, dz_out_col, zh_out_col,
@@ -516,7 +517,14 @@ int launch_vertical_solver(const ExecutionContext &x, fv3_gpu_error *error) {
        * repair toward the authoritative Fortran, not a change away from it. */
       p.vertical_ms, fv_real(p.dt), fv_real(cfg.rdgas),
       fv_real(1.0 / (1.0 - cfg.akap)),
-      fv_real(cfg.akap), fv_real(cfg.ptop), fv_real(cfg.p_fac),
+      fv_real(cfg.akap),
+      /* akap_exner: the Exner-only scalar for ptk/pk3. cfg.akap remains the
+       * closure kappa (gama and capa1). They are the same number unless the
+       * caller supplies akap_exner, in which case the two Riem_Solver3 roles
+       * separate exactly as the authoritative MOIST_CAPPA build does; see
+       * NumericalConfig::akap_exner. Prompt 6B. */
+      fv_real(cfg.akap_exner > 0.0 ? cfg.akap_exner : cfg.akap),
+      fv_real(cfg.ptop), fv_real(cfg.p_fac),
       fv_real(cfg.a_imp), fv_real(cfg.scale_m),
       /* grav. Was hardcoded T(9.8) inside riem_solver3_column, which had no grav
        * parameter to pass it through; see fv3_vertical_column.hpp for the full

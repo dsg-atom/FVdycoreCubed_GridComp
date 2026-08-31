@@ -75,4 +75,15 @@ fv3_gpu_status launch_diffusive_heating_hydrostatic_cuda(
     View3<const fv_real> delp, View3<const fv_real> pkz,
     View3<fv_real> pt, void *stream) noexcept;
 
+fv3_gpu_status launch_pem_snapshot_cuda(
+    const HorizontalBounds &, fv_real ptop, View3<const fv_real> delp,
+    View3<fv_real> pem, void *stream) noexcept;
+fv3_gpu_status launch_omega_from_pe_cuda(
+    const HorizontalBounds &, fv_real rdt, View3<const fv_real> pe,
+    View3<fv_real> pem, View3<fv_real> omga, void *stream) noexcept;
+fv3_gpu_status launch_adv_pe_cuda(
+    const HorizontalBounds &, View3<const fv_real> ua, View3<const fv_real> va,
+    View3<fv_real> pb, const AdvPeMetrics &, View3<fv_real> om,
+    void *stream) noexcept;
+
 } // namespace fv3::gpu::operators

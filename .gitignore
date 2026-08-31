@@ -8,6 +8,16 @@
 __pycache__
 build_cuda_r4/
 build_cuda_r8/
+# Local diagnostic / benchmark scratch files
+*_3a11*.sh
+*_3a11*.out
+*_3a11*.txt
+
+# Specific local diagnostic directories
+dt3a11v/
+
+# Slurm / debug output
+*.out
 
 # Any out-of-source CUDA build tree, not just the two named above. The perf
 # benchmark lives in build_cuda_r8_perf/ (it is behind BUILD_FV3_GPU_PERF_BENCH
@@ -21,3 +31,18 @@ slurm-*.out
 *.log
 *.stdout
 *.sorted
+
+# Milestone 6A.5: converted authoritative grid-metric binaries are derived
+# data (regenerable from the Fortran spgrid_* export via
+# tools/grid_metrics/convert_fortran_grid_metrics.py), not source. Keep the
+# converter and its test committed; keep the *.bin/manifest.json output out.
+tools/grid_metrics/c8_authoritative/
+
+# Milestone 6A.5 Section 10: converted SP0 dynamical-state binaries
+# (tools/savepoints/convert_sp0_to_cuda.py output) and CUDA device-readback
+# dumps (run_small_perf_bench.cpp --sp0-dump output) are derived/generated
+# data, not source. Keep the converter and comparator scripts committed;
+# keep the *.bin/manifest.json output out.
+tools/savepoints/sp0_cuda_authoritative/
+tools/savepoints/sp0_cuda_dump_*/
+tools/savepoints/sp0_cuda_sentinel_test/

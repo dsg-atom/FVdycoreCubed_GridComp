@@ -42,14 +42,17 @@
  * subject of §8. This file does not write them and does not claim to. Any stage
  * that reads a corner halo block is not covered by this exchange.
  *
- * Also NOT handled here, and recorded so it is not mistaken for covered: the
- * shared staggered seam LINE. For a staggered field the outermost owned line
- * coincides with the neighbour's, both tiles compute it independently, and FV3
- * reconciles the two copies through mpp_get_boundary at dyn_core.F90:1094-1095
- * into 1-D ebuffer/nbuffer -- never into the field array itself, motivated by
- * the ":1091 Prevent accumulation of rounding errors at overlapped domain edges"
- * comment. That is exchange E11 in the §1 map; it has no enum group and remains
- * classified MISSING.
+ * The shared staggered seam LINE is a different operation again, and it IS now
+ * handled here -- as its own group, FV3_GPU_H_DWIND_SEAM (exchange E11 of the §1
+ * map), riding this same machinery at ring h = 0. Correction to what this comment
+ * previously asserted: mpp_get_boundary does NOT stop at the 1-D
+ * ebuffer/nbuffer. dyn_core.F90:1181-1188 copies both buffers straight back into
+ * u and v, so the destination really is the field array -- owned cells, not halo
+ * cells. See halo_group_spec(FV3_GPU_H_DWIND_SEAM) for the map and for the
+ * evidence that it reproduces the authoritative result exactly.
+ *
+ * Ring indexing below is therefore ring_begin..halo_width, not 1..halo_width.
+ * Every ordinary group has ring_begin == 1 and is bit-identical to before.
  */
 #include "fv3_gpu_halo_exchange.hpp"
 #include "fv3_gpu_errors.hpp"
@@ -77,15 +80,15 @@ FV3_HALO_HD inline int64_t view_offset(const HaloStripView &v, int64_t i, int64_
  * right: source_shift(receiver_stagger, reversed) equals the packed field's own
  * staggering, so the strip it wants is the strip already sitting here. */
 __global__ void pack_edge_kernel(HaloStripView src, fv_real *buf, int64_t along_extent,
-                                 int64_t nk, int64_t nx, int64_t ny, int32_t width,
-                                 TileEdge edge, StaggerShift stagger) {
+                                 int64_t nk, int64_t nx, int64_t ny, int32_t ring_begin,
+                                 int32_t width, TileEdge edge, StaggerShift stagger) {
   const int64_t k = blockIdx.x * blockDim.x + threadIdx.x;
   const int64_t t = blockIdx.y + 1;                       /* 1..along_extent */
-  const int32_t h = static_cast<int32_t>(blockIdx.z) + 1; /* 1..width */
+  const int32_t h = ring_begin + static_cast<int32_t>(blockIdx.z); /* ring_begin..width */
   if (k >= nk || t > along_extent || h > width) return;
   int64_t i = 0, j = 0;
   halo_src_index(edge, t, h, nx, ny, stagger, i, j);
-  buf[slot_offset(along_extent, nk, h, t, k)] =
+  buf[slot_offset(along_extent, nk, h - ring_begin + 1, t, k)] =
       src.data[view_offset(src, i, j, src.lo_k + k)];
 }
 
@@ -100,17 +103,17 @@ __global__ void pack_edge_kernel(HaloStripView src, fv_real *buf, int64_t along_
  * by T9 of tests/runtime/test_halo_topology.cpp). */
 __global__ void unpack_edge_kernel(HaloStripView dst, const fv_real *buf,
                                    int64_t along_extent, int64_t donor_extent,
-                                   int64_t nk, int64_t nx, int64_t ny, int32_t width,
-                                   TileEdge edge, StaggerShift stagger, bool reversed,
-                                   int8_t sign) {
+                                   int64_t nk, int64_t nx, int64_t ny, int32_t ring_begin,
+                                   int32_t width, TileEdge edge, StaggerShift stagger,
+                                   bool reversed, int8_t sign) {
   const int64_t k = blockIdx.x * blockDim.x + threadIdx.x;
   const int64_t t = blockIdx.y + 1;
-  const int32_t h = static_cast<int32_t>(blockIdx.z) + 1;
+  const int32_t h = ring_begin + static_cast<int32_t>(blockIdx.z);
   if (k >= nk || t > along_extent || h > width) return;
   const int64_t tp = seam_along_index(t, donor_extent, reversed);
   int64_t i = 0, j = 0;
   halo_dest_index(edge, t, h, nx, ny, stagger, i, j);
-  const fv_real v = buf[slot_offset(donor_extent, nk, h, tp, k)];
+  const fv_real v = buf[slot_offset(donor_extent, nk, h - ring_begin + 1, tp, k)];
   dst.data[view_offset(dst, i, j, dst.lo_k + k)] =
       (sign < 0) ? static_cast<fv_real>(-v) : v;
 }
@@ -152,10 +155,10 @@ int launch_halo_pack(const HaloGroupSpec &spec, const HaloGeometry &g,
       const TileEdge edge = static_cast<TileEdge>(q);
       const int64_t along = edge_seam_extent(edge, g.nx, g.ny, fs.stagger);
       int threads = 0;
-      const dim3 grid = strip_grid(v.nk, along, spec.halo_width, threads);
+      const dim3 grid = strip_grid(v.nk, along, halo_ring_count(spec), threads);
       pack_edge_kernel<<<grid, threads, 0, static_cast<cudaStream_t>(stream)>>>(
-          v, send + slot_base(g, spec.halo_width, n, edge), along, v.nk, g.nx, g.ny,
-          spec.halo_width, edge, fs.stagger);
+          v, send + slot_base(g, halo_ring_count(spec), n, edge), along, v.nk, g.nx, g.ny,
+          spec.ring_begin, spec.halo_width, edge, fs.stagger);
     }
   }
   const cudaError_t rc = cudaGetLastError();
@@ -182,7 +185,7 @@ int launch_halo_transfer(const HaloGroupSpec &spec, const HaloGeometry &g,
   if (!spec.live) return fail(e, FV3_GPU_INVALID_ARGUMENT, __func__, "halo group is not live");
   if (!peer_send || !recv)
     return fail(e, FV3_GPU_INVALID_ARGUMENT, __func__, "null buffer table");
-  const int64_t slot = group_slot_elements(g, spec.halo_width);
+  const int64_t slot = group_slot_elements(g, halo_ring_count(spec));
   for (int q = 0; q < 4; ++q) {
     const TileEdge mine = static_cast<TileEdge>(q);
     const EdgeNeighbor &nb = topo.neighbors[q];
@@ -208,8 +211,8 @@ int launch_halo_transfer(const HaloGroupSpec &spec, const HaloGeometry &g,
                       "vector field's seam partner is not a member of its own halo group");
       }
       const cudaError_t rc = cudaMemcpyAsync(
-          recv + slot_base(g, spec.halo_width, n, mine),
-          src + slot_base(g, spec.halo_width, sn, nb.edge),
+          recv + slot_base(g, halo_ring_count(spec), n, mine),
+          src + slot_base(g, halo_ring_count(spec), sn, nb.edge),
           static_cast<size_t>(slot) * sizeof(fv_real), cudaMemcpyDeviceToDevice,
           static_cast<cudaStream_t>(stream));
       if (rc != cudaSuccess)
@@ -243,6 +246,9 @@ int launch_halo_unpack(const HaloGroupSpec &spec, const HaloGeometry &g,
         return fail(e, FV3_GPU_INVALID_ARGUMENT, __func__,
                     "a field required by this halo group is not registered");
       const HaloFieldSpec &fs = spec.fields[n];
+      /* E11's destinations are owned cells, so a field may legally decline an
+       * edge; see HaloFieldSpec::dest_edges. Ordinary groups pass 0xF. */
+      if (!(fs.dest_edges & (1u << q))) continue;
       const HaloStripView &v = f.view[n];
       const StaggerShift src = source_shift(fs.stagger, reversed);
       const int64_t along = edge_seam_extent(mine, g.nx, g.ny, fs.stagger);
@@ -255,10 +261,10 @@ int launch_halo_unpack(const HaloGroupSpec &spec, const HaloGeometry &g,
                     "seam extents disagree; index map and staggering are inconsistent");
       const int8_t sign = seam_component_sign(fs.role, rot);
       int threads = 0;
-      const dim3 grid = strip_grid(v.nk, along, spec.halo_width, threads);
+      const dim3 grid = strip_grid(v.nk, along, halo_ring_count(spec), threads);
       unpack_edge_kernel<<<grid, threads, 0, static_cast<cudaStream_t>(stream)>>>(
-          v, recv + slot_base(g, spec.halo_width, n, mine), along, donor, v.nk, g.nx,
-          g.ny, spec.halo_width, mine, fs.stagger, reversed, sign);
+          v, recv + slot_base(g, halo_ring_count(spec), n, mine), along, donor, v.nk, g.nx,
+          g.ny, spec.ring_begin, spec.halo_width, mine, fs.stagger, reversed, sign);
     }
   }
   const cudaError_t rc = cudaGetLastError();

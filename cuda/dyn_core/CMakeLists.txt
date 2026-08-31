@@ -172,6 +172,11 @@ if(FV3_DYN_CORE_ENABLE_CUDA)
   # it needs FV3_GPU_ENABLE_CUDA, which is PRIVATE here. A .cu because
   # cudaMemsetAsync fills bytes and so cannot write huge_r; this needs a kernel.
   target_sources(fv3_dyn_core_gpu PRIVATE runtime/fv3_gpu_state_poison.cu)
+  # Prompt 6B: the per-substep heat_source accumulation of dyn_core.F90:853-861,
+  # which the port was missing. Same target and same reasoning as the two sources
+  # above -- fv3_gpu_dyn_core_step calls it directly, and it needs
+  # FV3_GPU_ENABLE_CUDA, which is PRIVATE here.
+  target_sources(fv3_dyn_core_gpu PRIVATE runtime/fv3_gpu_heat_accumulator.cu)
   set_target_properties(fv3_dyn_core_gpu PROPERTIES CUDA_STANDARD 17)
 
   # Milestone 3A.1: production NumericalDispatch (wires WP-A/WP-C/WP-D CUDA

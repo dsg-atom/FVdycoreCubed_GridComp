@@ -67,7 +67,7 @@ constexpr FieldSpec specs[] = {
 };
 #undef S
 uint64_t align_up(uint64_t value,uint32_t alignment) { return (value+alignment-1)&~uint64_t(alignment-1); }
-bool valid_group(fv3_gpu_halo_group g){return g>=FV3_GPU_H_DWIND_IN&&g<=FV3_GPU_H_DWIND_NEXT;}
+bool valid_group(fv3_gpu_halo_group g){return g>=FV3_GPU_H_DWIND_IN&&g<=FV3_GPU_H_GROUP_LAST;}
 }
 
 const FieldSpec *field_spec(FieldId id) noexcept { for(const auto &s:specs)if(s.id==id)return &s;return nullptr; }

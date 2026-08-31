@@ -126,6 +126,19 @@ struct HaloFieldSpec {
   StaggerShift stagger{};
   VectorRole role = VectorRole::scalar;
   FieldId partner = FieldId::invalid;
+  /* Bitmask over TileEdge of the edges this field is UNPACKED into; bit q is
+   * 1 << q for TileEdge q. 0xF (all four) for every ordinary halo group, where
+   * the four edge overlaps are disjoint halo cells and writing all of them is
+   * the whole point.
+   *
+   * It exists for E11, whose destinations are OWNED cells, not halo cells: the
+   * authoritative write-back (dyn_core.F90:1181-1188) touches u's NORTH line and
+   * v's EAST line and nothing else. Writing the matching SOUTH/WEST ring-0 lines
+   * as well would overwrite owned values the authoritative code never replaces.
+   * Applied on the unpack side only -- pack and transfer stay edge-complete,
+   * which costs a few unread slots and keeps the donor side free of any
+   * knowledge of what its consumers intend to keep. */
+  uint8_t dest_edges = 0xF;
 };
 
 /* Largest field count in any group below; sized for FV3_GPU_H_DSCALAR's four. */
@@ -133,11 +146,30 @@ inline constexpr int max_halo_group_fields = 4;
 
 struct HaloGroupSpec {
   uint32_t group = 0;                 /* fv3_gpu_halo_group */
-  int32_t halo_width = 0;             /* rings exchanged, in cells */
+  int32_t halo_width = 0;             /* OUTERMOST ring exchanged, in cells */
   int32_t field_count = 0;
+  /* INNERMOST ring exchanged. 1 for every ordinary halo group -- ring 1 is the
+   * first cell outside the owned block. 0 only for E11, whose "ring" IS the
+   * outermost owned staggered line (see halo_dest_index at h = 0). Rings
+   * ring_begin..halo_width are exchanged, so the count is halo_ring_count(). */
+  int32_t ring_begin = 1;
   HaloFieldSpec fields[max_halo_group_fields]{};
   bool live = false;                  /* false => nothing to exchange (see notes) */
 };
+
+/* Number of rings a group exchanges. Buffer slots are sized and addressed by
+ * this, never by halo_width directly, so a group whose innermost ring is 0
+ * still gets a correctly sized slot. */
+FV3_HALO_HD inline constexpr int32_t halo_ring_count(const HaloGroupSpec &s) noexcept {
+  return s.halo_width - s.ring_begin + 1;
+}
+
+/* 1-based ring ordinal of ring `h` within its group's slot, which is what
+ * slot_offset's `h` argument means. Identity for an ordinary group. */
+FV3_HALO_HD inline constexpr int32_t halo_ring_ordinal(const HaloGroupSpec &s,
+                                                       int32_t h) noexcept {
+  return h - s.ring_begin + 1;
+}
 
 /* ---------------------------------------------------------------------------
  * GROUP FIELD TABLES
@@ -257,6 +289,49 @@ FV3_HALO_HD inline constexpr HaloGroupSpec halo_group_spec(uint32_t g) noexcept 
       s.live = true;
       break;
 
+    /* E11 -- dyn_core.F90:1176-1189.
+     *
+     *   if( it==n_split .and. gridstruct%grid_type<4 .and. .not.gridstruct%nested)
+     *      call mpp_get_boundary(u, v, domain, ebuffery=ebuffer,
+     *                            nbufferx=nbuffer, gridtype=DGRID_NE)
+     *      u(is:ie, je+1, k) = nbuffer(i-is+1,k)
+     *      v(ie+1, js:je, k) = ebuffer(j-js+1,k)
+     *
+     * This is NOT a halo exchange and must not be described as one. For a
+     * staggered field the outermost owned line is shared with the neighbour and
+     * BOTH tiles compute it independently; the two results differ at round-off.
+     * FV3 replaces one copy with the other so the discrepancy cannot accumulate
+     * over substeps (":1177 Prevent accumulation of rounding errors at
+     * overlapped domain edges"). Destination cells are OWNED, not halo.
+     *
+     * The existing seam algebra represents it exactly at ring h = 0:
+     *   halo_dest_index(north, t, 0, nx, ny, stagger_north) == (t, ny+1)   == u(is:ie, je+1)
+     *   halo_dest_index(east,  t, 0, nx, ny, stagger_east)  == (nx+1, t)   == v(ie+1, js:je)
+     * with edge_seam_extent giving nx and ny respectively -- exactly the
+     * authoritative i and j ranges, and no corner cell in either. The donor side
+     * needs no special case either: an aligned seam reads the neighbour's own
+     * shared line (src.j = 1 / src.i = 1) and a rotated seam reads the partner
+     * component through the standard source_shift/seam_component_sign pair.
+     *
+     * VERIFIED, not inferred: tools/savepoints/probe_e11_map.py predicts every
+     * tile's post-E11 sp2c line from the donor tile's pre-E11 sp2b image using
+     * this map and reproduces the authoritative Fortran result with residual
+     * 0.000e+00 on all 6 tiles, both fields and all 10 levels, against a genuine
+     * change of 3.9e-14..3.9e-13. u/v only, and DGRID_NE only: uc/vc are never
+     * reconciled this way, so this group must not be reused for them.
+     *
+     * Field order matches i_pack(8): u first, hence slot_x, as in H_DWIND_IN. */
+    case FV3_GPU_H_DWIND_SEAM:
+      s.ring_begin = 0;
+      s.halo_width = 0;               /* the single ring h = 0 */
+      s.field_count = 2;
+      s.fields[0] = {FieldId::u, stagger_north, VectorRole::slot_x, FieldId::v,
+                     static_cast<uint8_t>(1u << static_cast<int>(TileEdge::north))};
+      s.fields[1] = {FieldId::v, stagger_east,  VectorRole::slot_y, FieldId::u,
+                     static_cast<uint8_t>(1u << static_cast<int>(TileEdge::east))};
+      s.live = true;
+      break;
+
     /* dyn_core.F90:1201/:419 exchange q, but the supported production first-run
      * path runs tracer advection OUTSIDE the acoustic loop, so no stage in this
      * runtime consumes a q halo. Declared NOT LIVE rather than given an empty
@@ -340,7 +415,8 @@ FV3_HALO_HD inline constexpr int64_t slot_base(const HaloGeometry &g, int32_t wi
 /* Elements one tile needs for ONE group's send (or recv) buffer. */
 FV3_HALO_HD inline constexpr int64_t group_buffer_elements(const HaloGroupSpec &s,
                                                            const HaloGeometry &g) noexcept {
-  return static_cast<int64_t>(s.field_count) * 4 * group_slot_elements(g, s.halo_width);
+  return static_cast<int64_t>(s.field_count) * 4 *
+         group_slot_elements(g, halo_ring_count(s));
 }
 
 /* Offset of one value inside a slot. `along_extent` is the extent of the frame

@@ -42,10 +42,13 @@ int launch_nh_pressure_cuda(const ExecutionContext &x, fv3_gpu_error *e) noexcep
   const fv_real grav = static_cast<fv_real>(cfg.grav);
   const fv_real dt = static_cast<fv_real>(x.dispatch_params->dt);
   const fv_real ptop = static_cast<fv_real>(cfg.ptop);
-  const fv_real akap = static_cast<fv_real>(cfg.akap);
+  /* Exner-only akap; see the host twin in wp_d_contract.cpp and
+   * NumericalConfig::akap_exner. Prompt 6B. */
+  const double akap_exner = cfg.akap_exner > 0.0 ? cfg.akap_exner : cfg.akap;
+  const fv_real akap = static_cast<fv_real>(akap_exner);
   // top_value = ptk = ptop**akap, dyn_core.F90:296 / :1623 (use_logp is
   // rejected by the guard above, so the peln1 branch cannot be taken here).
-  const fv_real ptk = static_cast<fv_real>(std::pow(cfg.ptop, cfg.akap));
+  const fv_real ptk = static_cast<fv_real>(std::pow(cfg.ptop, akap_exner));
   HorizontalBounds hb{b.is, b.ie, b.js, b.je, b.npz};
 
   fv3_gpu_status s = launch_geopotential_from_height_cuda(
@@ -217,6 +220,23 @@ int launch_post_loop_heating_cuda(const ExecutionContext &x, fv3_gpu_error *e) n
                    view2<const fv_real>(views.rarea)};
   s = launch_del2_zonal_flux_cuda(hb, halo_band, cfg.use_sg != 0, view3<fv_real>(views.heat_source), m, sg, fx_v, stream);
   if (s != FV3_GPU_SUCCESS) return fail(e, s, __func__, "del2 zonal flux CUDA launch failed");
+
+  /* Prompt 6B: del2_cubed rotates the corners TWICE per pass, once per flux
+   * direction -- copy_corners(q, ..., 1, ...) at dyn_core.F90:2419 before the fx
+   * loop and copy_corners(q, ..., 2, ...) at :2437 between the fx and fy loops.
+   * Only the first was issued here, so the fy differences at the four physical
+   * panel corners consumed the x-rotated halo instead of the y-rotated one.
+   * That was latent while the corner service was a fail-stub and nf_ke was
+   * pinned to 1 (nt == 0 skips both rotations).
+   *
+   * Numerical algorithm changed: NO -- restores dyn_core.F90:2437. */
+  if (nt > 0) {
+    CornerServiceRequest req_y = diffusion_corner_request(Axis::y, halo_band, pass,
+                                                          DiffusionPhase::y_corner_copy, 0);
+    rc = x.corner_service(x, req_y, e);
+    if (rc) return rc;
+  }
+
   s = launch_del2_meridional_flux_cuda(hb, halo_band, cfg.use_sg != 0, view3<fv_real>(views.heat_source), m, sg, fy_v, stream);
   if (s != FV3_GPU_SUCCESS) return fail(e, s, __func__, "del2 meridional flux CUDA launch failed");
   s = launch_del2_update_cuda(hb, halo_band, cd, view3<fv_real>(views.heat_source), view2<const fv_real>(views.rarea), fx_v, fy_v, stream);
@@ -235,7 +255,12 @@ int launch_post_loop_heating_cuda(const ExecutionContext &x, fv3_gpu_error *e) n
      * timestep, so this read was correct then and would have become wrong now. */
     const fv_real bdt = static_cast<fv_real>(x.dispatch_params->bdt);
     const fv_real delt_max = static_cast<fv_real>(cfg.delt_max);
-    const fv_real cv_air = static_cast<fv_real>(cfg.rdgas / cfg.akap);
+    /* Prompt 6B: `cv_air = cp_air - rdgas` (dyn_core.F90:323), cp_air =
+     * rdgas/akap. See the host twin in wp_d_contract.cpp for the full note --
+     * this read cp_air and named it cv_air, making every dtmp a factor
+     * 1/(1-akap) = 1.4 too small. Numerical algorithm changed: NO. */
+    const fv_real cv_air =
+        static_cast<fv_real>(cfg.rdgas / cfg.akap - cfg.rdgas);
     const fv_real rdg = static_cast<fv_real>(-cfg.rdgas / cfg.grav);
     const fv_real akap = static_cast<fv_real>(cfg.akap);
     const int64_t n_con = cfg.n_con;
@@ -259,6 +284,88 @@ int launch_post_loop_heating_cuda(const ExecutionContext &x, fv3_gpu_error *e) n
       if (s != FV3_GPU_SUCCESS) return fail(e, s, __func__, "diffusive heating (nh) CUDA launch failed");
     }
   }
+  return FV3_GPU_SUCCESS;
+}
+
+/* omega finalization -- dyn_core.F90:503-517 and :1205-1218.  See the block
+ * comment in wp_d_operators.hpp for the authoritative mapping and the host twin
+ * in wp_d_contract.cpp for the identical guards. */
+int launch_omega_pem_snapshot_cuda(const ExecutionContext &x,
+                                   fv3_gpu_error *e) noexcept {
+  int rc = validate_execution_context(x, e);
+  if (rc) return rc;
+  rc = omega_preconditions(x, e);
+  if (rc) return rc;
+  OmegaViews v; OperatorArena arena;
+  rc = bind_omega(x, v, arena, e);
+  if (rc) return rc;
+  void *stream = x.submission.stream;
+  const auto &b = x.immutable->bounds;
+  HorizontalBounds hb{b.is, b.ie, b.js, b.je, b.npz};
+  const uint64_t ni = static_cast<uint64_t>(b.ie-b.is+1)+2*b.halo_width;
+  const uint64_t nj = static_cast<uint64_t>(b.je-b.js+1)+2*b.halo_width;
+  const int64_t lo_i = b.is-static_cast<int64_t>(b.halo_width);
+  const int64_t lo_j = b.js-static_cast<int64_t>(b.halo_width);
+  View3<fv_real> pem{static_cast<fv_real*>(arena.arrays[10]), lo_i, lo_j, 0, 1,
+                     static_cast<int64_t>(ni), static_cast<int64_t>(ni*nj)};
+  fv3_gpu_status s = launch_pem_snapshot_cuda(
+      hb, static_cast<fv_real>(x.immutable->config.ptop),
+      view3_const(v.delp), pem, stream);
+  if (s != FV3_GPU_SUCCESS)
+    return fail(e, s, __func__, "omega pem snapshot CUDA launch failed");
+  return FV3_GPU_SUCCESS;
+}
+
+int launch_omega_finalize_cuda(const ExecutionContext &x,
+                               fv3_gpu_error *e) noexcept {
+  int rc = validate_execution_context(x, e);
+  if (rc) return rc;
+  rc = omega_preconditions(x, e);
+  if (rc) return rc;
+  if (x.dispatch_params->rdt == 0)
+    return fail(e, FV3_GPU_INVALID_ARGUMENT, __func__,
+                "rdt is required by the omega finalization");
+  OmegaViews v; OperatorArena arena;
+  rc = bind_omega(x, v, arena, e);
+  if (rc) return rc;
+  void *stream = x.submission.stream;
+  const auto &b = x.immutable->bounds;
+  HorizontalBounds hb{b.is, b.ie, b.js, b.je, b.npz};
+  const uint64_t ni = static_cast<uint64_t>(b.ie-b.is+1)+2*b.halo_width;
+  const uint64_t nj = static_cast<uint64_t>(b.je-b.js+1)+2*b.halo_width;
+  const int64_t lo_i = b.is-static_cast<int64_t>(b.halo_width);
+  const int64_t lo_j = b.js-static_cast<int64_t>(b.halo_width);
+  View3<fv_real> pem{static_cast<fv_real*>(arena.arrays[10]), lo_i, lo_j, 0, 1,
+                     static_cast<int64_t>(ni), static_cast<int64_t>(ni*nj)};
+  View3<fv_real> pb{static_cast<fv_real*>(arena.arrays[11]), lo_i, lo_j, 0, 1,
+                    static_cast<int64_t>(ni), static_cast<int64_t>(ni*nj)};
+  // dyn_core.F90:1208-1212
+  fv3_gpu_status s = launch_omega_from_pe_cuda(
+      hb, static_cast<fv_real>(x.dispatch_params->rdt), view3_const(v.pe), pem,
+      view3<fv_real>(v.omga), stream);
+  if (s != FV3_GPU_SUCCESS)
+    return fail(e, s, __func__, "omega (pe-pem)*rdt CUDA launch failed");
+  /* dyn_core.F90:1602 -- adv_pe calls a2b_ord2 once per level on pem(:,k+1,:).
+   * Reuses the existing order-2 A-to-B launcher; only edge_* is consulted by the
+   * order-2 path, so dxa/dya/agrid_lonlat are deliberately left unbound. */
+  A2BGeometry geom{{}, {}, view3<const fv_real>(v.grid_lonlat), {},
+                   view1<const accumulator_real>(v.edge_w),
+                   view1<const accumulator_real>(v.edge_e),
+                   view1<const accumulator_real>(v.edge_s),
+                   view1<const accumulator_real>(v.edge_n)};
+  s = launch_a2b_ord2_global_cuda(hb, physical_edges(*x.immutable->topology),
+                                 physical_corners(*x.immutable->topology),
+                                 b.npz, pem, pb, geom, false, stream);
+  if (s != FV3_GPU_SUCCESS)
+    return fail(e, s, __func__, "omega a2b_ord2 CUDA launch failed");
+  // dyn_core.F90:1583-1636
+  AdvPeMetrics m{view3<const fv_real>(v.grid_lonlat), view2<const fv_real>(v.dx),
+                 view2<const fv_real>(v.dy), view2<const fv_real>(v.rarea)};
+  s = launch_adv_pe_cuda(hb, view3<const fv_real>(v.ua),
+                         view3<const fv_real>(v.va), pb, m,
+                         view3<fv_real>(v.omga), stream);
+  if (s != FV3_GPU_SUCCESS)
+    return fail(e, s, __func__, "omega adv_pe CUDA launch failed");
   return FV3_GPU_SUCCESS;
 }
 

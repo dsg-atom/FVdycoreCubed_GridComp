@@ -29,13 +29,13 @@ struct ContextData {
    * H_CWIND/H_DIVGD) and the caller has no opportunity to re-declare from
    * outside. Staleness stays fully live -- what is delegated is only who is
    * allowed to clear it. */
-  std::array<uint8_t, FV3_GPU_H_DWIND_NEXT + 1> halo_caller_managed{};
+  std::array<uint8_t, FV3_GPU_H_GROUP_LAST + 1> halo_caller_managed{};
   /* Milestone 3A.10 §10/§27: provenance of each group's most recent readiness.
    * See HaloResolution in fv3_gpu_internal.hpp. Written only by the runtime's
    * resolve_halo() and by mark_halo_ready(); never by a numerical stage. Read by
    * the Gate C1 harness, which must be able to prove that no required group was
    * resolved by declaration rather than by exchange. */
-  std::array<HaloResolution, FV3_GPU_H_DWIND_NEXT + 1> halo_resolution{};
+  std::array<HaloResolution, FV3_GPU_H_GROUP_LAST + 1> halo_resolution{};
   void *compute_stream = nullptr;
   void *transfer_stream = nullptr;
   /* Milestone 3A.9. Cross-stream ordering handles (cudaEvent_t, held as void*
@@ -85,6 +85,19 @@ struct ContextData {
   int64_t halo_buffer_elements = 0;
   void *event_halo_pack = nullptr;
   void *event_halo_xfer = nullptr;
+  /* Prompt 6B. The dyn_core-level heat_source accumulator of
+   * dyn_core.F90:853-861. Device-resident, owned here, allocated lazily on the
+   * first dyn_core step that needs it (d_con > 1.0E-5) and reused for the whole
+   * context lifetime -- the same persistent-residency rule the halo buffers
+   * above follow, and for the same reason: a per-substep cudaMalloc would
+   * serialize the device inside the acoustic loop.
+   *
+   * It exists because the port uses the registered 3-D heat_source field as
+   * d_sw's per-level scratch, which d_sw re-zeroes every substep, so the array
+   * cannot also carry the running sum. See
+   * runtime/fv3_gpu_heat_accumulator.hpp for the full contract. */
+  fv_real *heat_accum = nullptr;
+  uint64_t heat_accum_bytes = 0;
   uint64_t next_event = 1;
   uint64_t last_event = 0;
   ContextPhase phase = ContextPhase::created;

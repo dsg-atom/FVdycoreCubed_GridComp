@@ -623,7 +623,7 @@ void t10_group_tables_and_the_slot_keyed_sign_rule() {
   // partner must be resolvable inside its OWN group -- the transfer step relies
   // on that, and a partner living elsewhere would silently read slot -1.
   int live_groups = 0;
-  for (uint32_t g = 1; g <= FV3_GPU_H_DWIND_NEXT; ++g) {
+  for (uint32_t g = 1; g <= FV3_GPU_H_GROUP_LAST; ++g) {
     const HaloGroupSpec s = halo_group_spec(g);
     check_eq(static_cast<int>(s.group), static_cast<int>(g), "T10 group id round-trips");
     if (!s.live) {
@@ -636,8 +636,53 @@ void t10_group_tables_and_the_slot_keyed_sign_rule() {
     // Under-exchanging is a silent wrong answer; the authoritative domain halo
     // is fv_mp_mod.F90:108's ng = 3. In particular H_PKC2's name says 2 and its
     // width must still be 3, or the misnomer becomes a bug.
-    check_eq(s.halo_width, fv3_domain_halo_width,
-             "T10 group exchanges the authoritative domain halo width");
+    //
+    // H_DWIND_SEAM is the one group that is NOT a halo exchange: it is E11
+    // (dyn_core.F90:1178), the reconciliation of the shared staggered seam LINE,
+    // which lives at ring 0 -- inside the owned block, not outside it. It
+    // therefore has ring_begin == 0 and halo_width == 0, i.e. exactly one ring,
+    // and asserting the domain halo width for it would be wrong. Every other
+    // group must still exchange ng = 3 rings starting at ring 1.
+    if (g == FV3_GPU_H_DWIND_SEAM) {
+      check_eq(s.ring_begin, 0, "T10 E11 reconciles ring 0, the shared owned line");
+      check_eq(s.halo_width, 0, "T10 E11 spans the single ring 0");
+      check_eq(halo_ring_count(s), 1, "T10 E11 is one ring wide");
+      // Its destinations are OWNED cells, so each field must decline three of
+      // the four edges: u writes only NORTH (u(is:ie,je+1)), v only EAST
+      // (v(ie+1,js:je)). A 0xF mask here would overwrite owned values on the
+      // south/west lines that the authoritative code never touches.
+      for (int n = 0; n < s.field_count; ++n) {
+        const FieldId id = s.fields[n].id;
+        const uint8_t want = (id == FieldId::u)
+            ? static_cast<uint8_t>(1u << static_cast<int>(TileEdge::north))
+            : static_cast<uint8_t>(1u << static_cast<int>(TileEdge::east));
+        check(id == FieldId::u || id == FieldId::v, "T10 E11 carries u and v only");
+        check_eq((int)s.fields[n].dest_edges, (int)want,
+                 "T10 E11 unpacks one edge per field, matching :1181-1188");
+        // And the ring-0 destination really is the authoritative line, extents
+        // included -- this is the whole reason E11 needs no new index algebra.
+        const int64_t nx = 12, ny = 12;
+        const TileEdge de = (id == FieldId::u) ? TileEdge::north : TileEdge::east;
+        const int64_t along = edge_seam_extent(de, nx, ny, s.fields[n].stagger);
+        check_eq((long long)along, (long long)((id == FieldId::u) ? nx : ny),
+                 "T10 E11's along-extent is exactly is:ie (u) or js:je (v)");
+        for (int64_t t = 1; t <= along; ++t) {
+          int64_t i = 0, j = 0;
+          halo_dest_index(de, t, 0, nx, ny, s.fields[n].stagger, i, j);
+          if (id == FieldId::u)
+            check(i == t && j == ny + 1, "T10 E11 writes exactly u(is:ie,je+1,:)");
+          else
+            check(i == nx + 1 && j == t, "T10 E11 writes exactly v(ie+1,js:je,:)");
+        }
+      }
+    } else {
+      check_eq(s.ring_begin, 1, "T10 a halo group starts at the first ring outside the owned block");
+      check_eq(s.halo_width, fv3_domain_halo_width,
+               "T10 group exchanges the authoritative domain halo width");
+      for (int n = 0; n < s.field_count; ++n)
+        check_eq((int)s.fields[n].dest_edges, 0xF,
+                 "T10 an ordinary halo group unpacks all four edges");
+    }
     for (int n = 0; n < s.field_count; ++n) {
       const HaloFieldSpec &f = s.fields[n];
       check(f.id != FieldId::invalid, "T10 field id is set");
@@ -664,10 +709,11 @@ void t10_group_tables_and_the_slot_keyed_sign_rule() {
             "T10 the transposed source shift is exactly the partner's own stagger");
     }
   }
-  // Eleven enum members (H_DWIND_IN .. H_DWIND_NEXT); ten are live. The one
-  // that is not is H_Q_INLINE. H_DWIND_NEXT is a real group AND doubles as the
-  // array-sizing sentinel, which is why the count is ten and not nine.
-  check_eq(live_groups, 10, "T10 ten of the eleven enum groups are live (q is not)");
+  // Twelve enum members (H_DWIND_IN .. H_DWIND_SEAM); eleven are live. The one
+  // that is not is H_Q_INLINE. H_DWIND_SEAM is a real group AND doubles as the
+  // array-sizing sentinel (FV3_GPU_H_GROUP_LAST), which is why the count is
+  // eleven and not ten.
+  check_eq(live_groups, 11, "T10 eleven of the twelve enum groups are live (q is not)");
   check(!halo_group_spec(FV3_GPU_H_Q_INLINE).live,
         "T10 H_Q_INLINE is not live: no stage in the supported path reads a q halo");
 
@@ -698,16 +744,16 @@ void t10_group_tables_and_the_slot_keyed_sign_rule() {
   }
 
   // (f) Buffer slots must not overlap: 4 edges x field_count, each of one slot.
-  for (uint32_t g = 1; g <= FV3_GPU_H_DWIND_NEXT; ++g) {
+  for (uint32_t g = 1; g <= FV3_GPU_H_GROUP_LAST; ++g) {
     const HaloGroupSpec s = halo_group_spec(g);
     if (!s.live) continue;
     const HaloGeometry geom{12, 12, 5};
-    const int64_t slot = group_slot_elements(geom, s.halo_width);
+    const int64_t slot = group_slot_elements(geom, halo_ring_count(s));
     check(slot > 0, "T10 slot is non-empty");
     int64_t expect = 0;
     for (int n = 0; n < s.field_count; ++n) {
       for (int q = 0; q < 4; ++q) {
-        check_eq((long long)slot_base(geom, s.halo_width, n, (TileEdge)q),
+        check_eq((long long)slot_base(geom, halo_ring_count(s), n, (TileEdge)q),
                  (long long)expect, "T10 slots tile the buffer without overlap");
         expect += slot;
       }
@@ -719,7 +765,7 @@ void t10_group_tables_and_the_slot_keyed_sign_rule() {
       for (int q = 0; q < 4; ++q) {
         const int64_t along =
             edge_seam_extent((TileEdge)q, geom.nx, geom.ny, s.fields[n].stagger);
-        check(slot_offset(along, geom.npz + 1, s.halo_width, along, geom.npz) < slot,
+        check(slot_offset(along, geom.npz + 1, halo_ring_count(s), along, geom.npz) < slot,
               "T10 the last element of a strip lies inside its slot");
       }
     }

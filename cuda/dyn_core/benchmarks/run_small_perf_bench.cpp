@@ -35,6 +35,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <string>
@@ -49,6 +51,192 @@ static int64_t NI = 8;      // runtime-configurable for the perf benchmark (3A.1
 static int64_t NJ = 8;      // runtime-configurable for the perf benchmark (3A.11)
 static int64_t NPZ = 10;    // runtime-configurable for the perf benchmark (3A.11)
 static constexpr uint32_t HALO = 3;
+
+// Milestone 6A.5: when set (via --grid-metrics <dir>), setup() overwrites the
+// fabricated uniform grid metrics fv3_cube_geometry.hpp/make_host_state()
+// seed with the authoritative non-uniform c8 spherical cubed-sphere metrics
+// exported from the real Fortran gridstruct (tools/grid_metrics/
+// convert_fortran_grid_metrics.py). Empty string (default) preserves the
+// existing fabricated-metric benchmark path unchanged.
+static std::string g_grid_metrics_dir;
+
+// Milestone 6A.5 Section 10: when set (via --sp0-state <dir>), setup()
+// overwrites HostState's dynamical-state seed (u,v,w,delp,pt,delz,q_con,pe,
+// peln,pk) and da_min/da_min_c with the authoritative Fortran Prompt 6A SP0
+// savepoint (converted by tools/savepoints/convert_sp0_to_cuda.py). Empty
+// string (default) leaves the existing IC path unchanged.
+static std::string g_sp0_state_dir;
+
+// Milestone 6A.5 Section 10: when set (via --sp0-verify-only), main() loads
+// SP0 state into all 6 tiles, performs H2D, immediately reads the state back
+// (D2H, no kernel launch), and exits -- it never calls fv3_gpu_dyn_core_step.
+static bool g_sp0_verify_only = false;
+// Directory to dump the post-H2D/D2H readback into, one subdir per tile, for
+// offline comparison against the Fortran SP0 savepoint by
+// tools/savepoints/compare_sp0_identity.py. Required when
+// g_sp0_verify_only is set.
+static std::string g_sp0_dump_dir;
+
+// Prompt 6B: the acoustic-loop timestep (dyn_core's own `bdt` dummy; Fortran
+// divides it internally as dt = bdt/n_split, dyn_core.F90:317). The default
+// (10.0) is an arbitrary benchmark-only value with no tie to any production
+// config; the authoritative Prompt 6A savepoint run used bdt=3600.0
+// (RUN_DT=3600 / HEARTBEAT_DT, k_split=1, from
+// experiments/c8_L10_savepoint_6a_run1/fv3.j + input.nml). Getting this wrong
+// would desync every dt-scaled quantity (Courant numbers, Riemann solver,
+// damping) from the authoritative run for reasons having nothing to do with
+// CUDA kernel fidelity, so validation-mode runs MUST pass --bdt 3600. Default
+// unchanged so the synthetic/performance path is unaffected.
+static double g_bdt = 10.0;
+
+// Prompt 6B (Riem_Solver_c reconciliation): the AUTHORITATIVE dry-air gas
+// constant. nh_utils.F90:53 takes `rdgas` from FMS `constants_mod`, and the
+// Baselibs FMS the GEOSfvdycore_fortran_perf fixture links
+// (ESMA-Baselibs-8.32.0, FMS_DIR in the fixture's build/CMakeCache.txt) is
+// configured with -DCONSTANTS=GEOS (ESMA-Baselibs-8.32.0/src/GNUmakefile:1003),
+// which selects constants/geos_constants.fh:44:
+//     RDGAS = 8314.47 / 28.965      ! == 287.0523045054...
+// (the same MAPL_RUNIV/MAPL_AIRMW pair as MAPL_RDRY; the GFDL variant's 287.04
+// and the GFS variant's 287.05 are NOT what this fixture compiled).
+//
+// This harness previously used a round 287.0 both to derive its synthetic
+// balanced column and as cfg.rdgas. That is a -1.822125e-4 relative error, and
+// because SIM1_solver's pressure closure is p = -dm/dz*rgas*pt, too small an
+// rgas forces too small a |dz| by the same relative amount: it biased every
+// Riem_Solver_c layer thickness by -1.82e-4 and was the sole remaining cause of
+// the SP1 gz/pkc divergence. Written as the quotient rather than a rounded
+// decimal so it reproduces the Fortran parameter expression exactly.
+static const double kFv3Rdgas = 8314.47 / 28.965;
+
+// Prompt 6B (SP1 rerun): when set (via --sp1-boundary <dir>), setup()
+// overwrites h.ptop and h.phis/h.zs with values recovered from the
+// authoritative Fortran SP1 savepoint (ptop = pkc(:,:,1), phis = gz(:,:,km+1)
+// RAW, zs = phis/grav; tools/savepoints/convert_sp1_boundary_to_cuda.py).
+// Neither is exported by the SP0 loader or grid_metrics_6a5 (both explicitly
+// exclude them -- see docs/agent_handoff/prompt_6b_cuda_fortran_validation.md
+// Sec 7). Empty string (default) leaves h.ptop=1000.0 and h.phis/h.zs=0
+// (make_host_state()'s synthetic-benchmark seed) completely unaffected.
+static std::string g_sp1_boundary_dir;
+
+// Prompt 6B Task H (SP2 it=1): the AUTHORITATIVE n_sponge for the
+// GEOSfvdycore_fortran_perf c8/npz=10 validation fixture is -1, i.e. the
+// sponge branch is DISABLED. Proven two independent ways:
+//   1. the fixture's own namelist, experiments/c8_L10_savepoint_6a_run1/
+//      scratch_.../input.nml &fv_core_nml: n_sponge = -1;
+//   2. the authoritative captured runtime damping table,
+//      savepoints/sp2_it1_pe0_damping.txt, which records
+//      nord_k=nord_w=nord_t=nord_v=2, damp_vt=damp_w=damp_t=0.01,
+//      d_con_k=1.0, d2_divg=0 at EVERY k=1..10 -- exactly what
+//      dyn_core.F90:736's `if (npz>1 .and. n_sponge>0)` produces when it does
+//      NOT fire.
+// fv3_damping_translation.cpp's geos_production_flags() hardcodes n_sponge = 9
+// (FV_StateMod.F90:694), which is correct for the GEOS production namelist it
+// models but wrong for this fixture; with 9 the sponge arms corrupt 9 of the
+// 10 levels (k=0: nord_k/nord_v/nord_w->0, d2_divg 0.2, damp_vt 0.1, d_con 0;
+// k=1..7: d2_divg 0.1, damp_vt 0.05; k=8: d2_divg 0.02) and only k=9 matches.
+//
+// The override is a flag rather than a change to geos_production_flags()
+// because that function IS the documented GEOS-production translation and is
+// what the performance/stability baseline (milestone 3A.11T/U/V) was measured
+// against. The sentinel below keeps the default path bit-identical.
+static const int kDampNSpongeUnset = std::numeric_limits<int>::min();
+static int g_damp_n_sponge = kDampNSpongeUnset;
+
+// Prompt 6B Task J (sp2a it=1): the AUTHORITATIVE akap for this fixture is NOT
+// 2/7. It is 0.28571426868438721, which is the SINGLE-PRECISION evaluation of
+// R/(3.5*R) -- exactly one float32 ULP BELOW float32(2/7), i.e. 5.96e-08
+// (= 2^-24) relative below the double 2/7 this harness used.
+//
+// Provenance, traced to the declaration rather than fitted:
+//   MAPL PhysicalConstants.F90:49-56 declares, all as DEFAULT REAL (single):
+//       MAPL_AIRMW = 28.965 ; MAPL_RUNIV = 8314.47
+//       MAPL_RDRY  = MAPL_RUNIV/MAPL_AIRMW
+//       MAPL_CPDRY = 3.5*MAPL_RDRY
+//       MAPL_KAPPA = MAPL_RDRY/MAPL_CPDRY
+//     so the whole chain rounds in float32 three times and lands one ULP low.
+//   FV_StateMod.F90:491   kappa = MAPL_KAPPA        (widens to REAL8, value kept)
+//   FV_StateMod.F90:1833  call fv_dynamics(..., kappa, ...)
+//   fv_dynamics.F90:175   real, intent(IN) :: kappa
+//   fv_dynamics.F90:419   akap = kappa
+//   fv_dynamics.F90:645   call dyn_core(..., akap, ...)
+//   dyn_core.F90:316      ptk  = ptop ** akap
+//   dyn_core.F90:337      k1k  = akap / (1.-akap)
+// and dyn_core passes akap on to Riem_Solver3 -> SIM1_solver.
+//
+// FMS constants_mod is NOT the source, and that matters because
+// geos_constants.fh:50 spells KAPPA with the identical RDGAS/(3.5*RDGAS)
+// expression: if FMS were the source, RDGAS would also be single, and
+// Riem_Solver_c's dz (which is directly proportional to rgas) would then carry
+// a ~9e-09 relative error. The validated SP1 it=1 gz/pkc agreement at
+// <=6.3e-16 rules that out, so FMS is built with default real = 8 bytes and its
+// KAPPA is the double 2/7. Only the MAPL chain is single.
+//
+// Measured decisively off the authoritative dump: Riem_Solver3 writes
+// pk3(i,j,1) = ptk = ptop**akap with no other dependence (nh_core.F90:122), and
+// sp2a_it1_pe0_pk3 has pk3(k=1) = 3.7275934279762497 uniformly over the owned
+// box with ptop = 100, which inverts to akap = 0.28571426868438721. The double
+// 2/7 gives 3.7275937203149399 and float32(2/7) gives 3.7275939395689739 --
+// neither matches; the single-precision MAPL value reproduces it.
+//
+// Flag rather than an unconditional constant: 2/7 is the self-consistent value
+// for the synthetic/performance path (h.akap also derives that path's pk/pkz/
+// cappa seed), and the sentinel keeps that path bit-identical.
+static const double kAkapUnset = -1.0;
+static double g_akap = kAkapUnset;
+
+// Prompt 6B Task J, second half: the authoritative Fortran uses TWO DIFFERENT
+// kappas inside a single Riem_Solver3 call, and CUDA conflates them.
+//
+//   * the scalar `akap` (MAPL single, above) is used for the Exner variable:
+//       nh_core.F90:102  ptk = exp(akap*peln1)
+//       nh_core.F90:138  pk3(i,j,k) = exp(akap*peln2(i,k))
+//   * the `cappa(i,j,k)` ARRAY drives the SIM1 thermodynamic closure, because
+//     the fixture compiles both MOIST_CAPPA and USE_COND
+//     (@fvdycore/CMakeLists.txt:88-89):
+//       nh_core.F90:114  cp2(i,k) = cappa(i,j,k)        [#ifdef MOIST_CAPPA]
+//       nh_core.F90:148  gm2(i,k) = 1./(1.-cp2(i,k))    [USE_COND+MOIST_CAPPA]
+//       nh_core.F90:170  call SIM1_solver(..., gama, gm2, cp2, akap, ...)
+//     and SIM1_solver uses gm2/cp2 in place of gama/kappa throughout.
+//     cappa itself is built at fv_dynamics.F90:454 as
+//       cappa = rdgas/(rdgas + cvm/(1.+dp1))
+//     from FMS DOUBLE constants; dry (q_con == 0 on all 6 tiles here) gives
+//     cvm = cv_air = 2.5*rdgas, hence cappa = 1/3.5 = 2/7 in double.
+//
+// So the authoritative pair for this fixture is akap = 0.28571426868438721
+// (single) for pk3/ptk and cappa = 2/7 (double) for the closure. CUDA derives
+// both from the single cfg.akap: fv3_vertical_kernels.cu:522-523 passes
+// `1/(1-cfg.akap)` as gama and `cfg.akap` as kappa. That conflation is exactly
+// what the measurement showed -- with cfg.akap = 2/7 the closure outputs
+// (zh, delz, w, pkc) agreed to <=1.2e-15 while pk3 was off by 1.96e-07; with
+// cfg.akap = the single value pk3 fell to 5.4e-11 and the closure outputs rose
+// to ~1.3e-07, i.e. the error simply moved between the two roles.
+//
+// This retires the standing assumption that MOIST_CAPPA/USE_COND are
+// round-off-neutral here. That argument was "cappa == akap == 2/7, so
+// gm2 == gama"; cappa IS 2/7, but akap is NOT, so enabling the pair is what
+// SEPARATES the two roles rather than what perturbs them.
+//
+// RETRACTED APPROACH, recorded so it is not retried: the first attempt at this
+// enabled cfg.moist_cappa + cfg.use_cond and set the cappa array to 2/7, on the
+// reasoning that CUDA already implements both branches. It cannot run --
+// fv3_gpu_dyn_core_step rejects the configuration outright ("use_cond /
+// moist_cappa are not implemented in this subset"), cfg-wide, before any state
+// is mutated, and lifting that guard would switch on an unimplemented
+// configuration across operators far outside this window.
+//
+// The viable separation is narrower and does not touch the moist branch at all.
+// With cappa uniform and q_con == 0, Fortran's moist branch is algebraically
+// identical to the dry branch evaluated at kappa == cappa == 2/7 (gm2 == gama,
+// cp2 == kappa; only t1g's multiply order differs, at ~1e-16), which is exactly
+// what CUDA's dry branch already computes with cfg.akap = 2/7. So the CLOSURE
+// role is already authoritative by default; only the EXNER role needs the other
+// constant. Hence akap_exner: a second scalar consumed only by ptk/pk3
+// (riem3_precompute_column) and pk3_halo, leaving cfg.akap as the closure kappa
+// everywhere -- including Riem_Solver_c, whose gama/cp2 at SP1 it=1 are
+// validated at <=6.3e-16 with 2/7 and would REGRESS under a global akap
+// override. Flag-gated; 0 means "not supplied" and is bit-identical to before.
+static const double kAkapExnerUnset = -1.0;
+static double g_akap_exner = kAkapExnerUnset;
 
 // Milestone 3A.11T: pe/peln are registered (i, k, j), NOT (i, j, k).
 //
@@ -259,6 +447,16 @@ struct HostState {
   std::vector<fv_real> omga, f_c, cos_sg, dp_ref, ws3, phis;
 
   fv_real ptop, akap, grav;
+
+  // Milestone 6A.5 Section 10: when set (sp0_state_6a5::load(), gated by
+  // --sp0-state), the authoritative Fortran GLOBAL da_min/da_min_c
+  // (fv_grid_utils.F90 global_mx/global_mx_c over all 6 tiles, identical by
+  // construction) override production_config()'s per-tile-local derivation.
+  // Negative is the "not set" sentinel -- production_config()'s existing
+  // per-tile-local min(area)/min(area_c) derivation is unchanged when unset,
+  // so the synthetic/performance path is unaffected.
+  fv_real override_da_min = -1;
+  fv_real override_da_min_c = -1;
 
   /* Milestone 3A.11T diagnostic switch.  When set (FV3_BENCH_ORTHO_METRIC=1)
    * the grid metric collapses to the exactly orthogonal case
@@ -745,9 +943,18 @@ HostState make_host_state(int tile) {
     }
   }
   h.akap = fv_real(2.0 / 7.0);
+  // See kAkapUnset above. Applied here, before the balanced-column derivation,
+  // so pk/pkz/cappa stay self-consistent with whichever akap is in force.
+  if (g_akap > 0.0) {
+    h.akap = (fv_real)g_akap;
+    if (tile == 1) {
+      std::fprintf(stderr, "[6B] akap override: 2/7=%.17g -> %.17g\n",
+                   2.0 / 7.0, (double)h.akap);
+    }
+  }
   // Must equal cfg.rdgas below: the balanced column is derived with it, and the
   // solver evaluates the same invariant with cfg's value.
-  const double kRdgas = 287.0;
+  const double kRdgas = kFv3Rdgas;
 
   // Interface pressures, and the layer thicknesses they imply. delp is NOT
   // uniform any more -- every consumer below reads delp_col[k].
@@ -1162,11 +1369,29 @@ HostState make_host_state(int tile) {
       // patches of a fictional plane.
       const cube::LonLat gll = cg.corner(fv(i), fv(j));
       const cube::LonLat all_ = cg.center(fv(i), fv(j));
-      const size_t idx_ll = idx * 2;
-      h.grid_lonlat[idx_ll + 0] = (fv_real)gll.lon;
-      h.grid_lonlat[idx_ll + 1] = (fv_real)gll.lat;
-      h.agrid_lonlat[idx_ll + 0] = (fv_real)all_.lon;
-      h.agrid_lonlat[idx_ll + 1] = (fv_real)all_.lat;
+      /* Prompt 6B: LAYOUT FIX. These two arrays were filled INTERLEAVED
+       * (`idx*2 + component`), but they are registered with
+       *   st_ll = {1, ni_h, ni_h*nj_h}
+       * i.e. component-SLOWEST, two contiguous (i,j) planes -- which is the
+       * correct translation of Fortran's grid(isd:ied+1, jsd:jed+1, 2).
+       * The consumer (a2b_great_circle -> View3 component index lo_k / lo_k+1)
+       * therefore read lon/lat of the wrong cells, mixed together.
+       *
+       * Only the a2b_ord4 CORNER extrapolation reads these -- the interior,
+       * edge, qx/qy/qxx/qyy paths use dxa/dya -- which is exactly why the
+       * damage was confined to the four physical panel corners of the B-grid
+       * output while every interior cell agreed at round-off.
+       * Measured: at sp2b/it=1 the implied extrapolation ratio d1/(d2-d1) came
+       * out as [0.093, -68.5, 1213.3] on tile 5 and [0.050, -2.68, 1.72] on
+       * tile 1, against the authoritative 0.4212796036 (identical for all three
+       * stencil terms on all six tiles, which the harness cube::CubeGrid
+       * reproduces exactly -- so the geometry SOURCE was always right and only
+       * the store order was wrong).
+       * Numerical algorithm changed: NO. */
+      h.grid_lonlat[idx] = (fv_real)gll.lon;
+      h.grid_lonlat[idx + h.size_2d] = (fv_real)gll.lat;
+      h.agrid_lonlat[idx] = (fv_real)all_.lon;
+      h.agrid_lonlat[idx + h.size_2d] = (fv_real)all_.lat;
     }
   }
   // edge_w/e/s/n are the cubed-sphere edge-interpolation weights consumed by the
@@ -1386,6 +1611,18 @@ HostState make_host_state(int tile) {
     dmp::DampingFlags dflags =
         dmp::geos_production_flags((int)NPZ, (double)h.ptop,
                                    /*high_resolution=*/false);
+    /* Prompt 6B Task H: authoritative n_sponge override (see
+     * g_damp_n_sponge's declaration for the two-way proof that this fixture
+     * runs n_sponge = -1). Sentinel-guarded: unset leaves
+     * geos_production_flags()'s value untouched. */
+    if (g_damp_n_sponge != kDampNSpongeUnset) {
+      std::fprintf(stderr,
+                   "[6B-H] n_sponge override: %d -> %d (authoritative fixture "
+                   "namelist value; sponge branch %s)\n",
+                   dflags.n_sponge, g_damp_n_sponge,
+                   g_damp_n_sponge > 0 ? "ACTIVE" : "DISABLED");
+      dflags.n_sponge = g_damp_n_sponge;
+    }
     /* pm2_col is the layer-mean pressure of the column this harness built, i.e.
      * FV3's pfull(1:npz). Read only by the d4dmp() sine profile, which is
      * inactive at d4_bg_top == d4_bg_bot; passed anyway so the profile is
@@ -1744,7 +1981,7 @@ NumericalConfig production_config(const HostState &h) {
   cfg.a_imp = 1.0;
   cfg.p_fac = 0.05;
   cfg.scale_m = 1.0;
-  cfg.rdgas = 287.0;
+  cfg.rdgas = kFv3Rdgas;  // authoritative FMS/GEOS value; see kFv3Rdgas
   cfg.grav = h.grav;
   cfg.beta = 0.0;
   cfg.use_logp = 0;
@@ -1769,20 +2006,63 @@ NumericalConfig production_config(const HostState &h) {
   // column solve then divides by dz -- a silent Inf/NaN, produced by a
   // perfectly valid-looking configuration. 2 m is the GEOS namelist value.
   cfg.dz_min = 2.0;
-  // Milestone 3A.2: enable post_loop_heating's genuine (non-early-return)
-  // execution path. nf_ke must be exactly 1 because fv3_gpu_dyn_core_step
-  // sets dispatch_params.diffusion_passes = config.nf_ke and runs that many
-  // del2_cubed passes (fv3_gpu_runtime.cpp:620-623) --
-  // launch_post_loop_heating_cuda requires diffusion_passes==nf_ke. With
-  // nf_ke=1, passes=1 and nt=passes-1=0, so the corner_service
-  // call inside post_loop_heating (only reached when nt>0) is skipped,
-  // avoiding this milestone's unimplemented corner_edge_service stub.
-  cfg.n_con = 1;
+  /* Prompt 6B: n_con is DERIVED, per dyn_core.F90:402-412, not chosen.
+   *
+   *     if ( flagstruct%convert_ke .or. flagstruct%vtdm4 > 1.E-4 ) then
+   *          n_con = npz
+   *     else if ( d2_bg_k1 < 1.E-3 ) then ; n_con = 0
+   *     else if ( d2_bg_k2 < 1.E-3 ) then ; n_con = 1
+   *     else                              ; n_con = 2
+   *
+   * The value was previously hardcoded to 1 with a comment that justified
+   * nf_ke == 1 (the corner_edge_service stub) and then set n_con, not nf_ke --
+   * two independent controls conflated. n_con selects how many LEVELS of the
+   * post-loop diffusive-heating pt update run (dyn_core.F90:1338 `do k=1,n_con`);
+   * nf_ke selects how many del2_cubed smoothing passes heat_source receives
+   * first (:1310-1311). Only nf_ke interacts with corner_edge_service.
+   *
+   * The fixture's namelist sets vtdm4 = 0.01 and geos_production_flags()
+   * independently sets the same 0.01 from FV_StateMod.F90:744, so the first
+   * branch fires on both sides and the authoritative value is npz. convert_ke
+   * is irrelevant here (fv_arrays.F90:447 default .false., not overridden) but
+   * is honoured below if the translation ever carries it.
+   *
+   * Effect at the dyn_core exit: with n_con = 1 only k=1's pt was heated, while
+   * the authoritative run heats all npz levels -- the measured exit `pt`
+   * signature (nonzero at all 640 owned cells, per-level max decaying
+   * 4.74e-05 -> 4.88e-07) and the `pkz` signature (agreeing at k=1, diverging
+   * by O(1) for k=2..npz, because :1348 rewrites pkz at every heated level).
+   *
+   * Numerical algorithm changed: NO -- the authoritative loop bound is now used.
+   */
+  cfg.n_con = (h.tr_flags.vtdm4 > 1.0e-4)
+                  ? (int32_t)NPZ
+                  : (h.tr_flags.d2_bg_k1 < 1.0e-3
+                         ? 0
+                         : (h.tr_flags.d2_bg_k2 < 1.0e-3 ? 1 : 2));
   // 3A.11V Task 2: from the translation. FV_StateMod.F90:742 sets d_con = 1.0,
   // so the value is unchanged -- but it is now sourced rather than asserted.
   cfg.d_con = h.tr_d_con;
-  cfg.nf_ke = 1;
+  /* nf_ke is DERIVED from nord, per dyn_core.F90:1310
+   *     nf_ke = min(3, flagstruct%nord+1)
+   * (del2_cubed then applies its own `ntimes = min(3,nmax)` at :2400, so the
+   * cap is expressed twice authoritatively). It is assigned AFTER the
+   * damp_selection block below, because that block may still override cfg.nord.
+   *
+   * It was pinned to 1 while corner_edge_service was a fail-stub: passes with
+   * nt = ntimes-1-pass > 0 call copy_corners, which had no implementation. That
+   * stub is gone (fv3_gpu_production_dispatch.cu), so the authoritative value
+   * is now reachable. */
   cfg.moist_cappa = 0;
+  // See kAkapExnerUnset: the Exner-only kappa, separated from the closure kappa
+  // (cfg.akap) exactly as the authoritative MOIST_CAPPA build separates them.
+  if (g_akap_exner > 0.0) {
+    cfg.akap_exner = g_akap_exner;
+    std::fprintf(stderr,
+                 "[6B] akap_exner (ptk/pk3/pk3_halo) = %.17g; closure akap "
+                 "stays %.17g\n",
+                 g_akap_exner, (double)cfg.akap);
+  }
   cfg.use_sg = 0;
   // Milestone 3A.8: the production first-run d_sw configuration
   // (project_architecture.md). launch_d_sw_cuda rejects anything else before
@@ -1837,6 +2117,22 @@ NumericalConfig production_config(const HostState &h) {
     cfg.da_min_c = (rcmax > 0) ? (fv_real)(1.0 / rcmax) : amin;
     std::fprintf(stderr, "[BENCH] da_min=%.6e da_min_c=%.6e (derived)\n",
                  (double)cfg.da_min, (double)cfg.da_min_c);
+    // Milestone 6A.5 Section 10: da_min/da_min_c are GLOBAL (all-6-tile)
+    // Fortran reductions (fv_grid_utils.F90:809-812's global_mx/global_mx_c),
+    // not per-tile-local minima -- see milestone_6a5_authoritative_grid_
+    // metrics.md Sec 7. In authoritative validation mode (h.override_da_min
+    // set by sp0_state_6a5::load()), use the exported Fortran global value
+    // instead of the derivation above. The synthetic/performance path (no
+    // --sp0-state) is unchanged: override_da_min defaults to -1 and this
+    // branch is not taken.
+    if (h.override_da_min >= 0) {
+      cfg.da_min = h.override_da_min;
+      cfg.da_min_c = h.override_da_min_c;
+      std::fprintf(stderr,
+                   "[BENCH] da_min=%.6e da_min_c=%.6e (AUTHORITATIVE Fortran "
+                   "global override, Milestone 6A.5 Sec 10)\n",
+                   (double)cfg.da_min, (double)cfg.da_min_c);
+    }
   }
   cfg.inline_q = 0;
   cfg.rot3 = 0;
@@ -1868,6 +2164,11 @@ NumericalConfig production_config(const HostState &h) {
     // cfg.nord caps nord_cap_k, so branch H is only reachable when it is >= 1.
     if (d.force_nord >= 0) cfg.nord = d.force_nord;
   }
+
+  /* dyn_core.F90:1310 -- nf_ke = min(3, nord+1). Derived, never hardcoded, and
+   * placed here so every override of cfg.nord above is respected: nord=2
+   * (production) gives 3, nord=0 (--damp none / nodivdamp / nord0) gives 1. */
+  cfg.nf_ke = (int32_t)std::min(3, cfg.nord + 1);
 
   /* --- Milestone 3A.11V Task 3: the permanent stability table ---------------
    *
@@ -2091,6 +2392,384 @@ double checksum(const HostState &h) {
 
 int32_t rank_of_tile_table[kTiles] = {0, 1, 2, 3, 4, 5};
 
+// Milestone 6A.5: overwrite HostState's fabricated static grid metrics with
+// the authoritative ones exported from the real Fortran gridstruct (see
+// tools/grid_metrics/convert_fortran_grid_metrics.py). Called between
+// make_host_state(tile) and make_fields(*h) in setup(), so this is the only
+// place metric ingestion happens -- no device/kernel code changes, and the
+// H2D transfer in fv3_gpu_initialize_state carries whatever h holds at that
+// point regardless of where it came from.
+//
+// Validation-only: g_grid_metrics_dir is empty unless --grid-metrics was
+// passed on the CLI, in which case the existing fabricated-metric benchmark
+// path is completely unaffected.
+namespace grid_metrics_6a5 {
+
+// CUDA HostState field name -> vector pointer, single-component metrics.
+// Must match tools/grid_metrics/convert_fortran_grid_metrics.py's
+// SINGLE_FIELDS mapping exactly (name-for-name; the Fortran source-field
+// name is recorded there, not needed here).
+std::vector<std::pair<const char *, std::vector<fv_real> *>>
+single_field_table(HostState &h) {
+  return {
+      {"dx", &h.dx}, {"dy", &h.dy}, {"dxa", &h.dxa}, {"dya", &h.dya},
+      {"rdx", &h.rdx}, {"rdy", &h.rdy}, {"rdxa", &h.rdxa}, {"rdya", &h.rdya},
+      {"dxc", &h.dxc}, {"dyc", &h.dyc}, {"rdxc", &h.rdxc}, {"rdyc", &h.rdyc},
+      {"area", &h.area}, {"rarea", &h.rarea}, {"rarea_c", &h.rarea_c},
+      {"f0", &h.f0}, {"f_c", &h.f_c},
+      {"cosa_u", &h.cosa_u}, {"sina_u", &h.sina_u}, {"rsin_u", &h.rsin_u},
+      {"cosa_v", &h.cosa_v}, {"sina_v", &h.sina_v}, {"rsin_v", &h.rsin_v},
+      {"cosa_s", &h.cosa_s}, {"rsin2", &h.rsin2},
+      {"cosa", &h.cosa}, {"rsina", &h.rsina},
+      {"divg_u", &h.divg_u}, {"del6_u", &h.del6_u},
+      {"divg_v", &h.divg_v}, {"del6_v", &h.del6_v},
+  };
+}
+
+bool read_doubles(const std::string &path, size_t n, std::vector<double> *out) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) {
+    printf("  FAIL: grid-metrics: cannot open %s\n", path.c_str());
+    return false;
+  }
+  out->assign(n, 0.0);
+  f.read(reinterpret_cast<char *>(out->data()),
+         static_cast<std::streamsize>(n * sizeof(double)));
+  const std::streamsize got = f.gcount();
+  if (got != static_cast<std::streamsize>(n * sizeof(double))) {
+    printf("  FAIL: grid-metrics: %s: read %lld bytes, expected %zu\n",
+           path.c_str(), (long long)got, n * sizeof(double));
+    return false;
+  }
+  return true;
+}
+
+// tile is 1-based (matches setup()'s convention); the exporter/converter use
+// 0-based Fortran MPI rank == tile - 1.
+bool load(HostState &h, int tile, const std::string &dir) {
+  const std::string tile_dir = dir + "/tile" + std::to_string(tile - 1);
+  const size_t n2d = (size_t)h.ni_h * (size_t)h.nj_h;
+
+  for (auto &kv : single_field_table(h)) {
+    std::vector<double> raw;
+    if (!read_doubles(tile_dir + "/" + kv.first + ".bin", n2d, &raw)) return false;
+    if (raw.size() != kv.second->size()) {
+      printf("  FAIL: grid-metrics: %s size mismatch (file %zu, host %zu)\n",
+             kv.first, raw.size(), kv.second->size());
+      return false;
+    }
+    for (size_t i = 0; i < raw.size(); ++i) (*kv.second)[i] = (fv_real)raw[i];
+  }
+
+  for (auto &kv : std::vector<std::pair<const char *, std::vector<fv_real> *>>{
+           {"sin_sg", &h.sin_sg}, {"cos_sg", &h.cos_sg}}) {
+    std::vector<double> raw;
+    if (!read_doubles(tile_dir + "/" + kv.first + ".bin", 4 * n2d, &raw)) return false;
+    if (raw.size() != kv.second->size()) {
+      printf("  FAIL: grid-metrics: %s size mismatch (file %zu, host %zu)\n",
+             kv.first, raw.size(), kv.second->size());
+      return false;
+    }
+    for (size_t i = 0; i < raw.size(); ++i) (*kv.second)[i] = (fv_real)raw[i];
+  }
+
+  printf("  [6A.5] tile %d: authoritative grid metrics loaded from %s\n",
+         tile, tile_dir.c_str());
+  return true;
+}
+
+}  // namespace grid_metrics_6a5
+
+// ---------------------------------------------------------------------------
+// Prompt 6B: authoritative cubed-sphere edge-interpolation weights and
+// B-/A-grid lon/lat, for validation runs only.
+//
+// One input-fidelity defect is corrected here: edge_w/e/s/n. They are inputs to
+// a2b_ord4, and in the SP1->SP2 window the only a2b_ord4 consumer is
+// smag_corner, whose output reaches d_sw through damp2 -> vort -> ke and
+// therefore affects the u/v update and NOTHING else. That is exactly the
+// observed SP2 it=1 signature.
+//
+// edge_w/e/s/n were fabricated as local-index ramps 1.0 + 0.01*index by
+// make_host_state, which states the fabrication outright at that site.
+// Authoritative values are ~0.298..0.702; the ramp reaches 1.13, outside [0,1]
+// entirely. --grid-metrics cannot override them because edge_* are not in the
+// authoritative metric set (the Prompt 6A capture took gridstruct's per-cell
+// 2-D metric arrays; edge_* are 1-D edge vectors). They are recomputed instead,
+// from the real grid, by a direct port of edge_factors,
+// REF/model/fv_grid_utils.F90:1188-1293.
+//
+// RETRACTED, recorded so it is not rediscovered: an earlier revision of this
+// block also "fixed" make_host_state's cube::CubeGrid tile argument, on the
+// theory that it passed a 0-based MPI rank to a 1-based parameter. That was
+// wrong -- `tile` here is already 1-based (grid_metrics_6a5::load derives its
+// directory as "tile" + (tile-1), i.e. tile 1..6 -> tile0..tile5 on disk), so
+// make_host_state was correct. The `tile + 1` produced CubeGrid tile 7, whose
+// panel falls through tile_rotate's `default` while corner_owner reads it as
+// odd parity, and the resulting inconsistent halo mapping generated NaN in
+// u/v/delp at it=1. grid_lonlat/agrid_lonlat therefore need no rebuild either.
+//
+// Deliberately confined to the --grid-metrics gate. The default/performance
+// path keeps make_host_state's fabricated ramps and so stays bit-identical; the
+// 3A.11V del-2n stability calibration was measured against those values.
+//
+// Numerical algorithm changed: NO. No numerical expression is touched, only the
+// values fed into one.
+// ---------------------------------------------------------------------------
+namespace grid_geometry_6b {
+
+// Fortran poisons edge_* with big_number outside the band it fills, so that an
+// out-of-domain read fails loudly rather than silently using a plausible
+// number. Reproduced here: CUDA's a2b_ord4 reads j (and i) over
+// [output_j0, output_j1] = [js+1, je] = [2, npx-1] in
+// launch_a2b_ord4_global_cuda -- exactly the Fortran band -- so no poisoned
+// entry is ever read, and if one ever is, it will be obvious.
+static const double kBigNumber = 1.0e30;
+
+bool apply(HostState &h, int tile) {
+  const int im = (int)NI;
+  const int npx = im + 1;
+  // `tile` is 1-based here, which is also CubeGrid's convention; see the
+  // retraction note above.
+  const cube::CubeGrid cg(im, tile, (int)HALO);
+
+  // FV3 index -> harness array slot. The 2-D box and the 1-D edge vectors are
+  // both allocated from lo = 1 - HALO, so owned index a lives at a - 1 + HALO.
+  auto s2 = [&h](int i, int j) {
+    return (size_t)(i - 1 + (int)HALO) +
+           (size_t)(j - 1 + (int)HALO) * (size_t)h.ni_h;
+  };
+  auto s1 = [](int a) { return (size_t)(a - 1 + (int)HALO); };
+
+  // -- grid authenticity self-check, before anything is written ------------
+  // Re-derive dx/dy from CubeGrid and fit ONE radius against the authoritative
+  // dx/dy that grid_metrics_6a5::load has just installed. If CubeGrid were not
+  // the authoritative c8 grid, the edge weights computed from it would not be
+  // authoritative either, and this whole correction would be a different set of
+  // fabricated numbers. Distances are rotation-invariant and the six panels are
+  // pure rotations of one another, so this proves the panel SHAPE only, not the
+  // tile identity; do not read it as a check on the tile index.
+  {
+    double sum_r = 0.0;
+    int nr = 0;
+    for (int j = 1; j <= npx; ++j)
+      for (int i = 1; i <= im; ++i) {
+        const double u =
+            cube::great_circle_dist(cg.corner(i, j), cg.corner(i + 1, j), 1.0);
+        if (u > 0.0) { sum_r += (double)h.dx[s2(i, j)] / u; ++nr; }
+      }
+    for (int j = 1; j <= im; ++j)
+      for (int i = 1; i <= npx; ++i) {
+        const double u =
+            cube::great_circle_dist(cg.corner(i, j), cg.corner(i, j + 1), 1.0);
+        if (u > 0.0) { sum_r += (double)h.dy[s2(i, j)] / u; ++nr; }
+      }
+    if (nr == 0) {
+      printf("  FAIL: [6B] tile %d: no usable dx/dy for the grid self-check\n",
+             tile);
+      return false;
+    }
+    const double radius = sum_r / (double)nr;
+    double worst = 0.0;
+    for (int j = 1; j <= npx; ++j)
+      for (int i = 1; i <= im; ++i) {
+        const double u = radius * cube::great_circle_dist(
+                                      cg.corner(i, j), cg.corner(i + 1, j), 1.0);
+        worst = std::fmax(worst, std::fabs(u / (double)h.dx[s2(i, j)] - 1.0));
+      }
+    for (int j = 1; j <= im; ++j)
+      for (int i = 1; i <= npx; ++i) {
+        const double u = radius * cube::great_circle_dist(
+                                      cg.corner(i, j), cg.corner(i, j + 1), 1.0);
+        worst = std::fmax(worst, std::fabs(u / (double)h.dy[s2(i, j)] - 1.0));
+      }
+    printf("  [6B] tile %d: grid self-check fitted radius %.6f m, "
+           "max|dx,dy ratio-1| %.3e\n", tile, radius, worst);
+    if (!(worst <= 1.0e-12)) {
+      printf("  FAIL: [6B] tile %d: CubeGrid is not the authoritative grid "
+             "(max|ratio-1| %.3e > 1e-12); edge_* would not be authoritative\n",
+             tile, worst);
+      return false;
+    }
+  }
+
+  // grid_lonlat/agrid_lonlat are left as make_host_state built them: it uses the
+  // same CubeGrid with the same (1-based) tile, so recomputing them here would
+  // be a no-op.
+
+  // -- edge_factors (fv_grid_utils.F90:1188-1293), verbatim ---------------
+  for (int64_t j = 0; j < h.nj_h; ++j)
+    h.edge_w[j] = h.edge_e[j] = (accumulator_real)kBigNumber;
+  for (int64_t i = 0; i < h.ni_h; ++i)
+    h.edge_s[i] = h.edge_n[i] = (accumulator_real)kBigNumber;
+
+  // py/px hold the A-grid-pair spherical midpoints along each physical edge.
+  // Fortran fills them over max(1,js-1)..min(npy-1,je+1); with one tile per
+  // rank (is=js=1, ie=je=im) that is 1..npx-1. The A-grid points at index 0
+  // and npx are halo cells, i.e. real cells of the neighbouring panel, so this
+  // depends on CubeGrid's halo mapping being right as well as its panel shape.
+  std::vector<cube::LonLat> pyw(npx + 1), pye(npx + 1), pxs(npx + 1),
+      pxn(npx + 1);
+  for (int j = 1; j <= npx - 1; ++j) {
+    pyw[j] = cube::mid_pt_sphere(cg.center(0, j), cg.center(1, j));
+    pye[j] = cube::mid_pt_sphere(cg.center(npx - 1, j), cg.center(npx, j));
+    pxs[j] = cube::mid_pt_sphere(cg.center(j, 0), cg.center(j, 1));
+    pxn[j] = cube::mid_pt_sphere(cg.center(j, npx - 1), cg.center(j, npx));
+  }
+  // The radius cancels in d2/(d1+d2), so unit-sphere distances are exact here
+  // and no earth-radius constant needs to be introduced.
+  auto ratio = [](cube::LonLat prev, cube::LonLat curr, cube::LonLat corner) {
+    const double d1 = cube::great_circle_dist(prev, corner, 1.0);
+    const double d2 = cube::great_circle_dist(curr, corner, 1.0);
+    return d2 / (d1 + d2);
+  };
+  for (int j = 2; j <= npx - 1; ++j) {
+    h.edge_w[s1(j)] =
+        (accumulator_real)ratio(pyw[j - 1], pyw[j], cg.corner(1, j));
+    h.edge_e[s1(j)] =
+        (accumulator_real)ratio(pye[j - 1], pye[j], cg.corner(npx, j));
+    h.edge_s[s1(j)] =
+        (accumulator_real)ratio(pxs[j - 1], pxs[j], cg.corner(j, 1));
+    h.edge_n[s1(j)] =
+        (accumulator_real)ratio(pxn[j - 1], pxn[j], cg.corner(j, npx));
+  }
+
+  printf("  [6B] tile %d: authoritative edge_w[2..%d] =", tile, npx - 1);
+  for (int j = 2; j <= npx - 1; ++j)
+    printf(" %.12f", (double)h.edge_w[s1(j)]);
+  printf("\n");
+  return true;
+}
+
+}  // namespace grid_geometry_6b
+
+// Milestone 6A.5 Section 10: load the authoritative Fortran Prompt 6A SP0
+// dyn_core dynamical state (u,v,w,delp,pt,delz,q_con,pe,peln,pk) plus the
+// global da_min/da_min_c scalars, in place of whatever IC HostState would
+// otherwise hold. Reads flat binaries pre-remapped into the harness's own
+// index convention by tools/savepoints/convert_sp0_to_cuda.py (which itself
+// reuses tools/savepoints/savepoint_reader.load_field() -- no new savepoint
+// format). Gated by --sp0-state; empty (default) leaves HostState/
+// production_config() completely unaffected.
+namespace sp0_state_6a5 {
+
+std::vector<std::pair<const char *, std::vector<fv_real> *>>
+field_table(HostState &h) {
+  return {
+      {"u", &h.u}, {"v", &h.v}, {"w", &h.w}, {"delp", &h.delp},
+      {"pt", &h.pt}, {"delz", &h.delz}, {"q_con", &h.q_con},
+      {"pk", &h.pk}, {"pe", &h.pe}, {"peln", &h.peln},
+  };
+}
+
+bool read_doubles_into(const std::string &path, std::vector<fv_real> *out) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) {
+    printf("  FAIL: sp0-state: cannot open %s\n", path.c_str());
+    return false;
+  }
+  std::vector<double> raw(out->size(), 0.0);
+  f.read(reinterpret_cast<char *>(raw.data()),
+         static_cast<std::streamsize>(raw.size() * sizeof(double)));
+  const std::streamsize got = f.gcount();
+  if (got != static_cast<std::streamsize>(raw.size() * sizeof(double))) {
+    printf("  FAIL: sp0-state: %s: read %lld bytes, expected %zu\n",
+           path.c_str(), (long long)got, raw.size() * sizeof(double));
+    return false;
+  }
+  for (size_t i = 0; i < raw.size(); ++i) (*out)[i] = (fv_real)raw[i];
+  return true;
+}
+
+// tile is 1-based (matches setup()'s convention); the converter's output
+// directories are 0-based Fortran-pe-indexed, same convention as
+// grid_metrics_6a5::load().
+bool load(HostState &h, int tile, const std::string &dir) {
+  const std::string tile_dir = dir + "/tile" + std::to_string(tile - 1);
+
+  for (auto &kv : field_table(h)) {
+    if (!read_doubles_into(tile_dir + "/" + std::string(kv.first) + ".bin", kv.second))
+      return false;
+  }
+
+  std::vector<double> scalars(2, 0.0);
+  {
+    std::ifstream f(tile_dir + "/da_min_da_min_c.bin", std::ios::binary);
+    if (!f) {
+      printf("  FAIL: sp0-state: cannot open %s/da_min_da_min_c.bin\n", tile_dir.c_str());
+      return false;
+    }
+    f.read(reinterpret_cast<char *>(scalars.data()), 2 * sizeof(double));
+    if (f.gcount() != 2 * (std::streamsize)sizeof(double)) {
+      printf("  FAIL: sp0-state: %s/da_min_da_min_c.bin: short read\n", tile_dir.c_str());
+      return false;
+    }
+  }
+  h.override_da_min = (fv_real)scalars[0];
+  h.override_da_min_c = (fv_real)scalars[1];
+
+  printf("  [6A.5-Sec10] tile %d: authoritative SP0 state + global "
+         "da_min=%.6e da_min_c=%.6e loaded from %s\n",
+         tile, (double)h.override_da_min, (double)h.override_da_min_c,
+         tile_dir.c_str());
+  return true;
+}
+
+}  // namespace sp0_state_6a5
+
+// Prompt 6B (SP1 rerun): overwrite h.ptop and h.phis/h.zs with the
+// authoritative Fortran SP1-savepoint-derived boundary values (see
+// g_sp1_boundary_dir's comment above). Gated by --sp1-boundary; empty
+// (default) leaves HostState's synthetic seed completely unaffected.
+namespace sp1_boundary_6b {
+
+bool load(HostState &h, int tile, const std::string &dir) {
+  const std::string tile_dir = dir + "/tile" + std::to_string(tile - 1);
+
+  double ptop_val = 0.0;
+  {
+    std::ifstream f(tile_dir + "/ptop.bin", std::ios::binary);
+    if (!f) {
+      printf("  FAIL: sp1-boundary: cannot open %s/ptop.bin\n", tile_dir.c_str());
+      return false;
+    }
+    f.read(reinterpret_cast<char *>(&ptop_val), sizeof(double));
+    if (f.gcount() != (std::streamsize)sizeof(double)) {
+      printf("  FAIL: sp1-boundary: %s/ptop.bin: short read\n", tile_dir.c_str());
+      return false;
+    }
+  }
+  h.ptop = (fv_real)ptop_val;
+
+  if (!sp0_state_6a5::read_doubles_into(tile_dir + "/phis.bin", &h.phis)) return false;
+  if (!sp0_state_6a5::read_doubles_into(tile_dir + "/zs.bin", &h.zs)) return false;
+
+  /* dp_ref == update_dz_c's `dp0` dummy (dyn_core.F90:597). It sets
+   * top_ratio/bot_ratio/int_ratio, i.e. the xfx/yfx wind-extrapolation weights
+   * at every k INCLUDING k=km+1 -- the level that produces gz(km+1) and hence
+   * ws3 (nh_utils.F90:96-98, :113-137). HostState seeds it from the synthetic
+   * log-spaced delp column (:1382), which for this fixture gave
+   * bot_ratio=0.613137 against the authoritative 0.500000000000 and biased ws3
+   * by a uniform ~6.93% on all six tiles. dp_ref belongs to neither earlier
+   * ingestion milestone's field set (not a grid metric, not one of SP0's 10
+   * dynamical fields), which is why it stayed synthetic until now.
+   * Authoritative values come from the converter; nothing is derived here. */
+  if (!sp0_state_6a5::read_doubles_into(tile_dir + "/dp_ref.bin", &h.dp_ref)) return false;
+
+  const size_t km = h.dp_ref.size();
+  const double top_ratio = (km >= 2)
+      ? (double)h.dp_ref[0] / ((double)h.dp_ref[0] + (double)h.dp_ref[1]) : 0.0;
+  const double bot_ratio = (km >= 2)
+      ? (double)h.dp_ref[km - 1] / ((double)h.dp_ref[km - 2] + (double)h.dp_ref[km - 1]) : 0.0;
+  printf("  [6B-SP1] tile %d: authoritative SP1-boundary ptop=%.6f phis/zs "
+         "loaded, dp_ref[0]=%.6f dp_ref[%zu]=%.6f top_ratio=%.12f "
+         "bot_ratio=%.12f from %s\n", tile, (double)h.ptop, (double)h.dp_ref[0],
+         km - 1, (double)h.dp_ref[km - 1], top_ratio, bot_ratio, tile_dir.c_str());
+  return true;
+}
+
+}  // namespace sp1_boundary_6b
+
 // One tile's whole participation, minus the step itself.
 struct Member {
   fv3_gpu_context *ctx = nullptr;
@@ -2133,6 +2812,28 @@ bool setup(Member &m, int tile, HaloPeerGroup &pg, bool perturb_this_tile) {
   // make_tile_asymmetric's former site.
   m.h = std::make_unique<HostState>(make_host_state(tile));
   if (perturb_this_tile) perturb(*m.h);
+  if (!g_grid_metrics_dir.empty()) {
+    if (!grid_metrics_6a5::load(*m.h, tile, g_grid_metrics_dir)) return false;
+    // Strictly after the metric load: grid_geometry_6b's authenticity
+    // self-check validates CubeGrid against the authoritative dx/dy that load
+    // has just installed, and only then writes edge_*/grid_lonlat.
+    if (!grid_geometry_6b::apply(*m.h, tile)) return false;
+  }
+  // Milestone 6A.5 Section 10: strictly after grid metrics, strictly before
+  // make_fields() -- same "override host buffers before H2D registration"
+  // idiom grid_metrics_6a5::load() already uses. Load order required by
+  // Section 4: metrics -> global scalars -> SP0 dynamical state, all before
+  // any device transfer.
+  if (!g_sp0_state_dir.empty()) {
+    if (!sp0_state_6a5::load(*m.h, tile, g_sp0_state_dir)) return false;
+  }
+  // Prompt 6B (SP1 rerun): strictly after SP0 state, strictly before
+  // make_fields() -- ptop must be set before install_config() reads it
+  // (production_config()), and phis/zs must be set before make_fields()
+  // captures their pointers for H2D registration.
+  if (!g_sp1_boundary_dir.empty()) {
+    if (!sp1_boundary_6b::load(*m.h, tile, g_sp1_boundary_dir)) return false;
+  }
   m.fields = make_fields(*m.h);
 
   fv3_gpu_state_desc state{};
@@ -2255,7 +2956,7 @@ double run_mode_a(Member &m, int32_t n_split, int warmup, int iters) {
     fv3_gpu_step_desc step{};
     step.abi_version = FV3_GPU_ABI_VERSION;
     step.struct_bytes = sizeof(step);
-    step.bdt = 10.0;
+    step.bdt = g_bdt;
     step.k_split = 1;
     step.n_split = n_split;
     step.init_step = 1;
@@ -2307,6 +3008,51 @@ fv3_gpu_field_mask resident_field_mask() {
   return mask;
 }
 
+// Milestone 6A.5 Section 10: exactly the ten Prompt 6A SP0 dynamical-state
+// fields, for the D2H readback that proves device state (not just host
+// parsing) after sp0_state_6a5::load() + H2D, with no kernel launched.
+fv3_gpu_field_mask sp0_field_mask() {
+  fv3_gpu_field_mask mask{};
+  mask.abi_version = FV3_GPU_ABI_VERSION;
+  mask.struct_bytes = sizeof(mask);
+  for (FieldId id : {FieldId::u, FieldId::v, FieldId::w, FieldId::delp,
+                     FieldId::pt, FieldId::delz, FieldId::q_con,
+                     FieldId::pe, FieldId::peln, FieldId::pk})
+    mask.words[static_cast<uint32_t>(id) / 64] |=
+        (1ULL << (static_cast<uint32_t>(id) % 64));
+  return mask;
+}
+
+// Milestone 6A.5 Section 10: write the current (post-D2H) HostState SP0
+// fields to <dir>/tile<pe>/<field>.bin, float64, same flat layout
+// tools/savepoints/convert_sp0_to_cuda.py produces -- so
+// tools/savepoints/compare_sp0_identity.py can classify_diff() them directly
+// against the Fortran SP0 savepoint without a third data format.
+bool dump_sp0_state(const HostState &h, int tile, const std::string &dir) {
+  const std::string tile_dir = dir + "/tile" + std::to_string(tile - 1);
+  std::error_code ec;
+  std::filesystem::create_directories(tile_dir, ec);
+  const std::vector<std::pair<const char *, const std::vector<fv_real> *>> table = {
+      {"u", &h.u}, {"v", &h.v}, {"w", &h.w}, {"delp", &h.delp},
+      {"pt", &h.pt}, {"delz", &h.delz}, {"q_con", &h.q_con},
+      {"pk", &h.pk}, {"pe", &h.pe}, {"peln", &h.peln},
+  };
+  for (auto &kv : table) {
+    std::vector<double> raw(kv.second->begin(), kv.second->end());
+    std::ofstream f(tile_dir + "/" + std::string(kv.first) + ".bin", std::ios::binary);
+    if (!f) {
+      printf("  FAIL: sp0-dump: cannot open %s/%s.bin for write\n",
+             tile_dir.c_str(), kv.first);
+      return false;
+    }
+    f.write(reinterpret_cast<const char *>(raw.data()),
+            (std::streamsize)(raw.size() * sizeof(double)));
+  }
+  printf("  [6A.5-Sec10] tile %d: post-H2D/D2H SP0 state dumped to %s\n",
+         tile, tile_dir.c_str());
+  return true;
+}
+
 // MODE B (transfer-inclusive): each measured iteration is
 // sync_from_host -> dyn_core_step -> sync_to_host, chained by dependency and
 // DRAINED before the next iteration starts -- SS5 asks for the timed section
@@ -2327,7 +3073,7 @@ double run_mode_b(Member &m, int32_t n_split, int warmup, int iters) {
     fv3_gpu_step_desc step{};
     step.abi_version = FV3_GPU_ABI_VERSION;
     step.struct_bytes = sizeof(step);
-    step.bdt = 10.0;
+    step.bdt = g_bdt;
     step.k_split = 1;
     step.n_split = n_split;
     step.init_step = 1;
@@ -2454,6 +3200,58 @@ bool verify_work_executed(Member &m, int tile) {
 // ---------------------------------------------------------------------------
 namespace {
 
+// Milestone 6A.5 Section 10: load order is exactly metrics -> global scalars
+// -> SP0 dynamical state -> H2D/bind (all inside phase_e::setup()) -> verify
+// device state (D2H via fv3_gpu_sync_to_host below) -> STOP. No
+// fv3_gpu_dyn_core_step call anywhere in this function -- cgrid predictor,
+// d_sw, and the vertical solver are never invoked.
+bool run_sp0_verify_only() {
+  phase_e::HaloPeerGroup pg(phase_e::kTiles);
+  phase_e::Member m[phase_e::kTiles + 1];
+  bool setup_ok = true;
+  for (int t = 1; t <= phase_e::kTiles && setup_ok; ++t)
+    setup_ok = phase_e::setup(m[t], t, pg, false);
+  if (!setup_ok || !pg.complete()) {
+    printf("  FAIL: six-tile SP0 setup did not complete\n");
+    for (int t = phase_e::kTiles; t >= 1; --t) phase_e::teardown(m[t]);
+    return false;
+  }
+
+  bool ok = true;
+  const fv3_gpu_field_mask mask = phase_e::sp0_field_mask();
+  for (int t = 1; t <= phase_e::kTiles; ++t) {
+    fv3_gpu_error err{};
+    fv3_gpu_event ev = 0;
+    int rc = fv3_gpu_sync_to_host(m[t].ctx, &mask, &ev, &err);
+    if (rc == FV3_GPU_SUCCESS) rc = fv3_gpu_event_wait(m[t].ctx, ev, &err);
+    if (rc != FV3_GPU_SUCCESS) {
+      printf("  FAIL: tile %d SP0 D2H returned %d: %s\n", t, rc, err.message);
+      ok = false;
+      continue;
+    }
+    const struct { const std::vector<fv_real> *v; const char *n; } fin[] = {
+        {&m[t].h->u, "u"}, {&m[t].h->v, "v"}, {&m[t].h->w, "w"},
+        {&m[t].h->delp, "delp"}, {&m[t].h->pt, "pt"}, {&m[t].h->delz, "delz"},
+        {&m[t].h->q_con, "q_con"}, {&m[t].h->pe, "pe"}, {&m[t].h->peln, "peln"},
+        {&m[t].h->pk, "pk"},
+    };
+    char label[40];
+    for (const auto &f : fin) {
+      std::snprintf(label, sizeof(label), "tile%d %s", t, f.n);
+      ok &= check_finite(f.v->data(), f.v->size(), label);
+    }
+    std::snprintf(label, sizeof(label), "tile%d delp", t);
+    ok &= phase_e::check_positive_owned(m[t].h->delp.data(), m[t].h->ni_h, m[t].h->nj_h, NPZ, label);
+    if (!g_sp0_dump_dir.empty()) ok &= phase_e::dump_sp0_state(*m[t].h, t, g_sp0_dump_dir);
+  }
+
+  for (int t = phase_e::kTiles; t >= 1; --t) phase_e::teardown(m[t]);
+  printf("\n=== Milestone 6A.5 Section 10: SP0 verify-only: %s ===\n",
+         ok ? "PASS" : "FAIL");
+  printf("Numerical kernels executed: NO\n");
+  return ok;
+}
+
 bool run_one_repeat(int32_t n_split, int warmup, int iters, const char *mode,
                     int repeat, const char *hardware) {
   phase_e::HaloPeerGroup pg(phase_e::kTiles);
@@ -2512,7 +3310,33 @@ bool run_one_repeat(int32_t n_split, int warmup, int iters, const char *mode,
 void usage() {
   printf("usage: fv3_gpu_perf_bench --grid N --npz N --n_split N --warmup N "
         "--iters N --repeats N --mode resident|transfer|both "
-        "--hardware STRING\n");
+        "--hardware STRING "
+        "[--grid-metrics DIR]  (Milestone 6A.5: load authoritative grid "
+        "metrics from DIR/tile{0..5}/*.bin instead of the fabricated "
+        "uniform metrics; validation-only, default off)\n"
+        "[--sp0-state DIR --sp0-verify-only --sp0-dump DUMPDIR]  "
+        "(Milestone 6A.5 Section 10: load the authoritative Fortran Prompt "
+        "6A SP0 dynamical state + global da_min/da_min_c from DIR "
+        "(tools/savepoints/convert_sp0_to_cuda.py output), perform H2D, "
+        "immediately D2H and dump to DUMPDIR, then exit -- no numerical "
+        "kernel is launched. Requires --grid 8 --npz 10 to match the SP0 "
+        "savepoint's c8/npz=10 config.)\n"
+        "[--sp1-boundary DIR]  (Prompt 6B: overwrite h.ptop, h.phis/h.zs and h.dp_ref "
+        "with the authoritative Fortran SP1-savepoint-derived values from "
+        "DIR/tile{0..5}/*.bin (tools/savepoints/convert_sp1_boundary_to_cuda.py "
+        "output) instead of the synthetic ptop=1000/phis=zs=0 seed; "
+        "validation-only, default off)\n"
+        "[--akap VALUE]  (Prompt 6B: override akap/cappa. The authoritative "
+        "value for the GEOSfvdycore_fortran_perf fixture is "
+        "0.28571426868438721 -- the single-precision MAPL_KAPPA, one float32 "
+        "ULP below 2/7; the default is the double 2/7. validation-only, "
+        "default off)\n"
+        "[--akap-exner VALUE]  (Prompt 6B: use VALUE as the EXNER-only kappa "
+        "(ptk, pk3, pk3_halo) while cfg.akap stays the thermodynamic-closure "
+        "kappa. The authoritative fixture separates the two because it compiles "
+        "MOIST_CAPPA/USE_COND: VALUE = 0.28571426868438721 (single-precision "
+        "MAPL_KAPPA) for Exner, 2/7 for the closure; validation-only, "
+        "default off)\n");
 }
 
 } // namespace
@@ -2535,6 +3359,15 @@ int main(int argc, char **argv) {
     else if (a == "--repeats") repeats = std::atoi(next(i));
     else if (a == "--mode") mode = next(i);
     else if (a == "--hardware") hardware = next(i);
+    else if (a == "--grid-metrics") g_grid_metrics_dir = next(i);
+    else if (a == "--sp0-state") g_sp0_state_dir = next(i);
+    else if (a == "--sp0-verify-only") g_sp0_verify_only = true;
+    else if (a == "--sp0-dump") g_sp0_dump_dir = next(i);
+    else if (a == "--bdt") g_bdt = std::atof(next(i));
+    else if (a == "--sp1-boundary") g_sp1_boundary_dir = next(i);
+    else if (a == "--damp-n-sponge") g_damp_n_sponge = std::atoi(next(i));
+    else if (a == "--akap") g_akap = std::atof(next(i));
+    else if (a == "--akap-exner") g_akap_exner = std::atof(next(i));
     else if (a == "--help") { usage(); return 0; }
     else { printf("unknown argument: %s\n", a.c_str()); usage(); return 2; }
   }
@@ -2552,6 +3385,26 @@ int main(int argc, char **argv) {
   if (caps.device_count == 0) {
     printf("SKIP: no CUDA devices available\n");
     return 77;
+  }
+
+  if (g_sp0_verify_only) {
+    if (g_sp0_state_dir.empty()) {
+      printf("FAIL: --sp0-verify-only requires --sp0-state DIR\n");
+      return 2;
+    }
+    if (g_sp0_dump_dir.empty()) {
+      printf("FAIL: --sp0-verify-only requires --sp0-dump DUMPDIR\n");
+      return 2;
+    }
+    printf("=== Milestone 6A.5 Section 10: SP0 verify-only ===\n");
+    printf("Load order: metrics -> global scalars -> SP0 dynamical state -> "
+           "H2D -> verify device state -> STOP\n");
+    printf("grid=%lldx%lld npz=%lld sp0-state=%s grid-metrics=%s\n",
+          (long long)grid, (long long)grid, (long long)npz,
+          g_sp0_state_dir.c_str(),
+          g_grid_metrics_dir.empty() ? "(unset)" : g_grid_metrics_dir.c_str());
+    const bool ok = run_sp0_verify_only();
+    return ok ? 0 : 1;
   }
 
   printf("=== Milestone 3A.11 CUDA perf benchmark ===\n");

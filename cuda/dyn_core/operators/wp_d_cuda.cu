@@ -530,6 +530,39 @@ __global__ void heating_hydro_kernel(HorizontalBounds b,fv_real bdt,
   if(i>b.ie||j>b.je||n>=b.npz||n>=ncon)return;fv_real dtmp=heat(i,j,heat.lo_k+n)/(cp_air*dp(i,j,dp.lo_k+n));fv_real delta=n<2?dtmp:copysign(fmin(dabs(bdt)*delt_max,dabs(dtmp)),dtmp);pt(i,j,pt.lo_k+n)+=delta/pkz(i,j,pkz.lo_k+n);
 }
 
+/* omega finalization -- dyn_core.F90:505-516, :1208-1212 and :1535-1636.
+ * See the block comment in wp_d_operators.hpp for the authoritative mapping. */
+__global__ void omega_pem_kernel(HorizontalBounds b,fv_real ptop,
+                                 View3<const fv_real> dp,View3<fv_real> pem){
+  int64_t i=b.is-1+blockIdx.x*blockDim.x+threadIdx.x,j=b.js-1+blockIdx.y*blockDim.y+threadIdx.y;
+  if(i>b.ie+1||j>b.je+1)return;
+  fv_real p=ptop;
+  for(int64_t n=0;n<b.npz;++n){p+=dp(i,j,dp.lo_k+n);pem(i,j,pem.lo_k+n)=p;}
+}
+__global__ void omega_from_pe_kernel(HorizontalBounds b,fv_real rdt,
+                                     View3<const fv_real> pe,
+                                     View3<fv_real> pem,View3<fv_real> om){
+  int64_t i=b.is+blockIdx.x*blockDim.x+threadIdx.x,j=b.js+blockIdx.y*blockDim.y+threadIdx.y,n=blockIdx.z;
+  if(i>b.ie||j>b.je||n>=b.npz)return;
+  // pe keeps its Fortran (i,k,j) descriptor order: Fortran pe(i,k+1,j) with
+  // k=n+1 is pe(i, pe.lo_j+n+1, j).
+  om(i,j,om.lo_k+n)=(pe(i,pe.lo_j+n+1,j)-pem(i,j,pem.lo_k+n))*rdt;
+}
+__global__ void adv_pe_kernel(HorizontalBounds b,View3<const fv_real> ua,
+                              View3<const fv_real> va,View3<fv_real> pb,
+                              AdvPeMetrics m,View3<fv_real> om){
+  int64_t i=b.is+blockIdx.x*blockDim.x+threadIdx.x,j=b.js+blockIdx.y*blockDim.y+threadIdx.y,n=blockIdx.z;
+  if(i>b.ie||j>b.je||n>=b.npz)return;
+  const int64_t ku=ua.lo_k+n,kv=va.lo_k+n;
+  const bool surface=(n==b.npz-1);                       // Fortran k==npz
+  const fv_real up=surface?ua(i,j,ku):fv_real(0.5)*(ua(i,j,ku)+ua(i,j,ku+1));
+  const fv_real vp=surface?va(i,j,kv):fv_real(0.5)*(va(i,j,kv)+va(i,j,kv+1));
+  const accumulator_real inc=adv_pe_cell_increment(m,pb,pb.lo_k+n,i,j,up,vp);
+  const int64_t ko=om.lo_k+n;
+  om(i,j,ko)=static_cast<fv_real>(
+    static_cast<accumulator_real>(om(i,j,ko))+inc);
+}
+
 cudaStream_t stream_cast(void *p){return static_cast<cudaStream_t>(p);}
 fv3_gpu_status last(){return cudaGetLastError()==cudaSuccess?FV3_GPU_SUCCESS:FV3_GPU_CUDA_ERROR;}
 dim3 grid2(int64_t nx,int64_t ny,int64_t nz=1){return dim3((unsigned(nx)+block2.x-1)/block2.x,(unsigned(ny)+block2.y-1)/block2.y,(unsigned)nz);}
@@ -769,5 +802,8 @@ fv3_gpu_status launch_del2_meridional_flux_cuda(const HorizontalBounds&b,int n,b
 fv3_gpu_status launch_del2_update_cuda(const HorizontalBounds&b,int n,accumulator_real cd,View3<fv_real>q,View2<const fv_real>r,View3<fv_real>x,View3<fv_real>y,void*s)noexcept{if(!s||!valid_bounds(b)||n<0||!q.data||!r.data||!x.data||!y.data)return FV3_GPU_INVALID_ARGUMENT;del2_update_kernel<<<grid2(b.ie-b.is+1+2*n,b.je-b.js+1+2*n,b.npz),block2,0,stream_cast(s)>>>(b,n,cd,q,r,x,y);return last();}
 fv3_gpu_status launch_diffusive_heating_nh_cuda(const HorizontalBounds&b,fv_real bt,fv_real dm,fv_real cv,fv_real rdg,fv_real ak,bool moist,int64_t nc,View3<fv_real>h,View3<const fv_real>dp,View3<const fv_real>dz,View3<const fv_real>c,View3<fv_real>pk,View3<fv_real>pt,void*s)noexcept{if(!s||!valid_bounds(b)||nc<0||!h.data||!dp.data||!dz.data||(moist&&!c.data)||!pk.data||!pt.data)return FV3_GPU_INVALID_ARGUMENT;if(nc==0)return FV3_GPU_SUCCESS;heating_nh_kernel<<<grid2(b.ie-b.is+1,b.je-b.js+1,(nc<b.npz?nc:b.npz)),block2,0,stream_cast(s)>>>(b,bt,dm,cv,rdg,ak,moist,nc,h,dp,dz,c,pk,pt);return last();}
 fv3_gpu_status launch_diffusive_heating_hydrostatic_cuda(const HorizontalBounds&b,fv_real bt,fv_real dm,fv_real cp,int64_t nc,View3<const fv_real>h,View3<const fv_real>dp,View3<const fv_real>pk,View3<fv_real>pt,void*s)noexcept{if(!s||!valid_bounds(b)||nc<0||!h.data||!dp.data||!pk.data||!pt.data)return FV3_GPU_INVALID_ARGUMENT;if(nc==0)return FV3_GPU_SUCCESS;heating_hydro_kernel<<<grid2(b.ie-b.is+1,b.je-b.js+1,(nc<b.npz?nc:b.npz)),block2,0,stream_cast(s)>>>(b,bt,dm,cp,nc,h,dp,pk,pt);return last();}
+fv3_gpu_status launch_pem_snapshot_cuda(const HorizontalBounds&b,fv_real ptop,View3<const fv_real>dp,View3<fv_real>pem,void*s)noexcept{if(!s||!valid_bounds(b)||!dp.data||!pem.data)return FV3_GPU_INVALID_ARGUMENT;omega_pem_kernel<<<grid2(b.ie-b.is+3,b.je-b.js+3),block2,0,stream_cast(s)>>>(b,ptop,dp,pem);return last();}
+fv3_gpu_status launch_omega_from_pe_cuda(const HorizontalBounds&b,fv_real rdt,View3<const fv_real>pe,View3<fv_real>pem,View3<fv_real>om,void*s)noexcept{if(!s||!valid_bounds(b)||!pe.data||!pem.data||!om.data)return FV3_GPU_INVALID_ARGUMENT;omega_from_pe_kernel<<<grid2(b.ie-b.is+1,b.je-b.js+1,b.npz),block2,0,stream_cast(s)>>>(b,rdt,pe,pem,om);return last();}
+fv3_gpu_status launch_adv_pe_cuda(const HorizontalBounds&b,View3<const fv_real>ua,View3<const fv_real>va,View3<fv_real>pb,const AdvPeMetrics&m,View3<fv_real>om,void*s)noexcept{if(!s||!valid_bounds(b)||!ua.data||!va.data||!pb.data||!om.data||!m.grid_lonlat.data||!m.dx.data||!m.dy.data||!m.rarea.data)return FV3_GPU_INVALID_ARGUMENT;adv_pe_kernel<<<grid2(b.ie-b.is+1,b.je-b.js+1,b.npz),block2,0,stream_cast(s)>>>(b,ua,va,pb,m,om);return last();}
 
 } // namespace fv3::gpu::operators

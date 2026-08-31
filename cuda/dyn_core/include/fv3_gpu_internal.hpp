@@ -142,6 +142,24 @@ struct NumericalConfig {
    * that the supported configuration takes, so this changes no executed
    * arithmetic today -- it removes a trap for the SIM3p0 branch later. */
   double ptop=0, akap=0, a_imp=1, p_fac=0, scale_m=0, dz_min=0;
+  /* Prompt 6B (sp2a it=1): the authoritative fixture carries TWO distinct
+   * kappas through one Riem_Solver3 call, because it compiles MOIST_CAPPA and
+   * USE_COND:
+   *   - the scalar `akap` drives the EXNER variable only
+   *     (nh_core.F90:102 ptk = exp(akap*peln1), :138 pk3 = exp(akap*peln2),
+   *      dyn_core.F90:1017/1401 pk3_halo). Its value here is MAPL_KAPPA,
+   *     evaluated in single precision (MAPL PhysicalConstants.F90:50-56):
+   *     0.28571426868438721, one float32 ULP below float32(2/7).
+   *   - the `cappa(i,j,k)` ARRAY drives every thermodynamic closure, via
+   *     gm2 = 1/(1-cappa) and cp2 = cappa (nh_core.F90:114,148 -> SIM1_solver).
+   *     Its value here is the FMS double dry value rdgas/(3.5*rdgas) = 2/7
+   *     exactly (fv_dynamics.F90:454 with q_con == 0).
+   * `akap` above is the CLOSURE kappa (2/7), which is what every already
+   * validated stage uses (Riem_Solver_c's gama/cp2 at SP1 it=1, the SIM1
+   * closure). `akap_exner` is the Exner-only scalar; 0 means "not supplied",
+   * in which case the Exner sites fall back to `akap` and behaviour is
+   * bit-identical to before this member existed. */
+  double akap_exner=0;
   double rdgas=0, grav=0;
   double beta=0, d_ext=0, dddmp=0, d_con=0, lim_fac=0, zvir=0;
   double da_min=0, da_min_c=0, delt_max=0;
@@ -272,8 +290,8 @@ enum class HaloResolution : uint8_t {
 };
 
 struct DependencyState {
-  std::array<HaloState,FV3_GPU_H_DWIND_NEXT+1> halo{};
-  std::array<fv3_gpu_event,FV3_GPU_H_DWIND_NEXT+1> ready_event{};
+  std::array<HaloState,FV3_GPU_H_GROUP_LAST+1> halo{};
+  std::array<fv3_gpu_event,FV3_GPU_H_GROUP_LAST+1> ready_event{};
   int require(fv3_gpu_halo_group, fv3_gpu_event *) const noexcept;
   int mark_stale(fv3_gpu_halo_group) noexcept;
   int mark_pending(fv3_gpu_halo_group, fv3_gpu_event) noexcept;
@@ -360,6 +378,17 @@ struct NumericalDispatch {
   LaunchFn nh_pressure=nullptr;
   LaunchFn post_loop_heating=nullptr;
   CornerServiceFn corner_edge_service=nullptr;
+  /* Prompt 6B omega finalization. dyn_core.F90 snapshots pem at the top of the
+   * final acoustic substep (:503-517, gated it==n_split .and. end_step) and
+   * finalizes omga near the bottom of that same substep (:1205-1218, gated
+   * last_step). Two slots because the two halves are separated by the entire
+   * substep; the state that separates them (pem) lives in the WP-D operator
+   * arena, not on the host. Additive tail slots -- validate_dispatch does not
+   * require them and run() skips nulls, so existing wiring keeps compiling and
+   * internal_contract_version does not move. Same argument as
+   * cgrid_vertical_pre_halo above. */
+  LaunchFn omega_pem_snapshot=nullptr;
+  LaunchFn omega_finalize=nullptr;
 };
 
 int validate_execution_context(const ExecutionContext &, fv3_gpu_error *) noexcept;
