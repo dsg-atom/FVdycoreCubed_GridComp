@@ -430,12 +430,13 @@ FV3_HALO_HD inline constexpr int64_t slot_offset(int64_t along_extent, int64_t n
 /* Implemented in runtime/fv3_gpu_halo_exchange.cu; declared unconditionally so a
  * CPU-only translation unit still sees the contract. */
 int launch_halo_pack(const HaloGroupSpec &, const HaloGeometry &, const HaloTileFields &,
-                     fv_real *send, void *stream, fv3_gpu_error *) noexcept;
+                     fv_real *send, void *stream, fv3_gpu_error *,
+                     bool fuse_edges = false) noexcept;
 int launch_halo_transfer(const HaloGroupSpec &, const HaloGeometry &, const TopologyView &,
                          fv_real *const *peer_send_by_tile, fv_real *recv, void *stream,
                          fv3_gpu_error *) noexcept;
 int launch_halo_unpack(const HaloGroupSpec &, const HaloGeometry &, const TopologyView &,
                        const HaloTileFields &, const fv_real *recv, void *stream,
-                       fv3_gpu_error *) noexcept;
+                       fv3_gpu_error *, bool fuse_edges = false) noexcept;
 
 }  // namespace fv3::gpu::halo

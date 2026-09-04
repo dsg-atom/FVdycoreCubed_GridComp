@@ -816,7 +816,9 @@ int perform_peer_exchange(ContextData &d, fv3_gpu_halo_group g, fv3_gpu_error *e
   cudaError_t crc = order_after(d.compute_stream, d.transfer_stream, d.event_compute_done);
   if (crc != cudaSuccess) return cuda_fail(crc, e, api, &d);
 
-  rc = halo::launch_halo_pack(eff, geom, fields, d.halo_send, d.transfer_stream, e);
+  const bool fuse_halo_edges = d.immutable.config.fuse_halo_edges != 0;
+  rc = halo::launch_halo_pack(eff, geom, fields, d.halo_send, d.transfer_stream, e,
+                              fuse_halo_edges);
   if (rc != FV3_GPU_SUCCESS) return rc;
   crc = cudaEventRecord(static_cast<cudaEvent_t>(d.event_halo_pack),
                         static_cast<cudaStream_t>(d.transfer_stream));
@@ -853,7 +855,7 @@ int perform_peer_exchange(ContextData &d, fv3_gpu_halo_group g, fv3_gpu_error *e
                                   d.transfer_stream, e);
   if (rc != FV3_GPU_SUCCESS) return rc;
   rc = halo::launch_halo_unpack(eff, geom, d.topology, fields, d.halo_recv,
-                                d.transfer_stream, e);
+                                d.transfer_stream, e, fuse_halo_edges);
   if (rc != FV3_GPU_SUCCESS) return rc;
 
   crc = cudaEventRecord(static_cast<cudaEvent_t>(d.event_halo_xfer),

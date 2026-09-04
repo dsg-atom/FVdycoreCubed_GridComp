@@ -250,6 +250,12 @@ static bool g_cuda_graph = false;
 // instead of two -- see fv3_cgrid_corners.hpp. Numerical semantics changed: NO.
 static bool g_fuse_corner_fill = false;
 
+// Prompt 11: fuse pack_edge_kernel/unpack_edge_kernel's per-edge loop (4
+// launches/field) into one launch/field covering all four TileEdge values --
+// see fv3_gpu_halo_exchange.cu (pack_edge4_kernel/unpack_edge4_kernel).
+// Numerical semantics changed: NO.
+static bool g_fuse_halo_edges = false;
+
 // Milestone 3A.11T: pe/peln are registered (i, k, j), NOT (i, j, k).
 //
 // This is the FV3 exception to the usual convention, and it is uniform across
@@ -2076,6 +2082,7 @@ NumericalConfig production_config(const HostState &h) {
                  g_akap_exner, (double)cfg.akap);
   }
   cfg.fuse_corner_fill = g_fuse_corner_fill ? 1 : 0;
+  cfg.fuse_halo_edges = g_fuse_halo_edges ? 1 : 0;
   cfg.use_sg = 0;
   // Milestone 3A.8: the production first-run d_sw configuration
   // (project_architecture.md). launch_d_sw_cuda rejects anything else before
@@ -3364,7 +3371,11 @@ void usage() {
         "[--fuse-corner-fill]  (Prompt 9: fuse c_sw's per-level "
         "fill2_4corners(delp,pt,dir)+fill_4corners(w,dir) into one "
         "launch_fill_corner_triplet call; bit-identical, launch-count-only "
-        "change; default off)\n");
+        "change; default off)\n"
+        "[--fuse-halo-edges]  (Prompt 11: fuse pack_edge_kernel/"
+        "unpack_edge_kernel's per-edge loop (4 launches/field) into one "
+        "launch/field covering all four TileEdge values; bit-identical, "
+        "launch-count-only change; default off)\n");
 }
 
 } // namespace
@@ -3398,6 +3409,7 @@ int main(int argc, char **argv) {
     else if (a == "--akap-exner") g_akap_exner = std::atof(next(i));
     else if (a == "--cuda-graph") g_cuda_graph = true;
     else if (a == "--fuse-corner-fill") g_fuse_corner_fill = true;
+    else if (a == "--fuse-halo-edges") g_fuse_halo_edges = true;
     else if (a == "--help") { usage(); return 0; }
     else { printf("unknown argument: %s\n", a.c_str()); usage(); return 2; }
   }

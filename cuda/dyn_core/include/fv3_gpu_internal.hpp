@@ -187,6 +187,14 @@ struct NumericalConfig {
    * bit-identical result -- see fv3_cgrid_corners.hpp. Default 0 preserves the
    * exact prior launch sequence. */
   uint8_t fuse_corner_fill=0;
+  /* Prompt 11 pack/unpack-edge fusion, opt-in. When set, launch_halo_pack and
+   * launch_halo_unpack issue one kernel per (group, field) covering all four
+   * edges (via an extra grid.z multiplier) instead of one kernel per
+   * (group, field, edge). Same per-cell index arithmetic, same values, same
+   * buffer addresses -- see pack_edge4_kernel/unpack_edge4_kernel in
+   * fv3_gpu_halo_exchange.cu. Default 0 preserves the exact prior launch
+   * sequence. */
+  uint8_t fuse_halo_edges=0;
 };
 
 enum class TileEdge : uint8_t { west, east, south, north };
