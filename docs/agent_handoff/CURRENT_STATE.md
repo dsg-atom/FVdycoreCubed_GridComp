@@ -14,10 +14,42 @@ the previously **entirely absent** omega finalization path
 `adv_pe` → `:1535-1636`) is now implemented on both the host and device sides,
 with `en1/en2/ec1/ec2` **derived** from the already-authoritative B-grid corner
 geometry (proven, not invented — see §4) and `a2b_ord2` **reused** rather than
-rewritten. **Numerical algorithm changed: NO.** Next phase is post-validation
-performance retest / optimization planning; the §6 performance baseline remains
-**STALE — RETEST REQUIRED**._ Read this file first; avoid re-reading older
-milestone handoffs unless a specific open item below requires it.
+rewritten. **Numerical algorithm changed: NO.** The §6 performance baseline has since been
+**RE-ESTABLISHED post-Gate-C2 (Prompt 7, 2026-09-03)**: CUDA resident/transfer
+medians retaken on all three grids, Fortran comparison REUSED (unchanged
+fixture/config), and one bounded nsys profiling pass confirms the
+launch/orchestration-bound classification still holds (17,730 kernel
+launches/dyn_core call; no single kernel >6.3% of kernel time). No
+optimization was performed in that pass. A **CUDA Graphs prototype (Prompt 8,
+2026-09-03) was then attempted and is BLOCKED**: capturing the
+`dgrid_dynamics` stage succeeds mechanically, but a single graph-mode
+dyn_core call diverges numerically from the non-graph call on all 13 exit
+fields, all 6 tiles (wind fields `u`/`v`/`ua`/`va`/`w`/`omga` at max_rel
+≈1.0–2.0, i.e. uncorrelated — far beyond Gate C2 tolerance), and sustained
+replay across benchmark repeats crashes with an illegal memory access in the
+halo-transfer path that corrupts one tile's GPU context for the rest of the
+job. Per the task's own instructions this triggered a STOP (tolerance was not
+loosened) and both permitted autonomous fix cycles were already used on
+unrelated job-script bugs, so no further fix was attempted. Full detail,
+including a suspected (unconfirmed) ~8× timing confound from the job's MPI
+resource configuration: `docs/agent_handoff/prompt_8_cuda_graphs_prototype.md`.
+**Numerical algorithm changed: NO.** Gate C2 itself is unaffected (default,
+non-graph path unchanged; R8 ctest and default smoke both PASS). A **narrow
+kernel-fusion prototype (Prompt 9, 2026-09-03, job 58230026) was then
+attempted and is COMPLETE, unlike Prompt 8**: fusing `c_sw`'s per-level
+`fill2_4corners`+`fill_4corners` corner-fill pair (both directions, opt-in via
+`--fuse-corner-fill`, default off) into one `launch_fill_corner_triplet` call
+produces a `dyn_core_exit` dump **bitwise identical** to the default path on
+all 13 fields × 6 tiles (78/78 IDENTICAL, 0 DIFFERS), with R8 ctest 22/22 PASS
+and default smoke PASS. Performance effect is small and only partly resolved:
+nsys shows kernel launches/call falling 17,730→17,370 (−2.0%) and kernel busy
+time 74.0→73.0 ms/call (−1.4%), both trustworthy but modest since only 2 of
+17,730 launch sites were touched; a raw wall-clock read (~10% resident-time
+drop) is **not** treated as validated — repeat-to-repeat noise in that job was
+comparable to the claimed delta. **Numerical algorithm changed: NO.** Full
+detail: `docs/agent_handoff/prompt_9_kernel_fusion_validation.md`. Read this
+file first; avoid re-reading older milestone handoffs unless a specific open
+item below requires it.
 
 ## 1. Git State
 
@@ -545,8 +577,14 @@ uncommitted Prompt 6B work:
 
 ## 6. Performance Baseline
 
+**STATUS: RE-ESTABLISHED post-Gate-C2 (Prompt 7, 2026-09-03).** Full detail,
+methodology, and the nsys profiling analysis:
+`docs/agent_handoff/prompt_7_post_gate_c2_performance_baseline.md`. Git HEAD
+for this baseline: `191157f` (matches `origin/cuda/gpu-bringup`).
+
 Fortran R8 median `DYN_CORE` ms/call (6 MPI ranks, one per cubed-sphere face,
-Intel/AVX2, Discover `mil` nodes):
+Intel/AVX2, Discover `mil` nodes) — **REUSED**, not remeasured this pass:
+fixture git HEAD/config unchanged, and every Gate C2 fix is CUDA-side only.
 
 | Grid  | ms/call |
 |-------|---------|
@@ -554,32 +592,38 @@ Intel/AVX2, Discover `mil` nodes):
 | 16×16 | 16.704  |
 | 32×32 | 30.261  |
 
-CUDA R8 median ms/call (1 A100, `warpa003`, PRE-VALIDATION):
+CUDA R8 median ms/call (1 A100, `warpa013`, POST-GATE-C2):
 
 | Grid  | resident | transfer-inclusive |
 |-------|----------|---------------------|
-| 8×8   | 28.332   | 29.358              |
-| 16×16 | 29.690   | 30.896              |
-| 32×32 | 28.827   | 31.178              |
+| 8×8   | 29.918   | 30.799              |
+| 16×16 | 28.799   | 28.767              |
+| 32×32 | 26.009   | 28.075              |
 
-Speedup (Fortran ÷ CUDA, resident): 8×8 **0.449×**, 16×16 **0.563×**, 32×32
-**1.050×** — launch/orchestration-latency dominated at these sizes (a 16×
-cell-count increase changes resident cost <2%).
+Speedup (Fortran ÷ CUDA, resident): 8×8 **0.426×**, 16×16 **0.580×**, 32×32
+**1.163×**. Change vs. the old (pre-Gate-C2) baseline, resident: 8×8 **+5.60%**,
+16×16 **−3.00%**, 32×32 **−9.78%** (transfer-inclusive: +4.91%/−6.89%/−9.95%).
+Despite four fidelity fixes (`grid_lonlat` store order, `cv_air`, `n_con`,
+`nf_ke`) plus E11/the heat accumulator/the new corner service/the `omga`
+finalization all adding real per-call GPU work to the default path, resident
+cost did not regress at 16×16/32×32 and rose only 5.6% at 8×8 — consistent
+with (not proof of) the launch-latency-bound regime confirmed by profiling
+below. Old and new runs used different A100 nodes (`warpa003` vs `warpa013`),
+a confound; no stronger causal claim is made.
 
 **Not a normalized hardware-efficiency comparison** (6 CPU ranks vs 1 GPU); no
 CUDA implementation-quality conclusion implied.
 
-**STATUS: STALE — RETEST REQUIRED. This is now the FIRST item of the next
-phase**, since Gate C2 is closed (§7). These numbers predate the fidelity/layout
-fixes. The first eight are opt-in and cannot affect them, but
-**four** now touch the default synthetic path: #9 `grid_lonlat` store order
-(wrong → correct geometry layout), #10 `cv_air`, #11 `n_con` (which derives
-to `npz` there too, since `geos_production_flags()` sets `vtdm4 = 0.01`, so the
-post-loop heating now runs at all ten levels instead of one) and #13 `nf_ke`.
-E11, the heat accumulator, the new corner service, and the `omga` finalization
-(`omega_pem_snapshot` + `omega_finalize` on the `it == n_split` substep) all add
-work as well. **Do not draw any performance conclusion from the table above until
-it is re-taken.**
+**One bounded nsys profiling pass (32×32, resident, job 58226917) confirms the
+launch/orchestration-bound hypothesis still holds**: 17,730 kernel
+launches/dyn_core call, `cudaLaunchKernel` = 90.6% of CUDA API time, no single
+kernel exceeds 6.3% of kernel time, memory-op time ≈2.41 ms/call (91.3% D2D,
+i.e. GPU-side halo traffic, not host transfer) against ≈74 ms/call of kernel
+busy time. `ncu` was judged NOT JUSTIFIED (no kernel individually dominant).
+Top 3 optimization candidates identified (not implemented): kernel
+fusion/batching of the many small repetitive kernels; CUDA Graphs to amortize
+per-launch issue latency; consolidation of the halo/corner-service kernel
+family (~18% of kernel time). **No numerical code was changed.**
 
 ## 7. Current Validation Boundary
 
@@ -625,11 +669,46 @@ GATE C2 CLOSED.** All three acoustic substeps validate at all five in-loop
 boundaries and **all 13 dyn_core-exit fields** validate. There are no remaining
 gaps in this configuration.
 
-**The next task is post-validation performance retest / optimization planning**,
-beginning with re-taking the §6 CUDA timings (STALE — RETEST REQUIRED), then the
-`nsys`/`ncu` profile of the launch-bound inference in milestone 3A.11V §7.2.
-Correctness-first ordering has been satisfied, so performance work is now in
-scope for the first time.
+**Prompt 7 — post-Gate-C2 performance baseline + one bounded nsys profiling
+pass: COMPLETE.** See §6 above and
+`docs/agent_handoff/prompt_7_post_gate_c2_performance_baseline.md` for full
+detail. No optimization was performed (explicitly out of scope for that pass).
+No numerical code was changed.
+
+**Prompt 8 — CUDA Graphs prototype: BLOCKED.** See summary above and
+`docs/agent_handoff/prompt_8_cuda_graphs_prototype.md` for full detail. Do not
+resume graph work without first deciding how to handle its two findings: (1) a
+numerical divergence in a single graph-mode call that needs runtime
+investigation (device-pointer/parameter bindings across the halo-exchange
+boundary are the leading hypothesis, not yet tested), and (2) a suspected
+job-resourcing confound (`--ntasks=1 --cpus-per-task=12` + `mpirun
+--oversubscribe`) that produced ~8× inflated timings for both graph and
+non-graph modes in that pass and may also be implicated in a replay crash.
+**The next task is optimization**, but the recommended path is now either (a)
+resolve the CUDA Graphs correctness defect first if that investigation is
+authorized, or (b) fall back to one of the other two Prompt 7 candidates:
+kernel fusion/batching of the many small repetitive kernels, or
+halo/corner-service kernel-family consolidation (~18% of kernel time). Either
+way, re-establish a clean (properly-resourced) timing baseline before drawing
+conclusions from any run using `perf_rerun_logs/prompt8_graph.sbatch`'s
+resource request.
+
+**Prompt 9 — narrow kernel-fusion prototype: COMPLETE.** See summary above and
+`docs/agent_handoff/prompt_9_kernel_fusion_validation.md` for full detail.
+Fused `c_sw`'s per-level `fill2_4corners`+`fill_4corners` corner-fill pair
+(both directions) into one launch, opt-in via `--fuse-corner-fill` (default
+off, default path unchanged). Correctness: bitwise-identical `dyn_core_exit`
+dump on all 13 fields × 6 tiles, ctest 22/22 PASS. Performance: small
+(−2.0% kernel launches/call, −1.4% kernel busy time/call) — this fusion only
+touched 2 of 17,730 launch-generating call sites, so a small effect is
+expected, not a disappointment. A raw wall-clock read suggested ~10% but was
+**not validated** (comparable to job noise) — do not quote it. This does not
+close the "kernel fusion" optimization candidate from Prompt 7 §6; it
+validates the approach on one small pair. Higher-leverage unfused targets
+identified: `copy_corners_kernel` (1,140 calls/dyn_core-call), the
+halo/corner-service family generally (~18% of kernel time, per Prompt 7),
+`a2b4_global_corner_kernel` (108 calls/call), `pack_edge_kernel` (1,056
+calls/call). **Numerical algorithm changed: NO.**
 
 **Most recent pass — `omga` exit finalization.** Reused the existing 6C
 savepoints (no new fixture run, no new Fortran instrumentation). Scope was the
@@ -766,27 +845,45 @@ committed): `GEOSfvdycore_fortran_perf/experiments/c8_L10_savepoint_6{a,c}_run{1
    ~~E11~~, ~~the `heat_source` accumulation~~, ~~the exit `pkz`/`pe`~~,
    ~~the exit `pt` / `nf_ke`~~, ~~the exit `omga`~~, ~~Gate C2~~ — all **DONE**.
    See §4 and §7.
-2. **RESUME HERE: post-validation performance retest.** Re-take the §6 CUDA
-   timings — they are STALE, and four input-fidelity fixes (#9 `grid_lonlat`,
-   #10 `cv_air`, #11 `n_con`, #13 `nf_ke`) plus E11, the heat accumulator, the
-   new corner service and the `omga` finalization all touch the default synthetic
-   path. Retake Fortran alongside if the fixture is still reproducible, so the
-   comparison stays like-for-like; keep the "6 CPU ranks vs 1 GPU is not a
-   normalized hardware comparison" caveat.
-3. Then the deferred profiling work: an `nsys`/`ncu` profile of the launch-bound
-   inference in milestone 3A.11V §7.2 (a 16× cell-count increase changed resident
-   cost <2%, which is the evidence that these sizes are orchestration-latency
-   dominated). Only after that consider kernel fusion, occupancy, multi-stream,
-   CUDA Graphs, CUDA-aware MPI, or multi-GPU scaling.
-4. Before extending the Gate C2 claim beyond this configuration, close the
+2. ~~Re-establish the CUDA performance baseline after Gate C2, then profile
+   the small-grid launch-bound behavior with nsys before choosing optimization
+   targets~~ — **DONE (Prompt 7)**. See §6 and
+   `prompt_7_post_gate_c2_performance_baseline.md`.
+3. ~~Prototype CUDA Graphs capture for one acoustic substep (32×32 case)~~ —
+   **DONE, BLOCKED (Prompt 8)**. See summary above and
+   `prompt_8_cuda_graphs_prototype.md`. Do not retry without addressing its
+   two findings (numerical divergence on a single graph-mode call; replay
+   instability under sustained repeats).
+4. ~~Prototype kernel fusion for one small repetitive-kernel pair, verify
+   bitwise, then measure~~ — **DONE (Prompt 9)**. See summary above and
+   `prompt_9_kernel_fusion_validation.md`. Fusing `c_sw`'s corner-fill pair
+   validated the approach (bitwise-identical, ctest clean) but only moved the
+   launch count 17,730→17,370/call (−2.0%) — too small a target to call the
+   fusion/batching optimization candidate closed.
+5. **RESUME HERE.** Either (a) investigate the CUDA Graphs numerical/replay
+   defect in `dgrid_dynamics` if the user authorizes continued graph work
+   (start from the leading hypothesis in `prompt_8_cuda_graphs_prototype.md`
+   §4: device-pointer/parameter bindings captured across the halo-exchange
+   boundary), or (b) extend the now-validated fusion approach to a
+   higher-leverage target — `copy_corners_kernel` (1,140 calls/dyn_core-call)
+   or the broader halo/corner-service kernel family (~18% of kernel time) are
+   the largest unfused counts identified so far — or (c) halo/corner-service
+   kernel-family consolidation more broadly. Whichever is chosen, first
+   re-take a clean timing baseline with a properly-resourced Slurm job
+   (Prompt 8's `--ntasks=1`+`--oversubscribe` job produced timings ~8× the
+   Prompt 7 reference and should not be reused as-is; Prompt 9's job was
+   properly resourced but used few enough repeats that its wall-clock read is
+   not conclusive — use more repeats next time before quoting a % speedup).
+6. Before extending the Gate C2 claim beyond this configuration, close the
    recorded gaps in §10 in this order: R4 validation (currently only compiled and
    ctest-clean, never savepoint-compared); `MOIST_CAPPA`/`USE_COND` for any moist
    configuration; the four `a_imp <= 0.999` inert-but-non-authoritative knobs
    (`scale_m`, `m_split`, `delt_max`); `pe`'s unwritten halo ring; the
    un-localized `fv3_dispatch_smoke` Phase C failure at `nf_ke > 1`.
-5. Consider consolidating the ten-plus passes of uncommitted Prompt 6B work
-   into a commit (**only when the user asks** — do not push or merge). This is
-   now a natural commit point: Gate C2 is closed and the tree is ctest-clean.
+7. Consider consolidating the ten-plus passes of uncommitted Prompt 6B/7/8/9
+   work into a commit (**only when the user asks** — do not push or merge).
+   This is now a natural commit point: Gate C2 is closed and the tree is
+   ctest-clean.
 
 Carry forward the ordering that found 13 of 13 input-fidelity root causes:
 **audit input fidelity — values, store order, registration, and *derived* config

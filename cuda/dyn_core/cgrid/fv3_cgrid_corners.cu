@@ -138,6 +138,28 @@ __global__ void fill2_4corners_kernel(CornerFillArgs a,
   }
 }
 
+// Prompt 9 kernel-fusion prototype: fill2_4corners_kernel(q1, q2, dir)
+// immediately followed by fill_4corners_kernel(q3, dir), fused into one
+// launch. Same per-field bodies, same q1 -> q2 -> q3 order, one thread --
+// bit-identical to the two-launch form.
+__global__ void fill_corner_triplet_kernel(CornerFillArgs a,
+                                           FieldView<fv_real, 2> q1,
+                                           FieldView<fv_real, 2> q2,
+                                           FieldView<fv_real, 2> q3,
+                                           int32_t dir) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+
+  if (dir == kCornerFillDirX) {
+    fill_4corners_x(a, q1);
+    fill_4corners_x(a, q2);
+    fill_4corners_x(a, q3);
+  } else if (dir == kCornerFillDirY) {
+    fill_4corners_y(a, q1);
+    fill_4corners_y(a, q2);
+    fill_4corners_y(a, q3);
+  }
+}
+
 }  // namespace
 
 fv3_gpu_status launch_fill_4corners(const CornerFillArgs &a,
@@ -172,6 +194,25 @@ fv3_gpu_status launch_fill2_4corners(const CornerFillArgs &a,
 
   auto cuda_stream = static_cast<cudaStream_t>(stream);
   fill2_4corners_kernel<<<1, 1, 0, cuda_stream>>>(a, q1, q2, dir);
+  if (cudaPeekAtLastError() != cudaSuccess) return FV3_GPU_CUDA_ERROR;
+
+  return FV3_GPU_SUCCESS;
+}
+
+fv3_gpu_status launch_fill_corner_triplet(const CornerFillArgs &a,
+                                          const FieldView<fv_real, 2> &q1,
+                                          const FieldView<fv_real, 2> &q2,
+                                          const FieldView<fv_real, 2> &q3,
+                                          int32_t dir, void *stream) {
+  if (!stream || !q1.data || !q2.data || !q3.data) return FV3_GPU_INVALID_ARGUMENT;
+  if (dir != kCornerFillDirX && dir != kCornerFillDirY)
+    return FV3_GPU_INVALID_ARGUMENT;
+
+  if (!a.sw_corner && !a.se_corner && !a.ne_corner && !a.nw_corner)
+    return FV3_GPU_SUCCESS;
+
+  auto cuda_stream = static_cast<cudaStream_t>(stream);
+  fill_corner_triplet_kernel<<<1, 1, 0, cuda_stream>>>(a, q1, q2, q3, dir);
   if (cudaPeekAtLastError() != cudaSuccess) return FV3_GPU_CUDA_ERROR;
 
   return FV3_GPU_SUCCESS;

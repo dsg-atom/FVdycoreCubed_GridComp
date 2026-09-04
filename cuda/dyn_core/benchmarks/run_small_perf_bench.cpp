@@ -238,6 +238,18 @@ static double g_akap = kAkapUnset;
 static const double kAkapExnerUnset = -1.0;
 static double g_akap_exner = kAkapExnerUnset;
 
+// Prompt 8 (CUDA Graphs prototype). Opt-in only; false is bit-identical to
+// before this flag existed. When true, every tile's context enables
+// dgrid_dynamics graph capture/replay via fv3_gpu_set_cuda_graph_mode
+// immediately after fv3_gpu_create -- see that function's contract.
+static bool g_cuda_graph = false;
+
+// Prompt 9 (kernel-fusion prototype). Opt-in only; false is bit-identical to
+// before this flag existed. When true, c_sw's fill2_4corners(delp,pt,dir) +
+// fill_4corners(w,dir) pair is issued as one launch_fill_corner_triplet call
+// instead of two -- see fv3_cgrid_corners.hpp. Numerical semantics changed: NO.
+static bool g_fuse_corner_fill = false;
+
 // Milestone 3A.11T: pe/peln are registered (i, k, j), NOT (i, j, k).
 //
 // This is the FV3 exception to the usual convention, and it is uniform across
@@ -2063,6 +2075,7 @@ NumericalConfig production_config(const HostState &h) {
                  "stays %.17g\n",
                  g_akap_exner, (double)cfg.akap);
   }
+  cfg.fuse_corner_fill = g_fuse_corner_fill ? 1 : 0;
   cfg.use_sg = 0;
   // Milestone 3A.8: the production first-run d_sw configuration
   // (project_architecture.md). launch_d_sw_cuda rejects anything else before
@@ -2804,6 +2817,13 @@ bool setup(Member &m, int tile, HaloPeerGroup &pg, bool perturb_this_tile) {
     printf("  FAIL: tile %d fv3_gpu_create returned %d: %s\n", tile, m.rc, err.message);
     return false;
   }
+  if (g_cuda_graph) {
+    int grc = fv3_gpu_set_cuda_graph_mode(m.ctx, 1, &err);
+    if (grc != FV3_GPU_SUCCESS) {
+      printf("  FAIL: tile %d fv3_gpu_set_cuda_graph_mode returned %d: %s\n", tile, grc, err.message);
+      return false;
+    }
+  }
 
   // 3A.11V Task 1: the tile index now enters the IC here, at the ONE place that
   // builds the state, and it enters as geometry (which part of the sphere this
@@ -3336,7 +3356,15 @@ void usage() {
         "kappa. The authoritative fixture separates the two because it compiles "
         "MOIST_CAPPA/USE_COND: VALUE = 0.28571426868438721 (single-precision "
         "MAPL_KAPPA) for Exner, 2/7 for the closure; validation-only, "
-        "default off)\n");
+        "default off)\n"
+        "[--cuda-graph]  (Prompt 8: enable CUDA Graph capture/replay for the "
+        "dgrid_dynamics stage only via fv3_gpu_set_cuda_graph_mode; every "
+        "other stage and all six-tile halo communication are unchanged; "
+        "default off)\n"
+        "[--fuse-corner-fill]  (Prompt 9: fuse c_sw's per-level "
+        "fill2_4corners(delp,pt,dir)+fill_4corners(w,dir) into one "
+        "launch_fill_corner_triplet call; bit-identical, launch-count-only "
+        "change; default off)\n");
 }
 
 } // namespace
@@ -3368,6 +3396,8 @@ int main(int argc, char **argv) {
     else if (a == "--damp-n-sponge") g_damp_n_sponge = std::atoi(next(i));
     else if (a == "--akap") g_akap = std::atof(next(i));
     else if (a == "--akap-exner") g_akap_exner = std::atof(next(i));
+    else if (a == "--cuda-graph") g_cuda_graph = true;
+    else if (a == "--fuse-corner-fill") g_fuse_corner_fill = true;
     else if (a == "--help") { usage(); return 0; }
     else { printf("unknown argument: %s\n", a.c_str()); usage(); return 2; }
   }
@@ -3410,10 +3440,10 @@ int main(int argc, char **argv) {
   printf("=== Milestone 3A.11 CUDA perf benchmark ===\n");
   printf("PRE-VALIDATION PERFORMANCE CHARACTERIZATION -- not numerical validation\n");
   printf("grid=%lldx%lld npz=%lld n_split=%d precision=%s warmup=%d iters=%d "
-        "repeats=%d hardware=%s\n",
+        "repeats=%d hardware=%s cuda_graph=%d\n",
         (long long)grid, (long long)grid, (long long)npz, n_split,
         sizeof(fv_real) == 8 ? "R8" : "R4", warmup, iters, repeats,
-        hardware.c_str());
+        hardware.c_str(), g_cuda_graph ? 1 : 0);
   printf("CSVHEADER,implementation,grid_x,grid_y,levels,tiles,n_split,precision,"
         "mode,repeat,elapsed_ms,ms_per_step,hardware\n");
 

@@ -180,6 +180,13 @@ struct NumericalConfig {
   uint8_t use_cond=0, moist_cappa=0, use_logp=0, inline_q=0;
   uint8_t hydrostatic=0, rot3=0, do_f3d=0, do_skeb=0;
   uint8_t use_sg=0, rayleigh_enabled=0, grid_type=0, reserved=0;
+  /* Prompt 9 kernel-fusion prototype, opt-in. When set, c_sw's per-level
+   * fill2_4corners(delp, pt, dir) + fill_4corners(w, dir) pair
+   * (sw_core.F90:206+237, :257+284) is issued as one launch_fill_corner_triplet
+   * call instead of two separate launches. Same statement order, same thread,
+   * bit-identical result -- see fv3_cgrid_corners.hpp. Default 0 preserves the
+   * exact prior launch sequence. */
+  uint8_t fuse_corner_fill=0;
 };
 
 enum class TileEdge : uint8_t { west, east, south, north };

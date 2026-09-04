@@ -185,6 +185,15 @@ int fv3_gpu_dyn_core_step(fv3_gpu_context *, const fv3_gpu_step_desc *, fv3_gpu_
 int fv3_gpu_sync_to_host(fv3_gpu_context *, const fv3_gpu_field_mask *, fv3_gpu_event *, fv3_gpu_error *);
 int fv3_gpu_event_wait(fv3_gpu_context *, fv3_gpu_event, fv3_gpu_error *);
 int fv3_gpu_get_capabilities(fv3_gpu_context *, fv3_gpu_capabilities *);
+/* Prompt 8 (CUDA Graphs prototype). Opt-in only; a context never enables graph
+ * capture unless this is called with enabled != 0. Default execution (this
+ * never called) is unchanged. Must be called before the first
+ * fv3_gpu_dyn_core_step on this context -- capture happens on that stage's
+ * first occurrence. Scope is deliberately narrow: only the dgrid_dynamics
+ * stage is captured/replayed; every other stage and all cross-tile halo
+ * communication run exactly as in default mode. See ContextData's
+ * cuda_graph_enabled field for why this stage was chosen. */
+int fv3_gpu_set_cuda_graph_mode(fv3_gpu_context *, int enabled, fv3_gpu_error *);
 int fv3_gpu_finalize(fv3_gpu_context **, fv3_gpu_error *);
 
 #ifdef __cplusplus

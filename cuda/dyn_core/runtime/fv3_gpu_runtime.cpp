@@ -6,6 +6,7 @@
 #include "fv3_gpu_types.hpp"
 #include "vertical/fv3_vertical_column.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -15,6 +16,7 @@
 #include <limits>
 #include <new>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 #ifdef FV3_GPU_ENABLE_CUDA
@@ -1471,6 +1473,21 @@ extern "C" int fv3_gpu_sync_to_host(fv3_gpu_context *c,const fv3_gpu_field_mask 
   return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,"runtime was built without CUDA");
 #endif
 }
+/* Prompt 8 (CUDA Graphs prototype). Opt-in switch, off by default; see
+ * ContextData::cuda_graph_enabled and fv3_gpu_api.h. Rejects being toggled
+ * mid-lifetime once a graph has already been captured, since a context has no
+ * mechanism to invalidate/re-capture -- callers set this once, right after
+ * fv3_gpu_create, matching the documented "before the first
+ * fv3_gpu_dyn_core_step" contract. */
+extern "C" int fv3_gpu_set_cuda_graph_mode(fv3_gpu_context *c,int enabled,fv3_gpu_error *e){
+  using namespace fv3::gpu; clear_error(e);
+  if(!c)return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"null context");
+  if(c->data.phase==ContextPhase::failed)return fail(e,FV3_GPU_STATE_CONFLICT,__func__,"context has failed");
+  if(c->data.dgrid_dynamics_graph_captured)
+    return fail(e,FV3_GPU_STATE_CONFLICT,__func__,"cannot change graph mode after a graph has been captured");
+  c->data.cuda_graph_enabled=(enabled!=0);
+  return 0;
+}
 extern "C" int fv3_gpu_dyn_core_step(fv3_gpu_context *c,const fv3_gpu_step_desc *s,fv3_gpu_event *ev,fv3_gpu_error *e){
   using namespace fv3::gpu; clear_error(e); if(ev)*ev=0;
   if(!c||!s||!ev||!header_ok(s->abi_version,s->struct_bytes,sizeof(*s)))
@@ -1911,6 +1928,50 @@ extern "C" int fv3_gpu_dyn_core_step(fv3_gpu_context *c,const fv3_gpu_step_desc 
     if(!run(dispatch.cgrid_pressure)) return rc;              // :614
     FV3_GPU_DBG_STAGE("cgrid_pressure");
     if(!resolve(FV3_GPU_H_CWIND)) return rc;                  // :618 -> :640
+#ifdef FV3_GPU_ENABLE_CUDA
+    if(c->data.cuda_graph_enabled){
+      /* Prompt 8. This one stage is bounded on both sides by a cross-thread
+       * halo resolve (H_CWIND above, H_DSCALAR below) and runs entirely on
+       * compute_stream, so thread-local capture is safe here even though
+       * capturing the whole substep is not (see the CUDA Graphs handoff for
+       * why). Captured once; every later occurrence -- every subsequent it in
+       * this call, and every later fv3_gpu_dyn_core_step call -- replays. No
+       * per-call parameter update is needed: dgrid_dynamics's entire
+       * kernel-launch argument set (bounds/options/level-tables/geometry
+       * built from immutable config+topology, and the persistent-residency
+       * device pointers) is invariant across occurrences for a fixed
+       * context. */
+      if(!c->data.dgrid_dynamics_graph_captured){
+        /* Prompt 8 diagnostic only, not a numerical change: report the
+         * one-time capture+instantiate cost so it can be excluded from the
+         * steady-state per-call timing the benchmark reports. */
+        const auto graph_t0=std::chrono::steady_clock::now();
+        cudaStream_t cs=(cudaStream_t)c->data.compute_stream;
+        cudaError_t z=cudaStreamBeginCapture(cs,cudaStreamCaptureModeThreadLocal);
+        if(z!=cudaSuccess) return cuda_fail(z,e,__func__,&c->data);
+        bool ok=run(dispatch.dgrid_dynamics);
+        cudaGraph_t graph=nullptr;
+        cudaError_t ez=cudaStreamEndCapture(cs,&graph);
+        if(!ok){ if(graph) cudaGraphDestroy(graph); return rc; }
+        if(ez!=cudaSuccess) return cuda_fail(ez,e,__func__,&c->data);
+        cudaGraphExec_t exec=nullptr;
+        cudaError_t iz=cudaGraphInstantiate(&exec,graph,0);
+        cudaGraphDestroy(graph);
+        if(iz!=cudaSuccess) return cuda_fail(iz,e,__func__,&c->data);
+        c->data.dgrid_dynamics_graph_exec=exec;
+        c->data.dgrid_dynamics_graph_captured=true;
+        const auto graph_t1=std::chrono::steady_clock::now();
+        const double graph_setup_ms=
+            std::chrono::duration<double,std::milli>(graph_t1-graph_t0).count();
+        std::fprintf(stderr,"[FV3_GPU_GRAPH] capture+instantiate_ms=%.3f pid=%d device=%d\n",
+                     graph_setup_ms,(int)getpid(),(int)c->data.create.device_ordinal);
+      } else {
+        cudaError_t z=cudaGraphLaunch((cudaGraphExec_t)c->data.dgrid_dynamics_graph_exec,
+                                       (cudaStream_t)c->data.compute_stream);
+        if(z!=cudaSuccess) return cuda_fail(z,e,__func__,&c->data);
+      }
+    } else
+#endif
     if(!run(dispatch.dgrid_dynamics)) return rc;              // :700-829
     FV3_GPU_DBG_STAGE("dgrid_dynamics");
 #ifdef FV3_GPU_ENABLE_CUDA
@@ -2097,6 +2158,6 @@ extern "C" int fv3_gpu_get_capabilities(fv3_gpu_context*,fv3_gpu_capabilities *p
   p->precision_mask=(1u<<fv3::gpu::active_precision);p->communication_stage=1;p->feature_mask=0;return 0;}
 extern "C" int fv3_gpu_finalize(fv3_gpu_context **pc,fv3_gpu_error *e){using namespace fv3::gpu;clear_error(e);if(!pc||!*pc)return 0;auto*c=*pc;
 #ifdef FV3_GPU_ENABLE_CUDA
-  cudaSetDevice(c->data.create.device_ordinal);cudaStreamSynchronize((cudaStream_t)c->data.compute_stream);cudaStreamSynchronize((cudaStream_t)c->data.transfer_stream);for(auto &x:c->data.state.fields)cudaFree(x.device);if(c->data.workspace.allocation)cudaFree(c->data.workspace.allocation);if(c->data.heat_accum){cudaFree(c->data.heat_accum);c->data.heat_accum=nullptr;c->data.heat_accum_bytes=0;}if(c->data.event_compute_done)cudaEventDestroy((cudaEvent_t)c->data.event_compute_done);if(c->data.event_transfer_done)cudaEventDestroy((cudaEvent_t)c->data.event_transfer_done);cudaStreamDestroy((cudaStream_t)c->data.compute_stream);cudaStreamDestroy((cudaStream_t)c->data.transfer_stream);
+  cudaSetDevice(c->data.create.device_ordinal);cudaStreamSynchronize((cudaStream_t)c->data.compute_stream);cudaStreamSynchronize((cudaStream_t)c->data.transfer_stream);for(auto &x:c->data.state.fields)cudaFree(x.device);if(c->data.workspace.allocation)cudaFree(c->data.workspace.allocation);if(c->data.heat_accum){cudaFree(c->data.heat_accum);c->data.heat_accum=nullptr;c->data.heat_accum_bytes=0;}if(c->data.event_compute_done)cudaEventDestroy((cudaEvent_t)c->data.event_compute_done);if(c->data.event_transfer_done)cudaEventDestroy((cudaEvent_t)c->data.event_transfer_done);if(c->data.dgrid_dynamics_graph_exec)cudaGraphExecDestroy((cudaGraphExec_t)c->data.dgrid_dynamics_graph_exec);cudaStreamDestroy((cudaStream_t)c->data.compute_stream);cudaStreamDestroy((cudaStream_t)c->data.transfer_stream);
 #endif
   delete c;*pc=nullptr;return 0;}

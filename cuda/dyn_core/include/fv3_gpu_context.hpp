@@ -101,5 +101,26 @@ struct ContextData {
   uint64_t next_event = 1;
   uint64_t last_event = 0;
   ContextPhase phase = ContextPhase::created;
+  /* Prompt 8 (CUDA Graphs prototype). Opt-in only -- default false, so default
+   * execution is provably unchanged (fv3_gpu_set_cuda_graph_mode is the only
+   * writer). When enabled, the single dgrid_dynamics stage call is captured
+   * once, on this tile's own compute_stream, and replayed on every later
+   * occurrence (every subsequent it within this call, and every subsequent
+   * fv3_gpu_dyn_core_step call) rather than re-issued. This stage was chosen
+   * because it is bounded on both sides by a cross-thread halo resolve
+   * (resolve(H_CWIND) before, resolve(H_DSCALAR) after -- see
+   * fv3_gpu_runtime.cpp's per-substep sequence), runs entirely on
+   * compute_stream with no cross-thread stream reference inside it, and its
+   * entire kernel-launch parameter set (bounds, options, level tables,
+   * geometry, and the persistent-residency device pointers) is invariant
+   * across it and across calls for a fixed topology/config -- so replay needs
+   * no per-call parameter update (cudaGraphExecKernelNodeSetParams is not
+   * required). `dgrid_dynamics_graph_exec` is a cudaGraphExec_t stored as
+   * void* so this header stays compilable without the CUDA toolkit, matching
+   * every other stream/event field above. Owned here; destroyed in
+   * fv3_gpu_finalize. */
+  bool cuda_graph_enabled = false;
+  bool dgrid_dynamics_graph_captured = false;
+  void *dgrid_dynamics_graph_exec = nullptr;
 };
 }

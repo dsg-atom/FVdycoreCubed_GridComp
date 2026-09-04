@@ -752,15 +752,25 @@ int launch_cgrid_predictor_v3(const ExecutionContext &context,
     // These are WP-A-local corner algebra on this rank's own halo, so they use
     // the plain WP-A launchers and are NOT routed through
     // context.corner_service (fv3_cgrid_corners.hpp:8-13).
-    rc = launch_fill2_4corners(cf, level_slice(delp_rw, k), level_slice(pt_rw, k),
-                               kCornerFillDirX, stream);
-    if (rc != FV3_GPU_SUCCESS)
-      return fail(error, static_cast<fv3_gpu_status>(rc), __func__,
-                  "failed to enqueue fill2_4corners dir=1 (sw_core.F90:206)");
-    rc = launch_fill_4corners(cf, level_slice(w_rw, k), kCornerFillDirX, stream);
-    if (rc != FV3_GPU_SUCCESS)
-      return fail(error, static_cast<fv3_gpu_status>(rc), __func__,
-                  "failed to enqueue fill_4corners dir=1 (sw_core.F90:237)");
+    if (config.fuse_corner_fill) {
+      // Prompt 9 kernel-fusion prototype: one launch instead of two, same
+      // per-field order (delp, pt, w), bit-identical result.
+      rc = launch_fill_corner_triplet(cf, level_slice(delp_rw, k), level_slice(pt_rw, k),
+                                      level_slice(w_rw, k), kCornerFillDirX, stream);
+      if (rc != FV3_GPU_SUCCESS)
+        return fail(error, static_cast<fv3_gpu_status>(rc), __func__,
+                    "failed to enqueue fill_corner_triplet dir=1 (sw_core.F90:206+237)");
+    } else {
+      rc = launch_fill2_4corners(cf, level_slice(delp_rw, k), level_slice(pt_rw, k),
+                                 kCornerFillDirX, stream);
+      if (rc != FV3_GPU_SUCCESS)
+        return fail(error, static_cast<fv3_gpu_status>(rc), __func__,
+                    "failed to enqueue fill2_4corners dir=1 (sw_core.F90:206)");
+      rc = launch_fill_4corners(cf, level_slice(w_rw, k), kCornerFillDirX, stream);
+      if (rc != FV3_GPU_SUCCESS)
+        return fail(error, static_cast<fv3_gpu_status>(rc), __func__,
+                    "failed to enqueue fill_4corners dir=1 (sw_core.F90:237)");
+    }
 
     // P7 -- x fluxes fx1 / fx / fx2 (sw_core.F90:238-253). Reads the dir = 1
     // corner values that P3/P4 just installed.
@@ -777,15 +787,23 @@ int launch_cgrid_predictor_v3(const ExecutionContext &context,
     // to be split. Also the state in which delp/pt/w LEAVE this stage: c_sw
     // mutates them in place and nothing in dyn_core restores or re-exchanges
     // them, so d_sw and everything after observe the dir = 2 values.
-    rc = launch_fill2_4corners(cf, level_slice(delp_rw, k), level_slice(pt_rw, k),
-                               kCornerFillDirY, stream);
-    if (rc != FV3_GPU_SUCCESS)
-      return fail(error, static_cast<fv3_gpu_status>(rc), __func__,
-                  "failed to enqueue fill2_4corners dir=2 (sw_core.F90:257)");
-    rc = launch_fill_4corners(cf, level_slice(w_rw, k), kCornerFillDirY, stream);
-    if (rc != FV3_GPU_SUCCESS)
-      return fail(error, static_cast<fv3_gpu_status>(rc), __func__,
-                  "failed to enqueue fill_4corners dir=2 (sw_core.F90:284)");
+    if (config.fuse_corner_fill) {
+      rc = launch_fill_corner_triplet(cf, level_slice(delp_rw, k), level_slice(pt_rw, k),
+                                      level_slice(w_rw, k), kCornerFillDirY, stream);
+      if (rc != FV3_GPU_SUCCESS)
+        return fail(error, static_cast<fv3_gpu_status>(rc), __func__,
+                    "failed to enqueue fill_corner_triplet dir=2 (sw_core.F90:257+284)");
+    } else {
+      rc = launch_fill2_4corners(cf, level_slice(delp_rw, k), level_slice(pt_rw, k),
+                                 kCornerFillDirY, stream);
+      if (rc != FV3_GPU_SUCCESS)
+        return fail(error, static_cast<fv3_gpu_status>(rc), __func__,
+                    "failed to enqueue fill2_4corners dir=2 (sw_core.F90:257)");
+      rc = launch_fill_4corners(cf, level_slice(w_rw, k), kCornerFillDirY, stream);
+      if (rc != FV3_GPU_SUCCESS)
+        return fail(error, static_cast<fv3_gpu_status>(rc), __func__,
+                    "failed to enqueue fill_4corners dir=2 (sw_core.F90:284)");
+    }
 
     // P10 -- y fluxes fy1 / fy / fy2 (sw_core.F90:285-300) and
     // P11 -- delpc / ptc / wc        (sw_core.F90:301-309).

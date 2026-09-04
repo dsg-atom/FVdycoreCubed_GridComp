@@ -77,4 +77,18 @@ fv3_gpu_status launch_fill2_4corners(const CornerFillArgs &args,
                                      const FieldView<fv_real, 2> &q2,
                                      int32_t dir, void *stream);
 
+// Prompt 9 kernel-fusion prototype (opt-in, NumericalConfig::fuse_corner_fill).
+// Fuses the c_sw call sequence launch_fill2_4corners(q1, q2, dir) immediately
+// followed by launch_fill_4corners(q3, dir) (sw_core.F90:206+237 / :257+284)
+// into a single single-thread kernel launch, applying the identical
+// fill_4corners_x/y bodies to q1, then q2, then q3 -- the same statement
+// order as the two-launch form, on the same thread, so the result is
+// bit-identical. q1/q2/q3 must not alias each other. Numerical semantics
+// changed: NO -- this only reduces launch count.
+fv3_gpu_status launch_fill_corner_triplet(const CornerFillArgs &args,
+                                          const FieldView<fv_real, 2> &q1,
+                                          const FieldView<fv_real, 2> &q2,
+                                          const FieldView<fv_real, 2> &q3,
+                                          int32_t dir, void *stream);
+
 }  // namespace fv3::gpu::cgrid
