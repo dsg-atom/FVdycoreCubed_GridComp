@@ -122,5 +122,17 @@ struct ContextData {
   bool cuda_graph_enabled = false;
   bool dgrid_dynamics_graph_captured = false;
   void *dgrid_dynamics_graph_exec = nullptr;
+  /* Prompt 13. The ONE host scalar that reaches a captured kernel node by value
+   * and could in principle differ between calls is dgrid_dynamics's dt
+   * (DispatchParams::dt = bdt/n_split, consumed as DSwOptions::dt at
+   * operators/../dgrid/wp_b_dsw_contract_cuda.cpp; everything else the stage
+   * reads is either immutable config/topology or live device memory at a
+   * persistent address). Capture freezes it into every node that takes
+   * DSwOptions by value, so replaying with a different bdt/n_split would
+   * silently integrate with the wrong timestep. Rather than update thousands of
+   * nodes, the capture-time pair is recorded here and replay refuses a
+   * mismatch. */
+  double graph_capture_bdt = 0.0;
+  int32_t graph_capture_n_split = 0;
 };
 }

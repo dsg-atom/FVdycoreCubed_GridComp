@@ -1942,7 +1942,14 @@ extern "C" int fv3_gpu_dyn_core_step(fv3_gpu_context *c,const fv3_gpu_step_desc 
        * kernel-launch argument set (bounds/options/level-tables/geometry
        * built from immutable config+topology, and the persistent-residency
        * device pointers) is invariant across occurrences for a fixed
-       * context. */
+       * context.
+       *
+       * Prompt 13 qualifies that invariance in two ways, neither of which
+       * needs graph-node rewriting. (1) The capture occurrence must itself be
+       * LAUNCHED -- captured work does not execute; that omission was Prompt
+       * 8's numerical divergence, see below. (2) The invariance holds for a
+       * fixed timestep only: dt = bdt/n_split is frozen into the captured
+       * nodes, so replay verifies bdt/n_split rather than assuming them. */
       if(!c->data.dgrid_dynamics_graph_captured){
         /* Prompt 8 diagnostic only, not a numerical change: report the
          * one-time capture+instantiate cost so it can be excluded from the
@@ -1962,12 +1969,52 @@ extern "C" int fv3_gpu_dyn_core_step(fv3_gpu_context *c,const fv3_gpu_step_desc 
         if(iz!=cudaSuccess) return cuda_fail(iz,e,__func__,&c->data);
         c->data.dgrid_dynamics_graph_exec=exec;
         c->data.dgrid_dynamics_graph_captured=true;
+        c->data.graph_capture_bdt=s->bdt;
+        c->data.graph_capture_n_split=n_split;
         const auto graph_t1=std::chrono::steady_clock::now();
         const double graph_setup_ms=
             std::chrono::duration<double,std::milli>(graph_t1-graph_t0).count();
         std::fprintf(stderr,"[FV3_GPU_GRAPH] capture+instantiate_ms=%.3f pid=%d device=%d\n",
                      graph_setup_ms,(int)getpid(),(int)c->data.create.device_ordinal);
+        /* Prompt 13, THE defect Prompt 8 reported as "graph replay diverges
+         * numerically".
+         *
+         * cudaStreamBeginCapture puts the stream in capture mode: everything
+         * enqueued between Begin and EndCapture is RECORDED INTO THE GRAPH AND
+         * NOT EXECUTED. Prompt 8's capture arm ran dgrid_dynamics, ended
+         * capture, instantiated -- and then fell through with no launch, so
+         * this occurrence of the stage did not run at all. The `} else` below
+         * binds the plain non-graph `run(dispatch.dgrid_dynamics)` to
+         * !cuda_graph_enabled only, so nothing else covered for it either.
+         *
+         * The consequence is exactly the symptom Prompt 8 measured: one whole
+         * d_sw substep (transport, divergence/vorticity damping, KE/heat_source
+         * generation) silently dropped on the first substep of the first
+         * dyn_core call per context per benchmark repeat, giving O(1)
+         * uncorrelated wind error (max_rel ~1-2 on u/v/ua/va/w/omga) rather
+         * than the round-off-scale difference a pointer-staleness or
+         * parameter-freezing bug would produce. It also plausibly explains that
+         * pass's later illegal memory access, since the state fed into
+         * subsequent substeps was garbage.
+         *
+         * Launching the freshly instantiated exec here is stream-ordered on
+         * compute_stream, so the cudaStreamWaitEvent that resolve(H_CWIND)
+         * enqueued before capture still orders this work after the halo
+         * transfer, and the stages after it still see it as an ordinary
+         * predecessor on the same stream. */
+        cudaError_t lz=cudaGraphLaunch(exec,cs);
+        if(lz!=cudaSuccess) return cuda_fail(lz,e,__func__,&c->data);
       } else {
+        /* Prompt 13. Capture freezes DSwOptions::dt (= bdt/n_split, computed
+         * once per call above) by value into every captured kernel node, and
+         * that is the ONLY host scalar reaching this stage that a later call
+         * could legitimately change -- see ContextData's graph_capture_* fields
+         * for why the alternative (rewriting node parameters) is not taken.
+         * Refuse rather than silently integrate the captured timestep. */
+        if(c->data.graph_capture_bdt!=s->bdt||c->data.graph_capture_n_split!=n_split)
+          return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,
+                      "cuda graph was captured with a different bdt/n_split; "
+                      "graph mode requires a fixed timestep for the context lifetime");
         cudaError_t z=cudaGraphLaunch((cudaGraphExec_t)c->data.dgrid_dynamics_graph_exec,
                                        (cudaStream_t)c->data.compute_stream);
         if(z!=cudaSuccess) return cuda_fail(z,e,__func__,&c->data);

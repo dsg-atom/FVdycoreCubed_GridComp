@@ -188,45 +188,55 @@ __global__ void a2b4_global_corner_kernel(HorizontalBounds b,
                                            PhysicalCorners c,int64_t levels,
                                            View3<fv_real> q,
                                            View3<fv_real> out,A2BGeometry g){
-  const int64_t n=blockIdx.x*blockDim.x+threadIdx.x;
+  const int64_t n=blockIdx.y;
   if(n>=levels)return;
   const int64_t k=q.lo_k+n,ko=out.lo_k+n;
   constexpr fv_real r3=fv_real(1.0/3.0);
-  if(c.sw){
-    out(b.is,b.js,ko)=r3*(
-      a2b_extrapolate(g.grid_lonlat,g.agrid_lonlat,b.is,b.js,
-                      b.is,b.js,b.is+1,b.js+1,q(b.is,b.js,k),q(b.is+1,b.js+1,k))+
-      a2b_extrapolate(g.grid_lonlat,g.agrid_lonlat,b.is,b.js,
-                      b.is-1,b.js,b.is-2,b.js+1,q(b.is-1,b.js,k),q(b.is-2,b.js+1,k))+
-      a2b_extrapolate(g.grid_lonlat,g.agrid_lonlat,b.is,b.js,
-                      b.is,b.js-1,b.is+1,b.js-2,q(b.is,b.js-1,k),q(b.is+1,b.js-2,k)));
-  }
-  if(c.se){
-    out(b.ie+1,b.js,ko)=r3*(
-      a2b_extrapolate(g.grid_lonlat,g.agrid_lonlat,b.ie+1,b.js,
-                      b.ie,b.js,b.ie-1,b.js+1,q(b.ie,b.js,k),q(b.ie-1,b.js+1,k))+
-      a2b_extrapolate(g.grid_lonlat,g.agrid_lonlat,b.ie+1,b.js,
-                      b.ie,b.js-1,b.ie-1,b.js-2,q(b.ie,b.js-1,k),q(b.ie-1,b.js-2,k))+
-      a2b_extrapolate(g.grid_lonlat,g.agrid_lonlat,b.ie+1,b.js,
-                      b.ie+1,b.js,b.ie+2,b.js+1,q(b.ie+1,b.js,k),q(b.ie+2,b.js+1,k)));
-  }
-  if(c.ne){
-    out(b.ie+1,b.je+1,ko)=r3*(
-      a2b_extrapolate(g.grid_lonlat,g.agrid_lonlat,b.ie+1,b.je+1,
-                      b.ie,b.je,b.ie-1,b.je-1,q(b.ie,b.je,k),q(b.ie-1,b.je-1,k))+
-      a2b_extrapolate(g.grid_lonlat,g.agrid_lonlat,b.ie+1,b.je+1,
-                      b.ie+1,b.je,b.ie+2,b.je-1,q(b.ie+1,b.je,k),q(b.ie+2,b.je-1,k))+
-      a2b_extrapolate(g.grid_lonlat,g.agrid_lonlat,b.ie+1,b.je+1,
-                      b.ie,b.je+1,b.ie-1,b.je+2,q(b.ie,b.je+1,k),q(b.ie-1,b.je+2,k)));
-  }
-  if(c.nw){
-    out(b.is,b.je+1,ko)=r3*(
-      a2b_extrapolate(g.grid_lonlat,g.agrid_lonlat,b.is,b.je+1,
-                      b.is,b.je,b.is+1,b.je-1,q(b.is,b.je,k),q(b.is+1,b.je-1,k))+
-      a2b_extrapolate(g.grid_lonlat,g.agrid_lonlat,b.is,b.je+1,
-                      b.is-1,b.je,b.is-2,b.je-1,q(b.is-1,b.je,k),q(b.is-2,b.je-1,k))+
-      a2b_extrapolate(g.grid_lonlat,g.agrid_lonlat,b.is,b.je+1,
-                      b.is,b.je+1,b.is+1,b.je+2,q(b.is,b.je+1,k),q(b.is+1,b.je+2,k)));
+  switch(blockIdx.x){
+  case 0:
+    if(c.sw){
+      out(b.is,b.js,ko)=r3*(
+        a2b_extrapolate(g.grid_lonlat,g.agrid_lonlat,b.is,b.js,
+                        b.is,b.js,b.is+1,b.js+1,q(b.is,b.js,k),q(b.is+1,b.js+1,k))+
+        a2b_extrapolate(g.grid_lonlat,g.agrid_lonlat,b.is,b.js,
+                        b.is-1,b.js,b.is-2,b.js+1,q(b.is-1,b.js,k),q(b.is-2,b.js+1,k))+
+        a2b_extrapolate(g.grid_lonlat,g.agrid_lonlat,b.is,b.js,
+                        b.is,b.js-1,b.is+1,b.js-2,q(b.is,b.js-1,k),q(b.is+1,b.js-2,k)));
+    }
+    break;
+  case 1:
+    if(c.se){
+      out(b.ie+1,b.js,ko)=r3*(
+        a2b_extrapolate(g.grid_lonlat,g.agrid_lonlat,b.ie+1,b.js,
+                        b.ie,b.js,b.ie-1,b.js+1,q(b.ie,b.js,k),q(b.ie-1,b.js+1,k))+
+        a2b_extrapolate(g.grid_lonlat,g.agrid_lonlat,b.ie+1,b.js,
+                        b.ie,b.js-1,b.ie-1,b.js-2,q(b.ie,b.js-1,k),q(b.ie-1,b.js-2,k))+
+        a2b_extrapolate(g.grid_lonlat,g.agrid_lonlat,b.ie+1,b.js,
+                        b.ie+1,b.js,b.ie+2,b.js+1,q(b.ie+1,b.js,k),q(b.ie+2,b.js+1,k)));
+    }
+    break;
+  case 2:
+    if(c.ne){
+      out(b.ie+1,b.je+1,ko)=r3*(
+        a2b_extrapolate(g.grid_lonlat,g.agrid_lonlat,b.ie+1,b.je+1,
+                        b.ie,b.je,b.ie-1,b.je-1,q(b.ie,b.je,k),q(b.ie-1,b.je-1,k))+
+        a2b_extrapolate(g.grid_lonlat,g.agrid_lonlat,b.ie+1,b.je+1,
+                        b.ie+1,b.je,b.ie+2,b.je-1,q(b.ie+1,b.je,k),q(b.ie+2,b.je-1,k))+
+        a2b_extrapolate(g.grid_lonlat,g.agrid_lonlat,b.ie+1,b.je+1,
+                        b.ie,b.je+1,b.ie-1,b.je+2,q(b.ie,b.je+1,k),q(b.ie-1,b.je+2,k)));
+    }
+    break;
+  case 3:
+    if(c.nw){
+      out(b.is,b.je+1,ko)=r3*(
+        a2b_extrapolate(g.grid_lonlat,g.agrid_lonlat,b.is,b.je+1,
+                        b.is,b.je,b.is+1,b.je-1,q(b.is,b.je,k),q(b.is+1,b.je-1,k))+
+        a2b_extrapolate(g.grid_lonlat,g.agrid_lonlat,b.is,b.je+1,
+                        b.is-1,b.je,b.is-2,b.je-1,q(b.is-1,b.je,k),q(b.is-2,b.je-1,k))+
+        a2b_extrapolate(g.grid_lonlat,g.agrid_lonlat,b.is,b.je+1,
+                        b.is,b.je+1,b.is+1,b.je+2,q(b.is,b.je+1,k),q(b.is+1,b.je+2,k)));
+    }
+    break;
   }
 }
 
@@ -672,7 +682,7 @@ fv3_gpu_status launch_a2b_ord4_global_cuda(
   const cudaStream_t stream=stream_cast(s);
   if(any_corner(c)){
     a2b4_global_corner_kernel<<<
-      (static_cast<uint64_t>(l)+block1-1)/block1,block1,0,stream>>>
+      dim3(4,static_cast<unsigned>(l),1),1,0,stream>>>
       (b,c,l,q,o,g);
     if(last())return FV3_GPU_CUDA_ERROR;
   }
