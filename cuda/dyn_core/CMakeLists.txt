@@ -5,6 +5,13 @@ option(FV3_DYN_CORE_ENABLE_CUDA "Build the CUDA-backed runtime" OFF)
 # Milestone 3A.11: manually-run wall-clock timing tool, not a correctness
 # test -- off by default so it never adds time to the default ctest run.
 option(BUILD_FV3_GPU_PERF_BENCH "Build the 3A.11 small-scale perf benchmark" OFF)
+# Milestone 3A.15: the real cross-process halo transport (one cubed-sphere tile per
+# MPI rank), which the production GEOS/FV3 decomposition (FV_NX=1, FV_NY=6) requires
+# and which the in-process HaloPeerGroup ("Model B") cannot serve. OFF by default so
+# that every existing target -- the 22 ctests and the perf benchmark included --
+# builds and runs exactly as before on a machine with no MPI: with this off, not one
+# MPI symbol, header or compile definition enters any target.
+option(FV3_DYN_CORE_ENABLE_MPI_HALO "Build the cross-process MPI halo transport" OFF)
 set(FV3_DYN_CORE_PRECISION "R8" CACHE STRING "FV precision: R4, R4R8, or R8")
 set_property(CACHE FV3_DYN_CORE_PRECISION PROPERTY STRINGS R4 R4R8 R8)
 
@@ -27,6 +34,11 @@ add_library(fv3_dyn_core_gpu
   runtime/fv3_gpu_contract.cpp
   runtime/fv3_gpu_halo_topology.cpp
   runtime/fv3_damping_translation.cpp
+  # Registry-construction helpers for the Fortran field registry
+  # (cuda/interface/fv3_gpu_field_registry.F90). NOT part of the public ABI:
+  # they exist so the Fortran side can query the one field specification table
+  # and reuse the one damping translation instead of transcribing either.
+  runtime/fv3_gpu_registry_shim.cpp
 )
 target_include_directories(fv3_dyn_core_gpu PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -177,6 +189,31 @@ if(FV3_DYN_CORE_ENABLE_CUDA)
   # above -- fv3_gpu_dyn_core_step calls it directly, and it needs
   # FV3_GPU_ENABLE_CUDA, which is PRIVATE here.
   target_sources(fv3_dyn_core_gpu PRIVATE runtime/fv3_gpu_heat_accumulator.cu)
+  # Milestone 3A.15 §4-§7: the host-staged MPI halo transport. Added to THIS target
+  # rather than to a library of its own for the same two reasons the halo kernels
+  # above are: the runtime calls it (a separate library linking PUBLIC against
+  # fv3_dyn_core_gpu while fv3_dyn_core_gpu called into it would be a dependency
+  # cycle), and it needs FV3_GPU_ENABLE_CUDA, which is PRIVATE here -- the
+  # separate-library attempt recorded above preprocessed every definition away and
+  # linked an empty archive.
+  #
+  # Guarded so the DEFAULT build is byte-for-byte unaffected: with
+  # FV3_DYN_CORE_ENABLE_MPI_HALO off, this source is not compiled, no MPI package is
+  # searched for, and fv3_gpu_attach_mpi_halo_transport still EXISTS but refuses with
+  # FV3_GPU_UNSUPPORTED_CONFIGURATION naming this option -- a diagnosable refusal
+  # instead of an undefined reference.
+  #
+  # MPI is linked PRIVATE because the transport is entirely internal: no MPI type
+  # crosses this project's public ABI (the communicator arrives as its Fortran
+  # INTEGER handle -- see include/fv3_gpu_communication.h). A static library's
+  # PRIVATE link dependencies still reach a consumer's link line as LINK_ONLY, so
+  # the six-rank test links without naming MPI twice.
+  if(FV3_DYN_CORE_ENABLE_MPI_HALO)
+    find_package(MPI REQUIRED COMPONENTS CXX)
+    target_sources(fv3_dyn_core_gpu PRIVATE runtime/fv3_gpu_halo_mpi.cpp)
+    target_compile_definitions(fv3_dyn_core_gpu PRIVATE FV3_DYN_CORE_ENABLE_MPI_HALO=1)
+    target_link_libraries(fv3_dyn_core_gpu PRIVATE MPI::MPI_CXX)
+  endif()
   set_target_properties(fv3_dyn_core_gpu PROPERTIES CUDA_STANDARD 17)
 
   # Milestone 3A.1: production NumericalDispatch (wires WP-A/WP-C/WP-D CUDA
@@ -348,6 +385,35 @@ if(BUILD_TESTING)
       SKIP_RETURN_CODE 77
     )
 
+    # Milestone 3A.15 §11-§13: permanent SIX-RANK MPI halo transport test.
+    # The cross-process counterpart of the multi-tile test above: one tile per MPI
+    # process, exchanged through pack -> host-staged MPI transfer -> unpack, with
+    # every received value decoded back to its originating tile, index and sign.
+    #
+    # Only built when the MPI transport itself is built, and registered with
+    # MPIEXEC so ctest runs it on exactly six ranks -- it refuses any other rank
+    # count, because one rank holds exactly one cubed-sphere tile. It needs a GPU
+    # visible to all six ranks, so like the other integrated tests it reports 77
+    # (SKIP) rather than failing where no device exists.
+    if(FV3_DYN_CORE_ENABLE_MPI_HALO)
+      add_executable(fv3_halo_mpi_transport_test
+                     tests/integration/test_halo_mpi_transport.cu)
+      target_link_libraries(fv3_halo_mpi_transport_test PRIVATE
+        fv3_dyn_core_gpu
+        CUDA::cudart
+        MPI::MPI_CXX
+      )
+      set_target_properties(fv3_halo_mpi_transport_test PROPERTIES CUDA_STANDARD 17)
+      add_test(NAME fv3_halo_mpi_transport
+               COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 6
+                       ${MPIEXEC_PREFLAGS} $<TARGET_FILE:fv3_halo_mpi_transport_test>
+                       ${MPIEXEC_POSTFLAGS})
+      set_tests_properties(fv3_halo_mpi_transport PROPERTIES
+        LABELS "gpu;mpi"
+        SKIP_RETURN_CODE 77
+      )
+    endif()
+
     # Milestone 3A.11T §4: permanent LAYOUT-SENSITIVE pe/peln test.
     # pe and peln are the FV3 axis-order exception -- authoritative FV3 declares
     # pe(is-1:ie+1, npz+1, js-1:je+1), i.e. (i,k,j), while pk/gz/zh/pkc/pk3 in
@@ -388,6 +454,20 @@ if(BUILD_TESTING)
         CUDA::cudart
         Threads::Threads
       )
+      # Milestone 3A.15 SS12: --mpi-halo (six MPI processes, one tile per rank).
+      #
+      # The definition has to be repeated HERE. FV3_DYN_CORE_ENABLE_MPI_HALO=1 is
+      # PRIVATE on fv3_dyn_core_gpu, so it does not reach this translation unit; a
+      # bench compiled without it would preprocess every --mpi-halo line away and
+      # then report "requires a build configured with ...ON" in a build that has it
+      # on. That is the same class of silent-preprocess-away hazard already
+      # recorded at CMakeLists.txt:164-168, so it is guarded explicitly rather
+      # than inherited.
+      if(FV3_DYN_CORE_ENABLE_MPI_HALO)
+        target_compile_definitions(fv3_gpu_perf_bench PRIVATE
+                                   FV3_DYN_CORE_ENABLE_MPI_HALO=1)
+        target_link_libraries(fv3_gpu_perf_bench PRIVATE MPI::MPI_CXX)
+      endif()
     endif()
 
     # Milestone 3A.4 WP-B height-transport CUDA behavior test (requires CUDA and GPU)

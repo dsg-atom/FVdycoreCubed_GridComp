@@ -149,8 +149,54 @@ typedef struct fv3_gpu_capabilities {
   uint64_t feature_mask;
 } fv3_gpu_capabilities;
 
+/* Prompt 14/15 resumption: the production first-run numerical configuration
+ * (dyn_core.F90 namelist/derived values -- hord_*, nord*, akap, akap_exner,
+ * rdgas, grav, m_split, ...). Field names and order mirror
+ * fv3::gpu::NumericalConfig (fv3_gpu_internal.hpp) exactly, one-for-one, so
+ * the runtime's translation is a plain member copy with no reinterpretation.
+ * Before fv3_gpu_set_numerical_config existed, the ONLY way to install this
+ * struct was the internal, non-ABI C++ setter set_numerical_config(), reached
+ * only from benchmark harness code -- there was no public entry point a
+ * Fortran caller (or any other non-C++ caller) could use. This struct and its
+ * setter close that gap; the internal NumericalConfig type itself, and every
+ * numerical formula that reads it, are unchanged. */
+typedef struct fv3_gpu_numerical_config {
+  uint32_t abi_version;
+  uint32_t struct_bytes;
+  double ptop, akap, a_imp, p_fac, scale_m, dz_min;
+  double akap_exner;
+  double rdgas, grav;
+  double beta, d_ext, dddmp, d_con, lim_fac, zvir;
+  double da_min, da_min_c, delt_max;
+  double rayleigh_tau, rayleigh_ztop;
+  int32_t hord_tr, hord_mt, hord_vt, hord_tm, hord_dp;
+  int32_t hord_height, a2b_order;
+  int32_t nord, nord_v, nord_w, nord_t;
+  int32_t nf_ke, n_con, vertical_solver;
+  int32_t m_split;
+  uint8_t use_cond, moist_cappa, use_logp, inline_q;
+  uint8_t hydrostatic, rot3, do_f3d, do_skeb;
+  uint8_t use_sg, rayleigh_enabled, grid_type, reserved0;
+  uint8_t fuse_corner_fill;
+  uint8_t fuse_halo_edges;
+} fv3_gpu_numerical_config;
+
 int fv3_gpu_validate_field(const fv3_gpu_field_desc *, fv3_gpu_error *);
 int fv3_gpu_create(const fv3_gpu_create_desc *, fv3_gpu_context **, fv3_gpu_error *);
+/* Install the production numerical configuration. Must be called after
+ * fv3_gpu_create and before the first fv3_gpu_dyn_core_step; may be called
+ * again later only while no graph has been captured on this context (same
+ * rule fv3_gpu_set_cuda_graph_mode already enforces on the dispatch table).
+ * Returns FV3_GPU_INVALID_ARGUMENT if the header (abi_version/struct_bytes)
+ * does not match this build. */
+int fv3_gpu_set_numerical_config(fv3_gpu_context *, const fv3_gpu_numerical_config *, fv3_gpu_error *);
+/* Install the fixed production stage dispatch table (WP-A/B/C/D kernel
+ * launchers). This table has no caller-supplied parameters -- it is not
+ * configuration, it is which already-validated implementation of each stage
+ * to call, and it is the same table the benchmark installs via
+ * fv3_build_production_dispatch(). Must be called once, after
+ * fv3_gpu_set_numerical_config and before the first fv3_gpu_dyn_core_step. */
+int fv3_gpu_install_production_dispatch(fv3_gpu_context *, fv3_gpu_error *);
 int fv3_gpu_initialize_state(fv3_gpu_context *, const fv3_gpu_state_desc *, fv3_gpu_event *, fv3_gpu_error *);
 int fv3_gpu_sync_from_host(fv3_gpu_context *, const fv3_gpu_field_mask *, fv3_gpu_event *, fv3_gpu_error *);
 /* Milestone 3A.10: supply the cubed-sphere decomposition.

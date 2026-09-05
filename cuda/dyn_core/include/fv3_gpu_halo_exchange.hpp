@@ -171,6 +171,21 @@ FV3_HALO_HD inline constexpr int32_t halo_ring_ordinal(const HaloGroupSpec &s,
   return h - s.ring_begin + 1;
 }
 
+/* Index of a group field by FieldId; -1 if the group does not contain it.
+ * Used to resolve a rotated seam's partner to a slot in the SAME group, which is
+ * the only place a partner can legally live.
+ *
+ * Milestone 3A.15: promoted out of runtime/fv3_gpu_halo_exchange.cu's anonymous
+ * namespace so that a transport backend (the MPI one in particular) resolves the
+ * donor's slot with the SAME function launch_halo_transfer uses. A second copy of
+ * this remap living in a transport would be a silent divergence: it would put the
+ * wrong wind component on a rotated seam and still deliver a plausible number. */
+FV3_HALO_HD inline constexpr int field_slot(const HaloGroupSpec &s, FieldId id) noexcept {
+  for (int n = 0; n < s.field_count; ++n)
+    if (s.fields[n].id == id) return n;
+  return -1;
+}
+
 /* ---------------------------------------------------------------------------
  * GROUP FIELD TABLES
  *

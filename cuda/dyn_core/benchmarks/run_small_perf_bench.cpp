@@ -30,6 +30,18 @@
 // uniform 100 km metrics, so the IC is globally consistent but not balanced).
 #include "fv3_cube_geometry.hpp"
 
+// Milestone 3A.15 SS12: the six-MPI-process mode. Guarded so an MPI-off build of
+// this benchmark is bit-identical to before the flag existed -- the option is
+// OFF by default (cuda/dyn_core/CMakeLists.txt), and with it off neither the MPI
+// header nor a single line below is compiled.
+//
+// The public communication API is included unconditionally because it declares
+// only C types; the MPI header is not.
+#include "fv3_gpu_communication.h"
+#if defined(FV3_DYN_CORE_ENABLE_MPI_HALO)
+#include <mpi.h>
+#endif
+
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -249,6 +261,23 @@ static bool g_cuda_graph = false;
 // fill_4corners(w,dir) pair is issued as one launch_fill_corner_triplet call
 // instead of two -- see fv3_cgrid_corners.hpp. Numerical semantics changed: NO.
 static bool g_fuse_corner_fill = false;
+
+// Milestone 3A.15 SS12: run as SIX SEPARATE MPI PROCESSES, one cubed-sphere tile
+// per rank, exchanging halos through the host-staged MPI transport instead of the
+// in-process HaloPeerGroup. Opt-in only; false is the six-host-thread path
+// unchanged.
+//
+// This is the decomposition real production uses (FV_NX=1, FV_NY=6), and it is the
+// configuration the single-process path could never represent: HaloPeerGroup
+// copies between raw device pointers valid in one address space only.
+//
+// The tile is the rank, +1 for FV3's 1-based tiles -- the identity mapping SS2
+// confirmed against CubeHalo.F90. The transport does not trust that: it gathers
+// the rank->tile map across the communicator and refuses a duplicate or a
+// mismatch with the installed topology.
+static bool g_mpi_halo = false;
+static int g_mpi_rank = 0;   // valid only when g_mpi_halo
+static int g_mpi_tile = 1;   // == g_mpi_rank + 1
 
 // Prompt 11: fuse pack_edge_kernel/unpack_edge_kernel's per-edge loop (4
 // launches/field) into one launch/field covering all four TileEdge values --
@@ -2896,6 +2925,33 @@ bool setup(Member &m, int tile, HaloPeerGroup &pg, bool perturb_this_tile) {
 
   // NOTE the absence of declare_caller_managed_halos(). Nothing here declares a
   // halo ready. If the exchange does not work, this test does not run.
+  //
+  // Milestone 3A.15 SS12: the ONLY difference between the six-thread and the
+  // six-process configurations. Everything above and below -- state, geometry,
+  // config, topology, dispatch -- is identical, which is what makes the SS14
+  // bitwise comparison of the two paths' dyn_core exits a test of the transport
+  // rather than of two different setups.
+#if defined(FV3_DYN_CORE_ENABLE_MPI_HALO)
+  if (g_mpi_halo) {
+    // The communicator crosses the C ABI as its Fortran INTEGER handle; see
+    // fv3_gpu_communication.h for why MPI_Comm itself cannot.
+    const int rc_mpi = fv3_gpu_attach_mpi_halo_transport(
+        m.ctx, MPI_Comm_c2f(MPI_COMM_WORLD), tile, &err);
+    if (rc_mpi != FV3_GPU_SUCCESS) {
+      printf("  FAIL: tile %d fv3_gpu_attach_mpi_halo_transport returned %d: %s\n",
+             tile, rc_mpi, err.message);
+      return false;
+    }
+    if (fv3_gpu_halo_transport_kind_of(m.ctx) !=
+        FV3_GPU_HALO_TRANSPORT_MPI_HOST_STAGED) {
+      // Verified, not assumed: a silent fallback to the in-process transport
+      // would make a six-process run report success while exchanging nothing.
+      printf("  FAIL: tile %d asked for the MPI halo transport but the context "
+             "reports kind %d\n", tile, fv3_gpu_halo_transport_kind_of(m.ctx));
+      return false;
+    }
+  } else
+#endif
   if (attach_halo_peer_group(m.ctx, &pg, tile, &err) != FV3_GPU_SUCCESS) {
     printf("  FAIL: tile %d attach_halo_peer_group: %s\n", tile, err.message);
     return false;
@@ -2917,6 +2973,11 @@ bool setup(Member &m, int tile, HaloPeerGroup &pg, bool perturb_this_tile) {
 void teardown(Member &m) {
   if (!m.ctx) return;
   fv3_gpu_error err{};
+  // Transport-agnostic: this is the same implementation the public
+  // fv3_gpu_detach_halo_transport exposes (fv3_gpu_runtime.cpp:1592-1597), so it
+  // releases whichever transport is attached. No MPI-specific branch is needed,
+  // and none is added -- but note the ordering obligation it inherits: every rank
+  // must be past its last exchange before any rank detaches.
   detach_halo_peer_group(m.ctx, &err);
   fv3_gpu_finalize(&m.ctx, &err);
   m.ctx = nullptr;
@@ -3279,8 +3340,72 @@ bool run_sp0_verify_only() {
   return ok;
 }
 
+#if defined(FV3_DYN_CORE_ENABLE_MPI_HALO)
+/* Milestone 3A.15 SS12: one repeat under the real production decomposition -- this
+ * process owns exactly ONE tile and spawns no threads. The five peers are other
+ * OS processes, and the only thing that couples them is the halo exchange.
+ *
+ * Deliberately a separate function rather than a branch inside run_one_repeat: the
+ * six-thread path's structure (HaloPeerGroup, pg.complete(), std::thread fan-out,
+ * pg.abort_group() on failure, MAX over a local array) has no meaning here, and
+ * interleaving the two would obscure which lines the default path executes.
+ *
+ * FAILURE HANDLING IS MPI_Abort, NOT `return false`. A rank that fails between
+ * exchanges leaves its neighbours blocked in MPI_Waitall forever; there is no
+ * library-level rendezvous to poison the way pg.abort_group() poisons the
+ * in-process one (see MpiHaloTransport::abort_transport, which records exactly
+ * this). Aborting the job is the honest response and it is what makes a failure
+ * visible in a Slurm log instead of a 40-minute timeout. */
+bool run_one_repeat_mpi(int32_t n_split, int warmup, int iters, const char *mode,
+                        int repeat, const char *hardware) {
+  const int tile = g_mpi_tile;
+  phase_e::HaloPeerGroup pg(phase_e::kTiles);  // constructed, never attached
+  phase_e::Member m{};
+  if (!phase_e::setup(m, tile, pg, false)) {
+    printf("  FAIL: rank %d tile %d setup did not complete (repeat %d, mode %s)\n",
+           g_mpi_rank, tile, repeat, mode);
+    fflush(stdout);
+    MPI_Abort(MPI_COMM_WORLD, 1);
+    return false;
+  }
+
+  const double e = (std::strcmp(mode, "resident") == 0)
+                       ? phase_e::run_mode_a(m, n_split, warmup, iters)
+                       : phase_e::run_mode_b(m, n_split, warmup, iters);
+  bool ok = (e >= 0.0);
+  if (ok) ok = phase_e::verify_work_executed(m, tile);
+  if (!ok) {
+    printf("  FAIL: rank %d tile %d repeat %d mode %s did not complete cleanly\n",
+           g_mpi_rank, tile, repeat, mode);
+    fflush(stdout);
+    MPI_Abort(MPI_COMM_WORLD, 1);
+    return false;
+  }
+
+  /* Detach before the reduction, so the collective below cannot be reached by a
+   * rank that is still mid-exchange. */
+  phase_e::teardown(m);
+
+  /* SS9's statistic unchanged in kind: the MAX across the six tiles, which now
+   * needs an allreduce because the six tiles are six processes. */
+  double max_ms = e;
+  MPI_Allreduce(MPI_IN_PLACE, &max_ms, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+  if (g_mpi_rank == 0) {
+    printf("CSV,cuda_gpu_mpi,%lld,%lld,%lld,%d,%s,%s,%d,%.6f,%.6f,%s\n",
+           (long long)NI, (long long)NJ, (long long)NPZ, phase_e::kTiles,
+           sizeof(fv_real) == 8 ? "R8" : "R4", mode, repeat, max_ms,
+           max_ms / (double)iters, hardware);
+  }
+  return true;
+}
+#endif  // FV3_DYN_CORE_ENABLE_MPI_HALO
+
 bool run_one_repeat(int32_t n_split, int warmup, int iters, const char *mode,
                     int repeat, const char *hardware) {
+#if defined(FV3_DYN_CORE_ENABLE_MPI_HALO)
+  if (g_mpi_halo)
+    return run_one_repeat_mpi(n_split, warmup, iters, mode, repeat, hardware);
+#endif
   phase_e::HaloPeerGroup pg(phase_e::kTiles);
   phase_e::Member m[phase_e::kTiles + 1];
   bool setup_ok = true;
@@ -3375,7 +3500,13 @@ void usage() {
         "[--fuse-halo-edges]  (Prompt 11: fuse pack_edge_kernel/"
         "unpack_edge_kernel's per-edge loop (4 launches/field) into one "
         "launch/field covering all four TileEdge values; bit-identical, "
-        "launch-count-only change; default off)\n");
+        "launch-count-only change; default off)\n"
+        "[--mpi-halo]  (Milestone 3A.15: run as SIX SEPARATE MPI PROCESSES, one "
+        "cubed-sphere tile per rank (rank r owns tile r+1), exchanging halos "
+        "through the host-staged MPI transport instead of the in-process "
+        "HaloPeerGroup. This is the real production decomposition (FV_NX=1, "
+        "FV_NY=6). Requires a build with -DFV3_DYN_CORE_ENABLE_MPI_HALO=ON and "
+        "exactly 6 ranks; default off)\n");
 }
 
 } // namespace
@@ -3410,8 +3541,47 @@ int main(int argc, char **argv) {
     else if (a == "--cuda-graph") g_cuda_graph = true;
     else if (a == "--fuse-corner-fill") g_fuse_corner_fill = true;
     else if (a == "--fuse-halo-edges") g_fuse_halo_edges = true;
+    else if (a == "--mpi-halo") g_mpi_halo = true;
     else if (a == "--help") { usage(); return 0; }
     else { printf("unknown argument: %s\n", a.c_str()); usage(); return 2; }
+  }
+
+  // Milestone 3A.15 SS12. MPI is initialized here, by the caller, not by the
+  // transport -- fv3_gpu_attach_mpi_halo_transport documents that the caller owns
+  // MPI_Init/MPI_Finalize, because in the real deployment FV3's Fortran already
+  // owns them and a library that called MPI_Init would be wrong there.
+  if (g_mpi_halo) {
+#if !defined(FV3_DYN_CORE_ENABLE_MPI_HALO)
+    printf("FAIL: --mpi-halo requires a build configured with "
+           "-DFV3_DYN_CORE_ENABLE_MPI_HALO=ON\n");
+    return 2;
+#else
+    if (MPI_Init(&argc, &argv) != MPI_SUCCESS) {
+      printf("FAIL: MPI_Init failed\n");
+      return 2;
+    }
+    int size = 0;
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    MPI_Comm_rank(MPI_COMM_WORLD, &g_mpi_rank);
+    if (size != phase_e::kTiles) {
+      if (g_mpi_rank == 0)
+        printf("FAIL: --mpi-halo needs exactly %d ranks (one cubed-sphere tile "
+               "each); got %d\n", phase_e::kTiles, size);
+      MPI_Finalize();
+      return 2;
+    }
+    g_mpi_tile = g_mpi_rank + 1;
+    // The in-process six-tile paths cannot run here: each of the two below spawns
+    // or loops over all six tiles in ONE process, which is the decomposition
+    // --mpi-halo exists to replace. Refused rather than silently reinterpreted.
+    if (g_sp0_verify_only) {
+      if (g_mpi_rank == 0)
+        printf("FAIL: --sp0-verify-only is an in-process six-tile path and is not "
+               "supported with --mpi-halo\n");
+      MPI_Finalize();
+      return 2;
+    }
+#endif
   }
 
   NI = grid; NJ = grid; NPZ = npz;
@@ -3420,12 +3590,22 @@ int main(int argc, char **argv) {
   caps.abi_version = FV3_GPU_ABI_VERSION;
   caps.struct_bytes = sizeof(caps);
   fv3_gpu_get_capabilities(nullptr, &caps);
-  if (!caps.compiled_with_cuda) {
-    printf("SKIP: not compiled with CUDA\n");
-    return 77;
-  }
-  if (caps.device_count == 0) {
-    printf("SKIP: no CUDA devices available\n");
+  int usable = (caps.compiled_with_cuda && caps.device_count > 0) ? 1 : 0;
+#if defined(FV3_DYN_CORE_ENABLE_MPI_HALO)
+  /* Milestone 3A.15 SS12: the skip decision must be UNANIMOUS. If one rank
+   * returned 77 on its own, the other five would run on and block forever in the
+   * first halo MPI_Waitall against a rank that has already exited -- a hang, not a
+   * skip. MPI_MIN makes any rank's "no device" everybody's skip. */
+  if (g_mpi_halo)
+    MPI_Allreduce(MPI_IN_PLACE, &usable, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+#endif
+  if (!usable) {
+    if (!caps.compiled_with_cuda) printf("SKIP: not compiled with CUDA\n");
+    else if (caps.device_count == 0) printf("SKIP: no CUDA devices available\n");
+    else printf("SKIP: another rank of this run has no usable CUDA device\n");
+#if defined(FV3_DYN_CORE_ENABLE_MPI_HALO)
+    if (g_mpi_halo) MPI_Finalize();
+#endif
     return 77;
   }
 
@@ -3449,6 +3629,9 @@ int main(int argc, char **argv) {
     return ok ? 0 : 1;
   }
 
+  if (g_mpi_halo)
+    printf("=== Milestone 3A.15: SIX-MPI-PROCESS run, rank %d owns tile %d, "
+           "halo transport = host-staged MPI ===\n", g_mpi_rank, g_mpi_tile);
   printf("=== Milestone 3A.11 CUDA perf benchmark ===\n");
   printf("PRE-VALIDATION PERFORMANCE CHARACTERIZATION -- not numerical validation\n");
   printf("grid=%lldx%lld npz=%lld n_split=%d precision=%s warmup=%d iters=%d "
@@ -3473,5 +3656,16 @@ int main(int argc, char **argv) {
 
   printf("\n=== 3A.11 CUDA perf benchmark: %s ===\n", all_ok ? "PASS" : "FAIL");
   printf("Numerical validation against authoritative Fortran savepoints: NOT RUN.\n");
+#if defined(FV3_DYN_CORE_ENABLE_MPI_HALO)
+  /* Every rank is past teardown (run_one_repeat_mpi detaches before its own
+   * reduction), so finalizing here is safe. A rank that failed never reaches this
+   * line -- it called MPI_Abort. */
+  if (g_mpi_halo) {
+    int agreed = all_ok ? 1 : 0;
+    MPI_Allreduce(MPI_IN_PLACE, &agreed, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    all_ok = (agreed != 0);
+    MPI_Finalize();
+  }
+#endif
   return all_ok ? 0 : 1;
 }

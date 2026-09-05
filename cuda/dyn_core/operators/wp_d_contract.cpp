@@ -109,8 +109,21 @@ int bind_wp_d(const ExecutionContext &x, WpDViews &v, OperatorArena &arena,
       covers(v.pe, 0, b.is - 1, b.ie + 1) &&
       covers(v.pe, 2, b.js - 1, b.je + 1) && v.pe.rank == 3 &&
       v.pe.extent[1] >= static_cast<uint64_t>(b.npz) + 1 &&
-      covers(v.peln, 0, b.is - p, b.ie + p) &&
-      covers(v.peln, 2, b.js - p, b.je + p) && v.peln.rank == 3 &&
+      /* peln is required over its AUTHORITATIVE declared box only --
+       * fv_arrays.F90:1474 allocates peln(is:ie, npz+1, js:je), with no halo
+       * ring at all, and dyn_core.F90 declares the dummy the same way. The
+       * previous is-p..ie+p / js-p..je+p requirement was inherited from the
+       * benchmark harness, which allocates peln over the halo-extended box for
+       * its own convenience; it is not a WP-D need. No WP-D operator reads
+       * views.peln (it appears in WpDViews and in this bind only -- grep for
+       * peln under cuda/dyn_core/operators returns nothing else), so narrowing
+       * this cannot unmask an out-of-bounds access. peln's only writer anywhere
+       * in the port is Riem_Solver3's last_call writeback, which writes
+       * is..ie / js..je (fv3_vertical_kernels.cu riem_solver3_kernel bounds).
+       * Prompt 17 standalone integration: real Atm%peln has the Fortran box.
+       * Numerical semantics changed: NO. */
+      covers(v.peln, 0, b.is, b.ie) &&
+      covers(v.peln, 2, b.js, b.je) && v.peln.rank == 3 &&
       v.peln.extent[1] >= static_cast<uint64_t>(b.npz) + 1 &&
       covers_3d(v.pkz, b.is, b.ie, b.js, b.je, b.npz) &&
       covers_3d(v.gz, b.is - p, b.ie + p, b.js - p, b.je + p,

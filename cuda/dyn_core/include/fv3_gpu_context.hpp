@@ -85,6 +85,29 @@ struct ContextData {
   int64_t halo_buffer_elements = 0;
   void *event_halo_pack = nullptr;
   void *event_halo_xfer = nullptr;
+  /* Milestone 3A.15 §3/§10. The transport BACKEND that moves the packed bytes
+   * above between tiles: halo::HaloTransport*, see
+   * include/fv3_gpu_halo_transport.hpp.
+   *
+   * Everything in the exchange except this pointer is transport-independent, so
+   * this is the whole difference between the in-process six-thread Model B run and
+   * a real six-MPI-rank run. `resolve_halo` branches on it and on nothing else --
+   * `halo_peer` above is retained only because the Model B adapter needs the group
+   * it wraps and because diagnostics name it.
+   *
+   * `halo_transport_owned` records whether THIS context must destroy the backend
+   * at detach. It is 1 for the two attach paths that construct the backend
+   * themselves (attach_halo_peer_group, which wraps a caller-owned HaloPeerGroup in
+   * an adapter it allocates; and fv3_gpu_attach_mpi_halo_transport, which
+   * constructs the MPI backend) and 0 when a caller attaches a backend it owns.
+   * Getting this wrong would either leak one adapter per context or free a
+   * caller's object, so it is stored rather than inferred.
+   *
+   * `halo_transport_kind` is the fv3_gpu_halo_transport_kind reported through the
+   * public ABI, kept as a plain integer so this header needs no ABI enum. */
+  void *halo_transport = nullptr;
+  uint8_t halo_transport_owned = 0;
+  uint8_t halo_transport_kind = 0;
   /* Prompt 6B. The dyn_core-level heat_source accumulator of
    * dyn_core.F90:853-861. Device-resident, owned here, allocated lazily on the
    * first dyn_core step that needs it (d_con > 1.0E-5) and reused for the whole

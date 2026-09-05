@@ -195,14 +195,9 @@ __global__ void unpack_edge4_kernel(HaloStripView dst, const fv_real *field_base
       (sign < 0) ? static_cast<fv_real>(-v) : v;
 }
 
-/* Index of a group field by FieldId; -1 if the group does not contain it.
- * Used to resolve a rotated seam's partner to a slot in the SAME group, which is
- * the only place a partner can legally live. */
-inline int field_slot(const HaloGroupSpec &s, FieldId id) noexcept {
-  for (int n = 0; n < s.field_count; ++n)
-    if (s.fields[n].id == id) return n;
-  return -1;
-}
+/* field_slot() used to live here. It is now fv3_gpu_halo_exchange.hpp's, so that
+ * a transport backend resolves a rotated seam's donor slot with the same function
+ * launch_halo_transfer does rather than a second copy of the rule. */
 
 } // namespace
 

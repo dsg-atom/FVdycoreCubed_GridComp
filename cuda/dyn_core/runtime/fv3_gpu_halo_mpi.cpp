@@ -1,0 +1,401 @@
+/* Milestone 3A.15 §4-§7 -- the host-staged MPI halo transport.
+ *
+ * One cubed-sphere tile per MPI rank. This is the transport the real GEOS/FV3
+ * production decomposition needs (FV_NX=1, FV_NY=6: six separate processes), and it
+ * is the piece milestone 3A.10 named as the only one an MPI build has to replace:
+ * "HaloPeerGroup is the only piece an MPI transport replaces"
+ * (milestone_3a10_gpu_halo_exchange.md:955).
+ *
+ * NOTHING NUMERICAL IS DECIDED HERE. Which cells a group exchanges, which ring,
+ * which staggering, which seam rotation, which sign, and -- critically -- which
+ * DONOR SLOT a rotated seam must read all come from fv3_gpu_halo_exchange.hpp and
+ * are shared verbatim with the in-process backend. In particular the partner remap
+ * below calls the same field_slot()/seam_is_reversed() that launch_halo_transfer
+ * calls; a private second copy of that rule is exactly the class of defect this
+ * project has repeatedly found to be invisible downstream (it would put the wrong
+ * wind component on a rotated seam and still deliver a plausible number).
+ *
+ * THE ONE THING THIS FILE ADDS TO THE MODEL B SEQUENCE
+ *
+ * Model B's transfer is a device-to-device read out of the donor's send buffer,
+ * which is possible only because all six tiles are in one address space. Across
+ * processes the bytes have to travel, so per group:
+ *
+ *   1  D2H the whole packed send region on the caller's stream (stream-ordered
+ *      after the pack, which the contract guarantees is already enqueued)
+ *   2  wait for THAT COPY ONLY, on this transport's own event -- not the stream,
+ *      never the device (fv3_gpu_halo_transport.hpp's contract, and
+ *      project_architecture.md's "no hidden device synchronization")
+ *   3  MPI_Irecv x (4 edges * fields), then MPI_Isend x (4 edges * fields),
+ *      then one MPI_Waitall
+ *   4  H2D the whole recv region on the same stream, so the unpack the runtime
+ *      enqueues next is stream-ordered behind it
+ *
+ * Receives are posted before sends so a slow neighbour cannot force the MPI
+ * implementation to buffer an unexpected message the size of a halo group.
+ *
+ * The single host wait in step 2 is the intrinsic cost of host staging ("Stage 1"
+ * of project_architecture.md's Communication Evolution) and the reason Stage 2
+ * (CUDA-aware MPI, handing MPI the device pointers) exists as a later step. It does
+ * not weaken persistent residency: only the packed EDGE buffers cross the bus, never
+ * model state, and no device-resident field is ever round-tripped.
+ *
+ * WHY THE WHOLE REGION MOVES IN ONE COPY, NOT ONE PER SLOT
+ *
+ * Slots are laid out slot_base(g, w, field, edge) = (field*4 + edge) * slot, so a
+ * group's used region is CONTIGUOUS from the buffer base and its length is exactly
+ * group_buffer_elements(). Two bulk copies per group is therefore both correct and
+ * the minimum. (Model B copies per (field, edge) instead because it must gather from
+ * five different donors' buffers; here the peer traffic is MPI's job.)
+ * ------------------------------------------------------------------------- */
+
+#include "fv3_gpu_halo_mpi.hpp"
+
+#include "fv3_gpu_errors.hpp"
+#include "fv3_gpu_halo_topology.hpp"
+#include "fv3_gpu_internal.hpp"
+
+#include <cuda_runtime.h>
+#include <mpi.h>
+
+#include <array>
+#include <cstring>
+#include <new>
+#include <string>
+
+namespace fv3::gpu::halo {
+namespace {
+
+constexpr int kGroups = FV3_GPU_H_GROUP_LAST + 1;
+
+/* One MPI message per (group, edge, field). The tag has to be built from the
+ * SENDER's own (edge, field) and reconstructed by the receiver from the donor's
+ * (edge, field) -- which the receiver knows, because the seam tells it which of the
+ * donor's edges and which of the donor's field slots feeds each of its own slots.
+ *
+ * Max value: ((FV3_GPU_H_GROUP_LAST*4)+3)*max_halo_group_fields+3 = 207, far inside
+ * the MPI_TAG_UB every implementation guarantees (>= 32767). */
+inline int message_tag(uint32_t group, TileEdge edge, int field) noexcept {
+  return (static_cast<int>(group) * 4 + static_cast<int>(edge)) * max_halo_group_fields +
+         field;
+}
+
+inline MPI_Datatype fv_real_datatype() noexcept {
+  return (sizeof(fv_real) == sizeof(double)) ? MPI_DOUBLE : MPI_FLOAT;
+}
+
+class MpiHaloTransport final : public HaloTransport {
+ public:
+  MpiHaloTransport(MPI_Comm comm, int32_t tile, int rank,
+                   const std::array<int32_t, cubed_sphere_tiles> &tile_of_rank) noexcept
+      : comm_(comm), tile_(tile), rank_(rank), tile_of_rank_(tile_of_rank) {
+    layout_.fill(-1);
+  }
+
+  ~MpiHaloTransport() override { release_host_buffers(); }
+
+  const char *name() const noexcept override { return "mpi_host_staged"; }
+
+  bool attach(int32_t tile, const HaloMemberResources &r) noexcept override {
+    if (attached_) {
+      attach_why_ = "this MPI halo transport already has its tile attached; one rank "
+                    "carries exactly one tile in the production decomposition";
+      return false;
+    }
+    if (tile != tile_) {
+      attach_why_ = "the attaching context's tile is not the tile this rank was "
+                    "created for; rank->tile mapping must not differ between the "
+                    "transport and the installed topology";
+      return false;
+    }
+    if (r.buffer_elements <= 0 || !r.transfer_stream) {
+      attach_why_ = "the attaching context supplied no halo buffer size or no "
+                    "transfer stream";
+      return false;
+    }
+    /* Sized ONCE here, for the largest live group, exactly as the device buffers
+     * are -- the transport contract forbids allocating inside an exchange, and a
+     * cudaHostAlloc in the acoustic loop would serialize the device just as a
+     * cudaMalloc would. Pinned rather than ordinary host memory so both bulk copies
+     * are asynchronous DMA rather than a staged pageable copy. */
+    const size_t bytes = static_cast<size_t>(r.buffer_elements) * sizeof(fv_real);
+    if (cudaHostAlloc(reinterpret_cast<void **>(&h_send_), bytes, cudaHostAllocDefault) !=
+            cudaSuccess ||
+        cudaHostAlloc(reinterpret_cast<void **>(&h_recv_), bytes, cudaHostAllocDefault) !=
+            cudaSuccess) {
+      release_host_buffers();
+      attach_why_ = "could not allocate pinned host staging buffers for the MPI halo "
+                    "transport";
+      return false;
+    }
+    /* Zeroed for the same reason the device buffers are (milestone 3A.10 §20): a
+     * group whose field_count is below max_halo_group_fields leaves a slot tail that
+     * is copied but never read, and initcheck is right to call an uninitialized
+     * copy source a defect even when the value is never consumed. Across MPI that
+     * tail is also literally sent, so leaving it undefined would put uninitialized
+     * host memory on the wire. */
+    std::memset(h_send_, 0, bytes);
+    std::memset(h_recv_, 0, bytes);
+    if (cudaEventCreateWithFlags(&ev_d2h_, cudaEventDisableTiming) != cudaSuccess) {
+      release_host_buffers();
+      attach_why_ = "could not create the staging-copy completion event for the MPI "
+                    "halo transport";
+      return false;
+    }
+    elements_ = r.buffer_elements;
+    attached_ = true;
+    return true;
+  }
+
+  void detach(int32_t tile) noexcept override {
+    if (!attached_ || tile != tile_) return;
+    release_host_buffers();
+    attached_ = false;
+    elements_ = 0;
+  }
+
+  const char *attach_failure_reason() const noexcept override { return attach_why_; }
+
+  /* Positional field compaction has to agree across RANKS, not just across threads:
+   * a group's field set is configuration-dependent (cappa only under MOIST_CAPPA,
+   * heat_source only when d_con exceeds its threshold), and two tiles that compacted
+   * it differently would read each other's buffers at the wrong offset and get a
+   * plausible number from the wrong field. One MIN/MAX allreduce pair per group,
+   * cached, is the cheapest real check.
+   *
+   * COLLECTIVE. Every rank reaches it for the same group in the same order because
+   * every rank runs the same dispatch table; a rank that failed locally before
+   * getting here would have failed identically on every rank (the field set is a
+   * function of configuration, not of data). */
+  bool agree_on_layout(uint32_t group, int32_t field_count) noexcept override {
+    if (group >= static_cast<uint32_t>(kGroups)) return false;
+    if (layout_[group] >= 0) return layout_[group] == field_count;
+    int lo = field_count, hi = field_count;
+    if (MPI_Allreduce(MPI_IN_PLACE, &lo, 1, MPI_INT, MPI_MIN, comm_) != MPI_SUCCESS ||
+        MPI_Allreduce(MPI_IN_PLACE, &hi, 1, MPI_INT, MPI_MAX, comm_) != MPI_SUCCESS)
+      return false;
+    if (lo != hi) return false;
+    layout_[group] = field_count;
+    return true;
+  }
+
+  int transfer(const HaloGroupSpec &eff, const HaloGeometry &geom,
+               const TopologyView &topo, const fv_real *send, fv_real *recv,
+               void *stream, fv3_gpu_error *e, const char *api) noexcept override {
+    if (!attached_)
+      return fail(e, FV3_GPU_STATE_CONFLICT, api,
+                  "the MPI halo transport has no attached tile");
+    if (!send || !recv || !stream)
+      return fail(e, FV3_GPU_INVALID_ARGUMENT, api,
+                  "null halo buffer or stream reached the MPI halo transport");
+
+    const int32_t width = halo_ring_count(eff);
+    const int64_t slot = group_slot_elements(geom, width);
+    const int64_t used = group_buffer_elements(eff, geom);
+    if (used > elements_)
+      return fail(e, FV3_GPU_INTERNAL_ERROR, api,
+                  "this halo group needs more buffer than was sized at attach; the "
+                  "attach-time sizing loop must cover every live group");
+
+    const int rc_topo = check_topology_once(topo, api, e);
+    if (rc_topo != FV3_GPU_SUCCESS) return rc_topo;
+
+    auto *cs = static_cast<cudaStream_t>(stream);
+    const size_t used_bytes = static_cast<size_t>(used) * sizeof(fv_real);
+
+    /* 1. D2H, stream-ordered behind the pack the caller already enqueued. */
+    cudaError_t cr = cudaMemcpyAsync(h_send_, send, used_bytes, cudaMemcpyDeviceToHost, cs);
+    if (cr != cudaSuccess)
+      return fail(e, FV3_GPU_CUDA_ERROR, api, cudaGetErrorString(cr), (int)cr);
+    /* 2. Wait for exactly that copy. cudaEventSynchronize on this transport's own
+     *    event is strictly narrower than a stream synchronize and is not a device
+     *    synchronize; unrelated work on the compute stream keeps running. */
+    cr = cudaEventRecord(ev_d2h_, cs);
+    if (cr != cudaSuccess)
+      return fail(e, FV3_GPU_CUDA_ERROR, api, cudaGetErrorString(cr), (int)cr);
+    cr = cudaEventSynchronize(ev_d2h_);
+    if (cr != cudaSuccess)
+      return fail(e, FV3_GPU_CUDA_ERROR, api, cudaGetErrorString(cr), (int)cr);
+
+    /* 3. Point-to-point. Receives first. */
+    const MPI_Datatype dt = fv_real_datatype();
+    std::array<MPI_Request, 2 * 4 * max_halo_group_fields> req{};
+    int nreq = 0;
+
+    for (int q = 0; q < 4; ++q) {
+      const TileEdge mine = static_cast<TileEdge>(q);
+      const EdgeNeighbor &nb = topo.neighbors[q];
+      if (nb.tile < 1 || nb.tile > cubed_sphere_tiles)
+        return fail(e, FV3_GPU_INVALID_ARGUMENT, api,
+                    "edge has no neighbour tile; a connected topology is required "
+                    "before any halo group may be exchanged");
+      if (nb.rank < 0 || nb.rank >= size_)
+        return fail(e, FV3_GPU_INVALID_ARGUMENT, api,
+                    "edge neighbour has no MPI rank in the installed topology; the "
+                    "MPI halo transport cannot infer one");
+      /* Same rule as launch_halo_transfer, from the same functions: on a rotated
+       * seam a vector field reads its PARTNER's slot in this same group. */
+      const bool reversed = seam_is_reversed(mine, nb.edge);
+      for (int n = 0; n < eff.field_count; ++n) {
+        const HaloFieldSpec &fs = eff.fields[n];
+        int sn = n;
+        if (reversed && fs.role != VectorRole::scalar) {
+          sn = field_slot(eff, fs.partner);
+          if (sn < 0)
+            return fail(e, FV3_GPU_INVALID_ARGUMENT, api,
+                        "vector field's seam partner is not a member of its own halo "
+                        "group");
+        }
+        if (MPI_Irecv(h_recv_ + slot_base(geom, width, n, mine),
+                      static_cast<int>(slot), dt, nb.rank,
+                      message_tag(eff.group, nb.edge, sn), comm_,
+                      &req[nreq++]) != MPI_SUCCESS)
+          return fail(e, FV3_GPU_MPI_ERROR, api,
+                      "MPI_Irecv failed while posting a halo edge receive");
+      }
+    }
+    for (int q = 0; q < 4; ++q) {
+      const TileEdge mine = static_cast<TileEdge>(q);
+      const EdgeNeighbor &nb = topo.neighbors[q];
+      for (int n = 0; n < eff.field_count; ++n) {
+        if (MPI_Isend(h_send_ + slot_base(geom, width, n, mine),
+                      static_cast<int>(slot), dt, nb.rank,
+                      message_tag(eff.group, mine, n), comm_,
+                      &req[nreq++]) != MPI_SUCCESS)
+          return fail(e, FV3_GPU_MPI_ERROR, api,
+                      "MPI_Isend failed while posting a halo edge send");
+      }
+    }
+    if (MPI_Waitall(nreq, req.data(), MPI_STATUSES_IGNORE) != MPI_SUCCESS)
+      return fail(e, FV3_GPU_MPI_ERROR, api,
+                  "MPI_Waitall failed while completing a halo group exchange");
+
+    /* 4. H2D on the caller's stream, so the unpack enqueued next sees it. */
+    cr = cudaMemcpyAsync(recv, h_recv_, used_bytes, cudaMemcpyHostToDevice, cs);
+    if (cr != cudaSuccess)
+      return fail(e, FV3_GPU_CUDA_ERROR, api, cudaGetErrorString(cr), (int)cr);
+    return FV3_GPU_SUCCESS;
+  }
+
+  /* Nothing to do: this tile's send buffer was consumed by a D2H that completed
+   * before transfer() returned, and the MPI sends drew from the HOST copy, so no
+   * reader of the device send buffer survives into the next group's pack. Model B
+   * needs its step-5 barrier only because peers read the device buffer directly. */
+  int release_send(void *, fv3_gpu_error *e, const char *) noexcept override {
+    clear_error(e);
+    return FV3_GPU_SUCCESS;
+  }
+
+  /* There is no process-local rendezvous to release. A rank that fails mid-exchange
+   * leaves its neighbours in MPI_Waitall, and no library-level action can fix that
+   * safely -- the caller must MPI_Abort. Recorded here rather than papered over. */
+  void abort_transport() noexcept override {}
+
+ private:
+  void release_host_buffers() noexcept {
+    if (ev_d2h_) { cudaEventDestroy(ev_d2h_); ev_d2h_ = nullptr; }
+    if (h_send_) { cudaFreeHost(h_send_); h_send_ = nullptr; }
+    if (h_recv_) { cudaFreeHost(h_recv_); h_recv_ = nullptr; }
+  }
+
+  /* The topology's rank table and the MPI communicator have to describe the SAME
+   * mapping. If they disagree, every exchange still "succeeds" and simply delivers
+   * one tile's edge into another's halo -- a wrong-donor defect that no tolerance
+   * test can distinguish from a physics difference. Checked once, against the tile
+   * table gathered at creation, rather than assumed. */
+  int check_topology_once(const TopologyView &topo, const char *api,
+                          fv3_gpu_error *e) noexcept {
+    if (topology_checked_) return FV3_GPU_SUCCESS;
+    if (topo.tile != tile_)
+      return fail(e, FV3_GPU_INVALID_ARGUMENT, api,
+                  "the installed topology's tile is not the tile this MPI rank was "
+                  "created for");
+    for (int q = 0; q < 4; ++q) {
+      const EdgeNeighbor &nb = topo.neighbors[q];
+      if (nb.rank < 0 || nb.rank >= size_)
+        return fail(e, FV3_GPU_INVALID_ARGUMENT, api,
+                    "edge neighbour has no MPI rank in the installed topology; the "
+                    "MPI halo transport cannot infer one");
+      if (tile_of_rank_[nb.rank] != nb.tile)
+        return fail(e, FV3_GPU_INVALID_ARGUMENT, api,
+                    "the installed topology says an edge neighbour tile lives on an "
+                    "MPI rank that reported a different tile; a rank<->tile "
+                    "disagreement would silently exchange the wrong tiles' edges");
+    }
+    topology_checked_ = true;
+    return FV3_GPU_SUCCESS;
+  }
+
+  MPI_Comm comm_ = MPI_COMM_NULL;
+  int32_t tile_ = 0;
+  int rank_ = -1;
+  /* Fixed at 6: create_mpi_host_staged_transport refuses any other communicator
+   * size, so this is validated rather than assumed. */
+  int size_ = cubed_sphere_tiles;
+  std::array<int32_t, cubed_sphere_tiles> tile_of_rank_{};
+  std::array<int32_t, kGroups> layout_{};
+  fv_real *h_send_ = nullptr;
+  fv_real *h_recv_ = nullptr;
+  int64_t elements_ = 0;
+  cudaEvent_t ev_d2h_ = nullptr;
+  bool attached_ = false;
+  bool topology_checked_ = false;
+  const char *attach_why_ = "the MPI halo transport refused the attaching tile";
+};
+
+}  // namespace
+
+HaloTransport *create_mpi_host_staged_transport(int comm_fortran_handle, int32_t tile,
+                                               std::string *why) noexcept {
+  const auto refuse = [&](const char *m) -> HaloTransport * {
+    if (why) *why = m;
+    return nullptr;
+  };
+
+  int inited = 0;
+  if (MPI_Initialized(&inited) != MPI_SUCCESS || !inited)
+    return refuse("MPI is not initialized; the caller owns MPI_Init and must call it "
+                  "before attaching the MPI halo transport");
+  if (tile < 1 || tile > cubed_sphere_tiles)
+    return refuse("tile must be a 1-based cubed-sphere tile in 1..6");
+
+  MPI_Comm comm = MPI_Comm_f2c(static_cast<MPI_Fint>(comm_fortran_handle));
+  if (comm == MPI_COMM_NULL)
+    return refuse("the Fortran communicator handle does not name a valid MPI "
+                  "communicator");
+
+  int size = 0, rank = -1;
+  if (MPI_Comm_size(comm, &size) != MPI_SUCCESS ||
+      MPI_Comm_rank(comm, &rank) != MPI_SUCCESS)
+    return refuse("could not query the communicator's size and rank");
+  if (size != cubed_sphere_tiles)
+    return refuse("the halo communicator must have exactly 6 ranks, one per "
+                  "cubed-sphere tile; a different decomposition is not supported by "
+                  "this transport");
+
+  /* Gather the whole rank->tile map instead of assuming rank r holds tile r+1. The
+   * identity mapping IS what the production decomposition produces (§2), but this
+   * transport routes by the topology's rank table, so the map it validates against
+   * must be measured, not presumed. A duplicated or missing tile is refused here
+   * rather than discovered as a wrong-donor halo later. */
+  std::array<int32_t, cubed_sphere_tiles> tiles{};
+  if (MPI_Allgather(&tile, 1, MPI_INT32_T, tiles.data(), 1, MPI_INT32_T, comm) !=
+      MPI_SUCCESS)
+    return refuse("could not gather the rank->tile map across the halo communicator");
+  std::array<int, cubed_sphere_tiles + 1> seen{};
+  for (int r = 0; r < cubed_sphere_tiles; ++r) {
+    if (tiles[r] < 1 || tiles[r] > cubed_sphere_tiles)
+      return refuse("a rank of the halo communicator reported a tile outside 1..6");
+    if (seen[tiles[r]]++)
+      return refuse("two ranks of the halo communicator reported the same tile; each "
+                    "of the six tiles must be held by exactly one rank");
+  }
+
+  auto *t = new (std::nothrow) MpiHaloTransport(comm, tile, rank, tiles);
+  if (!t) return refuse("could not allocate the MPI halo transport");
+  return t;
+}
+
+void destroy_mpi_host_staged_transport(HaloTransport *t) noexcept { delete t; }
+
+}  // namespace fv3::gpu::halo

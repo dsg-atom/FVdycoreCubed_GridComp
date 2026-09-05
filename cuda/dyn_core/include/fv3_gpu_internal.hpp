@@ -16,6 +16,9 @@ inline constexpr uint32_t internal_contract_version = 4;
  * <condition_variable> do not enter every translation unit that needs the
  * contract types. The definition is in include/fv3_gpu_halo_peer.hpp. */
 namespace halo { class HaloPeerGroup; }
+/* Milestone 3A.15: likewise for the transport backend interface, whose definition
+ * is in include/fv3_gpu_halo_transport.hpp. */
+namespace halo { class HaloTransport; }
 
 enum class FieldId : uint32_t {
   invalid=0, u, v, w, delz, pt, delp, q, q_con, cappa, pe, pk, peln,
@@ -444,6 +447,23 @@ int set_topology(fv3_gpu_context *, const TopologyView &, fv3_gpu_error *) noexc
 int attach_halo_peer_group(fv3_gpu_context *, halo::HaloPeerGroup *, int32_t tile,
                            fv3_gpu_error *) noexcept;
 int detach_halo_peer_group(fv3_gpu_context *, fv3_gpu_error *) noexcept;
+/* Milestone 3A.15 §3 -- attach ANY transport backend. This is the general form;
+ * attach_halo_peer_group() is now a thin wrapper that constructs the Model B
+ * adapter and calls this. The validation, the one-time buffer/event allocation and
+ * the "buffers are sized for the largest live group so no exchange ever allocates"
+ * rule are all here and are therefore identical for every transport.
+ *
+ * `owned` = true means THIS context deletes the backend at detach; pass false to
+ * keep ownership. `kind` is the fv3_gpu_halo_transport_kind reported by
+ * fv3_gpu_halo_transport_kind_of(). `api` names the public entry point the caller
+ * invoked, so a refusal is attributed to it rather than to this helper.
+ *
+ * Kept out of fv3_gpu_api.h because a C ABI cannot express a C++ vtable; the two
+ * concrete backends are reached from C through attach_halo_peer_group (C++ callers)
+ * and fv3_gpu_attach_mpi_halo_transport (fv3_gpu_communication.h). */
+int attach_halo_transport(fv3_gpu_context *, halo::HaloTransport *, int32_t tile,
+                          bool owned, uint8_t kind, fv3_gpu_error *,
+                          const char *api) noexcept;
 /* Provenance of a group's most recent readiness, for a harness that must prove no
  * required group was resolved by declaration. Returns HaloResolution::none for an
  * invalid group or a null context. */

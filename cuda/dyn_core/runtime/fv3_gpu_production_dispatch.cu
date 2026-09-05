@@ -207,3 +207,21 @@ int fv3_build_production_dispatch(NumericalDispatch &out, fv3_gpu_error *e) noex
 }
 
 } // namespace fv3::gpu
+
+/* Prompt 14/15 resumption: public ABI counterpart of fv3_build_production_dispatch,
+ * declared in fv3_gpu_api.h. Defined HERE, not in fv3_gpu_runtime.cpp, because this
+ * translation unit (target fv3_production_dispatch) links PUBLIC against
+ * fv3_dyn_core_gpu -- the reverse dependency would be the cycle the CMakeLists.txt
+ * comment above the fv3_production_dispatch target already warns about, and the
+ * linker confirmed it (undefined reference to fv3_build_production_dispatch) when
+ * this was first tried from fv3_gpu_runtime.cpp. set_numerical_dispatch is a
+ * fv3_dyn_core_gpu symbol, reachable here because of that same PUBLIC link. */
+extern "C" int fv3_gpu_install_production_dispatch(fv3_gpu_context *c, fv3_gpu_error *e) {
+  using namespace fv3::gpu;
+  clear_error(e);
+  if (!c) return fail(e, FV3_GPU_INVALID_ARGUMENT, __func__, "null context");
+  NumericalDispatch d{};
+  int rc = fv3_build_production_dispatch(d, e);
+  if (rc != FV3_GPU_SUCCESS) return rc;
+  return set_numerical_dispatch(c, d, e);
+}

@@ -2,7 +2,12 @@
 #include "fv3_gpu_context.hpp"
 #include "fv3_gpu_errors.hpp"
 #include "fv3_gpu_halo_peer.hpp"
+#include "fv3_gpu_halo_transport.hpp"
+#if defined(FV3_DYN_CORE_ENABLE_MPI_HALO) && defined(FV3_GPU_ENABLE_CUDA)
+#include "fv3_gpu_halo_mpi.hpp"
+#endif
 #include "fv3_gpu_halo_topology.hpp"
+#include "fv3_gpu_production_dispatch.hpp"
 #include "fv3_gpu_types.hpp"
 #include "vertical/fv3_vertical_column.hpp"
 #include <algorithm>
@@ -789,18 +794,109 @@ int build_group_fields(const ContextData &d, uint32_t group,
   return FV3_GPU_SUCCESS;
 }
 
-int perform_peer_exchange(ContextData &d, fv3_gpu_halo_group g, fv3_gpu_error *e,
+/* Milestone 3A.15 §3 -- Model B behind the transport interface.
+ *
+ * This is an ADAPTER and deliberately nothing more: every line of it was moved
+ * verbatim out of the exchange below, and HaloPeerGroup itself is unchanged, so the
+ * in-process path is provably the same path it was before the interface existed.
+ * Steps 2/3 (the enqueue-order rendezvous and the device waits on the four donors'
+ * packs) and step 5 (the write-after-read barrier) are what make it a transport;
+ * their justification is in fv3_gpu_halo_peer.hpp and is not repeated here. */
+class PeerHaloTransport final : public halo::HaloTransport {
+ public:
+  explicit PeerHaloTransport(halo::HaloPeerGroup *pg) noexcept : pg_(pg) {}
+
+  const char *name() const noexcept override { return "in-process-peer"; }
+
+  bool attach(int32_t tile, const halo::HaloMemberResources &r) noexcept override {
+    halo::PeerMember m{};
+    m.send = r.send;
+    m.recv = r.recv;
+    m.pack_done = r.pack_done;
+    m.xfer_done = r.xfer_done;
+    m.transfer_stream = r.transfer_stream;
+    return pg_->attach(tile, m);
+  }
+  void detach(int32_t tile) noexcept override { pg_->detach(tile); }
+  bool agree_on_layout(uint32_t group, int32_t field_count) noexcept override {
+    return pg_->agree_on_layout(group, field_count);
+  }
+  void abort_transport() noexcept override { pg_->abort_group(); }
+
+  int transfer(const halo::HaloGroupSpec &eff, const halo::HaloGeometry &geom,
+               const TopologyView &topo, const fv_real *send, fv_real *recv,
+               void *stream, fv3_gpu_error *e, const char *api) noexcept override {
+    (void)send;  /* Model B reads the DONORS' send buffers, not this tile's. */
+    /* 2. Every peer has now ENQUEUED its pack. This is a host rendezvous over
+     *    enqueue order, not a device synchronization: no thread waits for the GPU
+     *    here. It is the same guarantee MPI_Waitall on the sends would give. */
+    if (!pg_->barrier())
+      return fail(e, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                  "the halo peer group is not fully attached; waiting for a member "
+                  "that will never arrive would deadlock, so it is refused");
+
+    /* 3. Wait on the DEVICE for the four donors' packs. Only the four neighbours
+     *    matter, and taking them from the topology rather than from all six keeps
+     *    this honest about who actually feeds this tile. */
+    for (int q = 0; q < 4; ++q) {
+      const int32_t nbt = topo.neighbors[static_cast<size_t>(q)].tile;
+      if (nbt < 1 || nbt > halo::cubed_sphere_tiles)
+        return fail(e, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                    "an edge has no neighbour tile, so its halo cannot be exchanged");
+      void *ev = pg_->member(nbt).pack_done;
+      if (!ev)
+        return fail(e, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                    "a neighbour tile is not attached to the peer group");
+      const cudaError_t crc = cudaStreamWaitEvent(static_cast<cudaStream_t>(stream),
+                                                  static_cast<cudaEvent_t>(ev), 0);
+      if (crc != cudaSuccess)
+        return fail(e, FV3_GPU_CUDA_ERROR, api, cudaGetErrorString(crc), (int)crc);
+    }
+
+    fv_real *send_table[halo::cubed_sphere_tiles + 1];
+    pg_->send_table(send_table);
+    return halo::launch_halo_transfer(eff, geom, topo, send_table, recv, stream, e);
+  }
+
+  int release_send(void *stream, fv3_gpu_error *e, const char *api) noexcept override {
+    /* 5. Nobody may repack into a send buffer that somebody else is still reading.
+     *    My next pack is on my stream; the transfer that reads my buffer is on the
+     *    reader's stream, and nothing orders those two. Without this the next
+     *    group's pack is a write-after-read hazard across streams. */
+    if (!pg_->barrier())
+      return fail(e, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                  "the halo peer group lost a member mid-exchange");
+    for (int t = 1; t <= pg_->tiles(); ++t) {
+      void *ev = pg_->member(static_cast<int32_t>(t)).xfer_done;
+      if (!ev) continue;
+      const cudaError_t crc = cudaStreamWaitEvent(static_cast<cudaStream_t>(stream),
+                                                  static_cast<cudaEvent_t>(ev), 0);
+      if (crc != cudaSuccess)
+        return fail(e, FV3_GPU_CUDA_ERROR, api, cudaGetErrorString(crc), (int)crc);
+    }
+    return FV3_GPU_SUCCESS;
+  }
+
+ private:
+  halo::HaloPeerGroup *pg_ = nullptr;
+};
+
+/* The exchange, transport-independent. The five steps and their ordering are
+ * milestone 3A.10 §10/§17's and are unchanged; steps 2/3 and 5 are now delegated
+ * to the attached backend, which is the ONLY thing that differs between an
+ * in-process six-thread run and a six-MPI-rank run. */
+int perform_halo_exchange(ContextData &d, fv3_gpu_halo_group g, fv3_gpu_error *e,
                           const char *api) {
-  auto *pg = static_cast<halo::HaloPeerGroup *>(d.halo_peer);
+  auto *tr = static_cast<halo::HaloTransport *>(d.halo_transport);
   const uint32_t group = static_cast<uint32_t>(g);
   halo::HaloGroupSpec eff{};
   halo::HaloTileFields fields{};
   int rc = build_group_fields(d, group, eff, fields, e, api);
   if (rc != FV3_GPU_SUCCESS) return rc;
 
-  if (!pg->agree_on_layout(group, eff.field_count))
+  if (!tr->agree_on_layout(group, eff.field_count))
     return fail(e, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
-                std::string("peers disagree on the registered field layout of ") +
+                std::string("halo participants disagree on the registered field layout of ") +
                     halo_group_name(g) +
                     "; slot-indexed buffers would be read at the wrong offset");
 
@@ -824,35 +920,13 @@ int perform_peer_exchange(ContextData &d, fv3_gpu_halo_group g, fv3_gpu_error *e
                         static_cast<cudaStream_t>(d.transfer_stream));
   if (crc != cudaSuccess) return cuda_fail(crc, e, api, &d);
 
-  /* 2. Every peer has now ENQUEUED its pack. This is a host rendezvous over
-   *    enqueue order, not a device synchronization: no thread waits for the GPU
-   *    here. It is the same guarantee MPI_Waitall on the sends would give. */
-  if (!pg->barrier())
-    return fail(e, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
-                "the halo peer group is not fully attached; waiting for a member "
-                "that will never arrive would deadlock, so it is refused");
-
-  /* 3. Wait on the DEVICE for the four donors' packs. Only the four neighbours
-   *    matter, and taking them from the topology rather than from all six keeps
-   *    this honest about who actually feeds this tile. */
-  for (int q = 0; q < 4; ++q) {
-    const int32_t nbt = d.topology.neighbors[static_cast<size_t>(q)].tile;
-    if (nbt < 1 || nbt > halo::cubed_sphere_tiles)
-      return fail(e, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
-                  "an edge has no neighbour tile, so its halo cannot be exchanged");
-    void *ev = pg->member(nbt).pack_done;
-    if (!ev)
-      return fail(e, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
-                  "a neighbour tile is not attached to the peer group");
-    crc = cudaStreamWaitEvent(static_cast<cudaStream_t>(d.transfer_stream),
-                              static_cast<cudaEvent_t>(ev), 0);
-    if (crc != cudaSuccess) return cuda_fail(crc, e, api, &d);
-  }
-
-  fv_real *send_table[halo::cubed_sphere_tiles + 1];
-  pg->send_table(send_table);
-  rc = halo::launch_halo_transfer(eff, geom, d.topology, send_table, d.halo_recv,
-                                  d.transfer_stream, e);
+  /* 2 + 3. TRANSPORT: make the donors' packed bytes readable and fill my recv
+   *    buffer at my own slot addresses. In-process this is a rendezvous over
+   *    enqueue order plus device waits on the four donors' pack events plus a D2D
+   *    copy; over MPI it is a D2H, Isend/Irecv/Waitall and an H2D. Nothing about
+   *    the seam algebra lives on either side of that choice. */
+  rc = tr->transfer(eff, geom, d.topology, d.halo_send, d.halo_recv,
+                    d.transfer_stream, e, api);
   if (rc != FV3_GPU_SUCCESS) return rc;
   rc = halo::launch_halo_unpack(eff, geom, d.topology, fields, d.halo_recv,
                                 d.transfer_stream, e, fuse_halo_edges);
@@ -867,21 +941,11 @@ int perform_peer_exchange(ContextData &d, fv3_gpu_halo_group g, fv3_gpu_error *e
                             static_cast<cudaEvent_t>(d.event_halo_xfer), 0);
   if (crc != cudaSuccess) return cuda_fail(crc, e, api, &d);
 
-  /* 5. Nobody may repack into a send buffer that somebody else is still reading.
-   *    My next pack is on my stream; the transfer that reads my buffer is on the
-   *    reader's stream, and nothing orders those two. Without this the next
-   *    group's pack is a write-after-read hazard across streams. */
-  if (!pg->barrier())
-    return fail(e, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
-                "the halo peer group lost a member mid-exchange");
-  for (int t = 1; t <= pg->tiles(); ++t) {
-    void *ev = pg->member(static_cast<int32_t>(t)).xfer_done;
-    if (!ev) continue;
-    crc = cudaStreamWaitEvent(static_cast<cudaStream_t>(d.transfer_stream),
-                              static_cast<cudaEvent_t>(ev), 0);
-    if (crc != cudaSuccess) return cuda_fail(crc, e, api, &d);
-  }
-  return FV3_GPU_SUCCESS;
+  /* 5. TRANSPORT: nobody may repack into a send buffer that somebody else is still
+   *    reading. In-process that is a cross-stream write-after-read hazard and needs
+   *    a barrier plus device waits; a host-staged backend has already consumed its
+   *    own buffer synchronously and does nothing. */
+  return tr->release_send(d.transfer_stream, e, api);
 }
 #endif  // FV3_GPU_ENABLE_CUDA
 
@@ -908,7 +972,7 @@ int resolve_halo(ContextData &d, fv3_gpu_halo_group g, fv3_gpu_error *e,
   HaloResolution provenance = HaloResolution::none;
   if (klass == HaloTopologyClass::vacuous) {
     provenance = HaloResolution::vacuous_topology;
-  } else if (d.halo_peer != nullptr) {
+  } else if (d.halo_transport != nullptr) {
     /* Milestone 3A.10: the branch that did not exist. A real exchange runs here
      * and readiness is granted only if it completed enqueuing without error, with
      * the consumer stream ordered behind the unpack. This is checked BEFORE the
@@ -916,12 +980,12 @@ int resolve_halo(ContextData &d, fv3_gpu_halo_group g, fv3_gpu_error *e,
      * always the truthful answer, and a caller's claim must not be able to
      * suppress it. */
 #ifdef FV3_GPU_ENABLE_CUDA
-    const int xrc = perform_peer_exchange(d, g, e, api);
+    const int xrc = perform_halo_exchange(d, g, e, api);
     if (xrc != FV3_GPU_SUCCESS) return xrc;
     provenance = HaloResolution::exchanged;
 #else
     return fail(e, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
-                "a halo peer group is attached but this build has no CUDA "
+                "a halo transport is attached but this build has no CUDA "
                 "support, so no exchange can be performed");
 #endif
   } else if (d.halo_caller_managed[slot] != 0) {
@@ -1144,34 +1208,35 @@ int set_topology(fv3_gpu_context *c, const TopologyView &t, fv3_gpu_error *e) no
  * Order matters and is enforced rather than documented: without a topology there
  * is no tile connectivity to size or validate against, and npx/npy == 0 is the
  * contract's "not supplied". */
-int attach_halo_peer_group(fv3_gpu_context *c, halo::HaloPeerGroup *pg, int32_t tile,
-                           fv3_gpu_error *e) noexcept {
+int attach_halo_transport(fv3_gpu_context *c, halo::HaloTransport *tr, int32_t tile,
+                          bool owned, uint8_t kind, fv3_gpu_error *e,
+                          const char *api) noexcept {
   clear_error(e);
-  if (!c) return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"null context");
-  if (!pg) return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"null peer group");
+  if (!c) return fail(e,FV3_GPU_INVALID_ARGUMENT,api,"null context");
+  if (!tr) return fail(e,FV3_GPU_INVALID_ARGUMENT,api,"null halo transport");
   if (c->data.phase==ContextPhase::failed)
-    return fail(e,FV3_GPU_STATE_CONFLICT,__func__,"context has failed");
-  if (c->data.halo_peer)
-    return fail(e,FV3_GPU_STATE_CONFLICT,__func__,
-                "this context is already attached to a halo peer group");
+    return fail(e,FV3_GPU_STATE_CONFLICT,api,"context has failed");
+  if (c->data.halo_transport)
+    return fail(e,FV3_GPU_STATE_CONFLICT,api,
+                "this context is already attached to a halo transport");
   if (tile < 1 || tile > halo::cubed_sphere_tiles)
-    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"tile must be 1..6");
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,api,"tile must be 1..6");
   if (c->data.topology.npx <= 0 || c->data.topology.npy <= 0)
-    return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,
-                "a topology must be installed before attaching to a peer group; "
+    return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,api,
+                "a topology must be installed before attaching a halo transport; "
                 "npx/npy are zero, which the contract defines as not-supplied");
   if (c->data.topology.tile != tile)
-    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,api,
                 "the tile being attached disagrees with TopologyView::tile");
 #ifndef FV3_GPU_ENABLE_CUDA
-  return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,
+  return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,api,
               "a real halo exchange requires a CUDA build");
 #else
   ContextData &d = c->data;
   const halo::HaloGeometry geom = geometry_of(d);
   if (geom.nx <= 0 || geom.ny <= 0 || geom.npz <= 0)
-    return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,
-                "domain bounds must be set before attaching to a peer group");
+    return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,api,
+                "domain bounds must be set before attaching a halo transport");
   int64_t need = 0;
   for (uint32_t g = 1; g <= static_cast<uint32_t>(FV3_GPU_H_GROUP_LAST); ++g) {
     const halo::HaloGroupSpec spec = halo::halo_group_spec(g);
@@ -1180,7 +1245,7 @@ int attach_halo_peer_group(fv3_gpu_context *c, halo::HaloPeerGroup *pg, int32_t 
     if (n > need) need = n;
   }
   if (need <= 0)
-    return fail(e,FV3_GPU_INTERNAL_ERROR,__func__,"no live halo group has a buffer size");
+    return fail(e,FV3_GPU_INTERNAL_ERROR,api,"no live halo group has a buffer size");
 
   void *send=nullptr, *recv=nullptr;
   cudaEvent_t ev_pack=nullptr, ev_xfer=nullptr;
@@ -1209,9 +1274,22 @@ int attach_halo_peer_group(fv3_gpu_context *c, halo::HaloPeerGroup *pg, int32_t 
    * this side does not have -- and because a report that is merely rarer is
    * worse than none: 24587 known-benign records would bury the one that matters.
    * This is a one-time memset outside the acoustic loop, so it costs nothing per
-   * substep and does not touch persistent residency. */
-  if (rc == cudaSuccess) rc = cudaMemset(send, 0, bytes);
-  if (rc == cudaSuccess) rc = cudaMemset(recv, 0, bytes);
+   * substep and does not touch persistent residency.
+   *
+   * 3A.18: enqueued on d.transfer_stream, NOT via plain cudaMemset. A plain
+   * cudaMemset on device memory is asynchronous with respect to the host and is
+   * issued on the LEGACY stream, which does not implicitly synchronize with a
+   * cudaStreamNonBlocking stream -- and d.transfer_stream, the stream every pack /
+   * staging transfer / unpack runs on, is created that way. The clear was therefore
+   * only PROBABLY ordered before the first pack (much host work and two MPI
+   * collectives intervene), never PROVABLY so. Enqueueing it on the same stream as
+   * the pack makes the ordering a stream guarantee at zero cost. The identical
+   * hazard, in the transport TEST's own 0xFF poison memset, was the measured cause
+   * of the intermittent six-rank failure (3A.18: 6 of 12 repeats, whole-slot
+   * POISON-REMAINS) -- see docs/agent_handoff/prompt_18_mpi_transport_determinism.md. */
+  const cudaStream_t clear_stream = static_cast<cudaStream_t>(d.transfer_stream);
+  if (rc == cudaSuccess) rc = cudaMemsetAsync(send, 0, bytes, clear_stream);
+  if (rc == cudaSuccess) rc = cudaMemsetAsync(recv, 0, bytes, clear_stream);
   if (rc == cudaSuccess) rc = cudaEventCreateWithFlags(&ev_pack, cudaEventDisableTiming);
   if (rc == cudaSuccess) rc = cudaEventCreateWithFlags(&ev_xfer, cudaEventDisableTiming);
   if (rc != cudaSuccess) {
@@ -1219,24 +1297,24 @@ int attach_halo_peer_group(fv3_gpu_context *c, halo::HaloPeerGroup *pg, int32_t 
     if (recv) cudaFree(recv);
     if (ev_pack) cudaEventDestroy(ev_pack);
     if (ev_xfer) cudaEventDestroy(ev_xfer);
-    return cuda_fail(rc, e, __func__, &d);
+    return cuda_fail(rc, e, api, &d);
   }
 
-  halo::PeerMember m{};
+  halo::HaloMemberResources m{};
   m.send = static_cast<fv_real*>(send);
   m.recv = static_cast<fv_real*>(recv);
+  m.buffer_elements = need;
   m.pack_done = ev_pack;
   m.xfer_done = ev_xfer;
   m.transfer_stream = d.transfer_stream;
-  if (!pg->attach(tile, m)) {
+  if (!tr->attach(tile, m)) {
     cudaFree(send); cudaFree(recv);
     cudaEventDestroy(ev_pack); cudaEventDestroy(ev_xfer);
-    return fail(e,FV3_GPU_STATE_CONFLICT,__func__,
-                "that tile is already attached to this peer group; a duplicate "
-                "would make the rendezvous count wrong and feed one tile's halo "
-                "from the wrong buffer");
+    return fail(e,FV3_GPU_STATE_CONFLICT,api,tr->attach_failure_reason());
   }
-  d.halo_peer = pg;
+  d.halo_transport = tr;
+  d.halo_transport_owned = owned ? 1 : 0;
+  d.halo_transport_kind = kind;
   d.halo_peer_tile = tile;
   d.halo_send = m.send;
   d.halo_recv = m.recv;
@@ -1247,13 +1325,39 @@ int attach_halo_peer_group(fv3_gpu_context *c, halo::HaloPeerGroup *pg, int32_t 
 #endif
 }
 
+/* Milestone 3A.10's entry point, preserved verbatim in signature and semantics.
+ * It now wraps the caller's HaloPeerGroup in the adapter above -- the adapter is
+ * allocated here and owned by the context, the peer group itself is still BORROWED
+ * -- so every existing caller (the benchmark's Phase E, the dispatch smoke test)
+ * keeps working unchanged and keeps getting exactly the Model B path. */
+int attach_halo_peer_group(fv3_gpu_context *c, halo::HaloPeerGroup *pg, int32_t tile,
+                           fv3_gpu_error *e) noexcept {
+  clear_error(e);
+  if (!c) return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"null context");
+  if (!pg) return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"null peer group");
+#ifndef FV3_GPU_ENABLE_CUDA
+  return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,
+              "a real halo exchange requires a CUDA build");
+#else
+  auto *tr = new (std::nothrow) PeerHaloTransport(pg);
+  if (!tr) return fail(e,FV3_GPU_INTERNAL_ERROR,__func__,
+                       "could not allocate the peer transport adapter");
+  const int rc = attach_halo_transport(
+      c, tr, tile, /*owned=*/true,
+      static_cast<uint8_t>(FV3_GPU_HALO_TRANSPORT_IN_PROCESS_PEER), e, __func__);
+  if (rc != FV3_GPU_SUCCESS) { delete tr; return rc; }
+  c->data.halo_peer = pg;
+  return FV3_GPU_SUCCESS;
+#endif
+}
+
 int detach_halo_peer_group(fv3_gpu_context *c, fv3_gpu_error *e) noexcept {
   clear_error(e);
   if (!c) return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"null context");
   ContextData &d = c->data;
-  if (!d.halo_peer) return FV3_GPU_SUCCESS;
-  auto *pg = static_cast<halo::HaloPeerGroup*>(d.halo_peer);
-  pg->detach(d.halo_peer_tile);
+  if (!d.halo_transport) return FV3_GPU_SUCCESS;
+  auto *tr = static_cast<halo::HaloTransport*>(d.halo_transport);
+  tr->detach(d.halo_peer_tile);
 #ifdef FV3_GPU_ENABLE_CUDA
   /* The peers must be past their last barrier before this frees anything. That is
    * the caller's sequencing obligation -- it is the same obligation MPI_Finalize
@@ -1268,6 +1372,11 @@ int detach_halo_peer_group(fv3_gpu_context *c, fv3_gpu_error *e) noexcept {
   d.halo_send=nullptr; d.halo_recv=nullptr;
   d.event_halo_pack=nullptr; d.event_halo_xfer=nullptr;
   d.halo_buffer_elements=0; d.halo_peer=nullptr; d.halo_peer_tile=0;
+  /* The adapter/backend is destroyed only if this context constructed it. A
+   * caller-supplied transport is left alone, and the HaloPeerGroup a
+   * PeerHaloTransport wraps is never touched either way -- it is borrowed. */
+  if (d.halo_transport_owned) delete tr;
+  d.halo_transport=nullptr; d.halo_transport_owned=0; d.halo_transport_kind=0;
   return FV3_GPU_SUCCESS;
 }
 
@@ -1460,6 +1569,95 @@ extern "C" int fv3_gpu_set_cubed_sphere_topology(fv3_gpu_context *c,int32_t tile
   if(rank_of_tile[tile-1]!=c->data.create.mpi_rank)
     return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"rank_of_tile disagrees with this context's mpi_rank");
   return set_topology(c,t,e);
+}
+/* Prompt 14/15 resumption: the public ABI counterpart of the internal
+ * set_numerical_config()/fv3_build_production_dispatch() pair. Before these
+ * existed, a non-C++ caller (a Fortran ISO_C_BINDING bridge, in particular)
+ * had no way to install either the numerical configuration or the stage
+ * dispatch table -- both were only reachable from benchmark-local C++ code.
+ * The translation below is a plain field-for-field copy: fv3_gpu_numerical_config
+ * mirrors fv3::gpu::NumericalConfig member-for-member, so no value is
+ * reinterpreted or defaulted differently than the internal setter would. */
+extern "C" int fv3_gpu_set_numerical_config(fv3_gpu_context *c,const fv3_gpu_numerical_config *in,fv3_gpu_error *e){
+  using namespace fv3::gpu; clear_error(e);
+  if(!c||!in||!header_ok(in->abi_version,in->struct_bytes,sizeof(*in)))
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"invalid context or numerical config ABI");
+  NumericalConfig cfg{};
+  cfg.ptop=in->ptop; cfg.akap=in->akap; cfg.a_imp=in->a_imp; cfg.p_fac=in->p_fac;
+  cfg.scale_m=in->scale_m; cfg.dz_min=in->dz_min; cfg.akap_exner=in->akap_exner;
+  cfg.rdgas=in->rdgas; cfg.grav=in->grav;
+  cfg.beta=in->beta; cfg.d_ext=in->d_ext; cfg.dddmp=in->dddmp; cfg.d_con=in->d_con;
+  cfg.lim_fac=in->lim_fac; cfg.zvir=in->zvir;
+  cfg.da_min=in->da_min; cfg.da_min_c=in->da_min_c; cfg.delt_max=in->delt_max;
+  cfg.rayleigh_tau=in->rayleigh_tau; cfg.rayleigh_ztop=in->rayleigh_ztop;
+  cfg.hord_tr=in->hord_tr; cfg.hord_mt=in->hord_mt; cfg.hord_vt=in->hord_vt;
+  cfg.hord_tm=in->hord_tm; cfg.hord_dp=in->hord_dp;
+  cfg.hord_height=in->hord_height; cfg.a2b_order=in->a2b_order;
+  cfg.nord=in->nord; cfg.nord_v=in->nord_v; cfg.nord_w=in->nord_w; cfg.nord_t=in->nord_t;
+  cfg.nf_ke=in->nf_ke; cfg.n_con=in->n_con; cfg.vertical_solver=in->vertical_solver;
+  cfg.m_split=in->m_split;
+  cfg.use_cond=in->use_cond; cfg.moist_cappa=in->moist_cappa; cfg.use_logp=in->use_logp;
+  cfg.inline_q=in->inline_q;
+  cfg.hydrostatic=in->hydrostatic; cfg.rot3=in->rot3; cfg.do_f3d=in->do_f3d; cfg.do_skeb=in->do_skeb;
+  cfg.use_sg=in->use_sg; cfg.rayleigh_enabled=in->rayleigh_enabled; cfg.grid_type=in->grid_type;
+  cfg.fuse_corner_fill=in->fuse_corner_fill; cfg.fuse_halo_edges=in->fuse_halo_edges;
+  return set_numerical_config(c,cfg,e);
+}
+/* fv3_gpu_install_production_dispatch is NOT defined here. It must call
+ * fv3_build_production_dispatch(), which lives in the separate
+ * fv3_production_dispatch target (runtime/fv3_gpu_production_dispatch.cu)
+ * specifically BECAUSE that target links PUBLIC against fv3_dyn_core_gpu
+ * (CMakeLists.txt: "kernels belong to fv3_dyn_core_gpu itself ... to avoid
+ * fv3_dyn_core_gpu linking PUBLIC against fv3_dyn_core_gpu while
+ * fv3_dyn_core_gpu called into it would be a dependency cycle"). Defining it
+ * here would require fv3_dyn_core_gpu to call into fv3_production_dispatch,
+ * i.e. exactly that forbidden cycle -- confirmed by the linker
+ * ("undefined reference to fv3::gpu::fv3_build_production_dispatch") when
+ * first tried. The implementation is in fv3_gpu_production_dispatch.cu,
+ * right after fv3_build_production_dispatch itself. */
+/* Milestone 3A.15 §10 -- transport selection across the stable C ABI.
+ *
+ * The communicator crosses as its Fortran INTEGER handle; the reason is in
+ * fv3_gpu_communication.h and is not a stylistic preference: MPI_Comm is an int in
+ * MPICH and an opaque pointer in Open MPI, so it cannot appear in an ABI that
+ * Fortran also calls through.
+ *
+ * When the build is configured without FV3_DYN_CORE_ENABLE_MPI_HALO this still
+ * EXISTS and refuses, rather than being absent. A missing symbol would surface as a
+ * link failure in whatever program happened to reference it; a refusal names the
+ * missing build option in fv3_gpu_error::message. */
+extern "C" int fv3_gpu_attach_mpi_halo_transport(fv3_gpu_context *c,
+                                                 int communicator_fortran_handle,
+                                                 int32_t tile, fv3_gpu_error *e){
+  using namespace fv3::gpu; clear_error(e);
+  if(!c)return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"null context");
+#if !defined(FV3_DYN_CORE_ENABLE_MPI_HALO) || !defined(FV3_GPU_ENABLE_CUDA)
+  (void)communicator_fortran_handle; (void)tile;
+  return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,
+              "this build has no MPI halo transport; configure with "
+              "-DFV3_DYN_CORE_ENABLE_MPI_HALO=ON (and a CUDA build) to enable it");
+#else
+  std::string why;
+  halo::HaloTransport *tr = halo::create_mpi_host_staged_transport(
+      communicator_fortran_handle, tile, &why);
+  if(!tr) return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,why);
+  const int rc = attach_halo_transport(
+      c, tr, tile, /*owned=*/true,
+      static_cast<uint8_t>(FV3_GPU_HALO_TRANSPORT_MPI_HOST_STAGED), e, __func__);
+  if(rc != FV3_GPU_SUCCESS){ halo::destroy_mpi_host_staged_transport(tr); return rc; }
+  return FV3_GPU_SUCCESS;
+#endif
+}
+extern "C" int fv3_gpu_detach_halo_transport(fv3_gpu_context *c, fv3_gpu_error *e){
+  using namespace fv3::gpu;
+  /* One implementation, two names: detach_halo_peer_group already released
+   * whatever transport is attached, because the buffers and events it frees are
+   * transport-independent. */
+  return detach_halo_peer_group(c, e);
+}
+extern "C" int fv3_gpu_halo_transport_kind_of(const fv3_gpu_context *c){
+  if(!c || !c->data.halo_transport) return FV3_GPU_HALO_TRANSPORT_NONE;
+  return static_cast<int>(c->data.halo_transport_kind);
 }
 extern "C" int fv3_gpu_sync_to_host(fv3_gpu_context *c,const fv3_gpu_field_mask *m,fv3_gpu_event *ev,fv3_gpu_error *e){
   using namespace fv3::gpu; clear_error(e); if(ev)*ev=0; if(!c||!ev)return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"null context or event"); int rc=validate_mask(m,e,__func__);if(rc)return rc; if(c->data.phase!=ContextPhase::initialized)return fail(e,FV3_GPU_STATE_CONFLICT,__func__,"context is not initialized");

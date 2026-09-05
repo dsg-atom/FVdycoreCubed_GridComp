@@ -1,6 +1,71 @@
 # Current Project State
 
-_Last regenerated from Git + handoffs on 2026-08-31 (§1/§4/§5/§6/§7/§8/§9/§10
+_Last updated 2026-09-04 for **Prompt 19 (longer standalone validation)**:
+§7/§9/§10 and this lead paragraph. **Prompt 19 is COMPLETE: PASS.** Two-stage
+validation ladder, same c8/npz=10/n_split=3/R8/6-rank configuration
+throughout, same executable/allocation per backend, no new validation
+framework (reused `p17_both.sbatch`'s mechanics and
+`tools/savepoints/compare_dcx_backends.py` unchanged). **Stage A** extended
+`k_split=1` from 6 to **72 dyn_core calls** (`JOB_SGMT` 3 days): entry call 1
+BITWISE identical on all 13 primary state fields (6/6 ranks); every sampled
+exit checkpoint (calls 1/6/18/36/54/72) ROUND-OFF SCALE or SMALL NUMERICAL
+DIFFERENCE with **zero SIGNIFICANT differences**; worst discrepancy `w`
+max_rel=5.116168e-11 at call 72; all fields FLAT or SUBLINEAR growth, no
+acceleration. **Stage B** used **k_split=2** — the smallest value that
+exercises `fv_dynamics.F90`'s `do n_map=1,k_split` loop more than once per
+heartbeat, confirmed unambiguous directly from `fv3.j:373-374` (hard-stop
+condition 2 did not trigger) — over 6 heartbeats = **12 dyn_core calls**
+(job 58246786, both backends rc=0, savepoints reach `it12` on both sides).
+Comparison at entry call 1 (BITWISE, 6/6 ranks), entry call 3 (the first
+dyn_core entry immediately after the first heartbeat's remap step — **no
+anomalous jump**, all fields ROUND-OFF/SMALL, worst `w` max_rel=2.69e-11),
+and exit calls 1/2/6/12 (all ROUND-OFF/SMALL, **zero SIGNIFICANT**, worst `w`
+max_rel=3.527908e-11 at call 6 — smaller than Stage A's 72-call worst,
+consistent with call-count-driven accumulation rather than a k_split-specific
+effect). `delp` positivity explicitly re-checked at call 12: min
+9957.5868/9962.5076 Pa, identical on both backends, 6/6 ranks. The recurring
+`mfxL`/`mfyL`/`cxL`/`cyL` pre-first-write flux-capacitor anomaly (benign,
+established in Prompt 17/18) reproduces identically in both stages and never
+recurs at any exit checkpoint. **Zero of the 3 permitted integration fixes
+were needed — no source code was modified.** Hard-stop condition (5), "both
+Stage A and Stage B pass," is the terminal state reached; no escalation to
+Opus. No CTest rerun performed (no source changed); the Prompt 18 record
+(24/24 MPI transport, Intel MPI 5/5, R8 CTest 23/23) stands unchanged by
+inference. Full detail:
+`docs/agent_handoff/prompt_19_longer_standalone_validation.md`. Next
+validation envelope: R4 savepoint comparison (still only compiled/ctest-clean,
+never savepoint-compared), then wider grids, then k_split values matching the
+real production heartbeat/physics cadence beyond this minimal k_split=2
+probe.
+
+Before that, last updated 2026-09-04 for **Prompt 18 (six-rank MPI halo transport
+determinism)**: §1/§7/§9 item 16b/§10 and the new Prompt 18 lead paragraph
+below, plus three inline premise corrections inside the Prompt 17 "NEW OPEN
+DEFECT" block. **Prompt 18 is COMPLETE and it CLOSES the last blocker on longer
+standalone validation**: the intermittent `fv3_halo_mpi_transport` failure was a
+CUDA stream-ordering defect in the TEST HARNESS (not the transport, not an MPI
+contract violation, not an OpenMPI bug), is fixed, and the transport now passes
+**24/24 consecutive OpenMPI runs** at 16692 checks / 0 failures, with Intel MPI
+5/5 PASS (was 5/5 FAIL) and R8 CTest 23/23. Read that paragraph first if you are
+resuming; §9 item 17 is the new RESUME HERE. Before that, last updated
+2026-09-04 for **Prompt 16 (standalone CUDA integration,
+resumed)**: §1/§9/§10 and the lead paragraph immediately below. **Prompt 16 is
+PARTIAL: the public C ABI is now complete and verified, but a second,
+distinct halo-ownership ambiguity was found at the real `fv_dynamics.F90`
+call site and the pass ESCALATES on it** — see the new lead paragraph just
+below and §9 item 16. This does not reopen Prompt 15 (still CLOSED) or Gate
+C2 (still CLOSED); it is a new, narrower blocker one layer up the call stack,
+outside anything any prior prompt had read. Before that, last updated
+2026-09-04 for **Prompt 15 (cross-process MPI halo transport)**:
+§1/§3/§4/§5/§7/§8/§9/§10 and the lead paragraph immediately below. **Prompt 15
+is COMPLETE and it CLOSES Prompt 14's blocker.** Before that, last updated
+2026-09-04 for **Prompt 14 (standalone CUDA production
+integration attempt)**: §1/§9/§10 and this summary, plus this new lead
+paragraph. **Prompt 14 is BLOCKED/ESCALATED, not completed** — see the next
+paragraph. Before that, last updated 2026-09-04 for **Prompt 13
+(architecture-level optimization — CUDA Graph replay repair)**:
+§1/§6/§8/§9/§10 and this summary. Previously
+regenerated from Git + handoffs on 2026-08-31 (§1/§4/§5/§6/§7/§8/§9/§10
 updated for the Prompt 6B **`omga` exit finalization** pass). Result: **the
 dyn_core exit `omga` now VALIDATES at SMALL NUMERICAL DIFFERENCE on all six
 tiles** (worst max_abs 4.875354e-14, guarded max_rel 1.505773e-12, rms
@@ -47,9 +112,536 @@ time 74.0→73.0 ms/call (−1.4%), both trustworthy but modest since only 2 of
 17,730 launch sites were touched; a raw wall-clock read (~10% resident-time
 drop) is **not** treated as validated — repeat-to-repeat noise in that job was
 comparable to the claimed delta. **Numerical algorithm changed: NO.** Full
-detail: `docs/agent_handoff/prompt_9_kernel_fusion_validation.md`. Read this
-file first; avoid re-reading older milestone handoffs unless a specific open
-item below requires it.
+detail: `docs/agent_handoff/prompt_9_kernel_fusion_validation.md`. Prompt 9's
+own handoff was then committed (with the Prompt 6B `omga` work and Prompts 7/8)
+in `b456897` ("Close Gate C2 and add initial CUDA launch optimizations") —
+this was **not** authored by an agent pass; it landed on the tree between
+sessions and was found and reconciled, not created, by Prompt 10 below. A
+**`copy_corners_kernel` batching characterization (Prompt 10, 2026-09-04) was
+then attempted and concluded NO IMPLEMENTATION IS WARRANTED**: all four
+batching dimensions the task specified (tile-batching, same-field/direction
+merge, cross-field merge, adjacent-call fusion) were ruled out by direct
+source reading — either they require a runtime/topology redesign (six tiles
+run as independent concurrent host threads with no shared launch surface) or
+they cross a real, source-proven producer/consumer dependency (every
+`dir=1`/`dir=2` corner-rotation pair at every loop site is separated by a
+consumer kernel that reads the `dir=1` rotation before `dir=2` overwrites the
+same cells). One narrower, safe-in-principle lever was found (merging the
+outer per-`nord` corner calls in `del6_vt_flux`/`deln_flux_pass`, since
+different `nord` passes touch disjoint vertical levels) but its ceiling is
+only ≈180 of 17,730 total launches (≈1.0%) — below Prompt 9's own measured
+noise floor — so it was not implemented. **No code was changed; no
+Slurm job was run.** Full detail:
+`docs/agent_handoff/prompt_10_copy_corners_batching.md`. A **pack/unpack
+halo-edge fusion (Prompt 11, 2026-09-04, jobs 58238397/58238413) was then
+attempted and is COMPLETE, with a real measured improvement, unlike Prompt
+9's small effect**: `pack_edge_kernel`/`unpack_edge_kernel` already batch
+level/along-position/ring-depth in their grid; the one remaining unbatched
+axis was the 4-edge loop, and (unlike Prompt 10's `copy_corners` dir=1/dir=2
+case) each edge's send/recv slot is disjoint with no producer/consumer
+dependency between edges, so fusing all 4 edges into one launch/`(group,
+field)` — opt-in via `--fuse-halo-edges`, new `pack_edge4_kernel`/
+`unpack_edge4_kernel` in `fv3_gpu_halo_exchange.cu`, default off — is provably
+safe reordering. Produces a `dyn_core_exit` dump **bitwise identical** to the
+default path on all 13 fields × 6 tiles (78/78 IDENTICAL, 0 DIFFERS), same for
+the combination with Prompt 9's `--fuse-corner-fill`, with R8 ctest PASS and
+both default/optimized smoke PASS. Measured whole-dyn_core-call kernel
+launches 17,730→16,074 (**−9.34%**), kernel busy time 74.0→67.44 ms/call
+(**−8.86%**), and a reproducible 32×32/R8 resident wall-clock improvement of
+**−20.28%** (29.20→23.28 ms/call median of 5 repeats, spread ≤0.33 ms —
+comfortably above the noise floor that made Prompt 9's wall-clock claim
+unusable). Combining both fusions measured very slightly slower than
+`--fuse-halo-edges` alone (23.86 vs 23.28 ms/call) — recorded, not chased
+further; still bitwise identical. **Numerical algorithm changed: NO.** Full
+detail: `docs/agent_handoff/prompt_11_next_launch_target.md`. An
+**`a2b4_global_corner_kernel` compute-efficiency tuning pass (Prompt 12,
+2026-09-04, job 58238626) was then attempted and is COMPLETE, at MODERATE
+value**: the pre-optimization kernel launched exactly 1 CUDA block of 128
+threads (only 10 active, one A100 SM of 108 used) and serialized up to 4
+physical-corner branches per active thread, each issuing 3
+`a2b_extrapolate` calls (6 `a2b_great_circle` transcendental evaluations) —
+up to 24 serialized evaluations per thread when all 4 corners are active.
+Restructured the launch to `dim3(4, levels, 1)` with 1 thread/block
+(`blockIdx.x` selects corner via `switch`, `blockIdx.y` selects level,
+mirroring the codebase's own `grid1(n,levels)` idiom), spreading the 4
+corners across independently-schedulable blocks with **unchanged per-corner
+formula and summation order** — bitwise-identical by construction. Section 2
+ncu profiling (`--kernel-name a2b4_global_corner_kernel`, both before/after)
+returned `ERR_NVGPUCTRPERM` (GPU performance-counter access denied to this
+account on this Discover allocation) — a **confirmed platform permission
+constraint**, not a flag error; the Section 3 bottleneck classification
+(SERIAL/LOW-PARALLELISM primary, OCCUPANCY-BOUND secondary) is therefore
+source-reading inference, not ncu-measured. Validated `dyn_core_exit` dump
+**156/156 IDENTICAL** (13 fields × 6 tiles × {default, `--fuse-halo-edges`}),
+R8 ctest 22/22 PASS (both before/after builds), both smokes PASS. Measured
+32×32/R8/resident whole-dyn_core-call improvement: 22.743409→22.255549
+ms/call (**−2.15%**, MODERATE per the task's own ≥3%/1–3%/<1% buckets).
+**Numerical algorithm changed: NO.** Terminal recommendation: further local
+compute-tuning on this one kernel is not justified without ncu access; next
+optimization step should be either requesting GPU performance-counter
+permission from NCCS, or shifting to kernel-time/occupancy tuning of the
+individually more expensive `riem_solver3_kernel`/`riem_solver_c_kernel`
+(explicitly deferred architectural work). CUDA Graphs remained explicitly
+out of scope for this pass. Full detail:
+`docs/agent_handoff/prompt_12_a2b4_kernel_tuning.md`. An
+**architecture-level optimization pass (Prompt 13, 2026-09-04, job 58238910)
+was then run and is COMPLETE — it SUPERSEDES Prompt 8's BLOCKED CUDA Graphs
+status**: the two candidate directions (A, repair CUDA Graph replay safety for
+a bounded capture region; B, reduce host launch/orchestration overhead by
+explicit stage/tile batching without graphs) were both studied from source,
+and **A was found to be a LOCAL defect, not a graph-semantics problem**. Root
+cause, verified directly in `fv3_gpu_runtime.cpp`: **the Prompt 8 capture arm
+never launched what it captured.** Stream-captured work is *recorded, not
+executed*; the arm did BeginCapture → run → EndCapture → Instantiate with no
+`cudaGraphLaunch`, and the `} else` bound the fallback non-captured
+`run(dispatch.dgrid_dynamics)` to non-graph mode only — so one entire `d_sw`
+substep (transport, divergence/vorticity damping, KE/`heat_source`
+generation) was silently dropped on the first substep of the first
+`fv3_gpu_dyn_core_step` per context per repeat. That exactly explains Prompt
+8's O(1) *uncorrelated* wind divergence (max_rel ≈1.0–2.0) without any
+device-pointer/parameter-binding hypothesis; graph-node parameter updates
+required were affirmatively measured as **ZERO**. Fixed with ~15 lines across
+2 files (capture arm now launches the freshly instantiated exec, plus a
+capture-time `bdt`/`n_split` invariance guard for the one by-value scalar,
+`DSwOptions::dt`); capture region unchanged (`dgrid_dynamics` only, halo
+exchange **not** captured). Validated: `dyn_core_exit` dump **78/78 fields ×
+tiles BITWISE IDENTICAL** to the non-graph path at 1 call (the capture
+occurrence — precisely what Prompt 8 got wrong) and again at 5 calls (1
+capture + 14 replays/tile); a 600-call / 1,800-substep / 1,770-replay stress
+ran clean with **no illegal memory access** (Prompt 8's replay crash did not
+reproduce); R8 ctest 22/22 PASS; default, graph, and graph+`--fuse-halo-edges`
+smokes PASS. Measured 32×32/R8/resident (same job, same node, same binary
+±`--cuda-graph`): 21.660791 → **20.546787 ms/call (−5.14%)**, with whole-call
+`cudaLaunchKernel` count 16,182 → **11,067/call (−31.6%)**. **Numerical
+algorithm changed: NO**; graph mode stays opt-in (`--cuda-graph`, default
+off). The pass's most consequential *finding* is negative and forward-looking:
+**−31.6% launches bought only −5.14% wall clock**, breaking the
+launch-latency model that fit Prompts 7 and 11 to 87–92%, and
+`cudaStreamSynchronize` total time rose 0.44 → 135.5 ms — the workload has
+crossed from **host-launch-bound to GPU-execution-bound**, which retires
+Direction B's expected value (its −35.3% launch reduction would now be worth
+~5%, not ~30%). Full detail:
+`docs/agent_handoff/prompt_13_architectural_optimization.md`. Read
+`CURRENT_STATE.md` first; avoid re-reading older milestone handoffs unless a
+specific open item below requires it.
+
+**Prompt 18 (2026-09-04) — six-rank MPI halo transport determinism: COMPLETE.
+The intermittent `fv3_halo_mpi_transport` failure is ROOT-CAUSED, FIXED, and the
+transport is now DETERMINISTIC at 24/24 consecutive OpenMPI runs. This CLOSES
+§9 item 16b and LIFTS the gate on longer standalone validation.** Full detail:
+`docs/agent_handoff/prompt_18_mpi_transport_determinism.md`. The essentials:
+
+- **The defect was in the TEST HARNESS, not the transport, and it is NOT an MPI
+  contract violation and NOT an OpenMPI bug.** It is a CUDA stream-ordering
+  defect: `test_halo_mpi_transport.cu` creates its exchange stream with
+  `cudaStreamCreateWithFlags(..., cudaStreamNonBlocking)`, which by definition
+  does **not** implicitly synchronize with the legacy default stream — and the
+  test issued two of its own device-buffer setup operations on the legacy
+  stream. (1) `cudaMemset(send/recv, 0xFF, ...)`: a plain `cudaMemset` on
+  *device* memory is asynchronous w.r.t. the host and lands in the legacy
+  stream, so the poison could land *after* the transport's staging H2D — re-
+  poisoning a whole recv slot after correct data had already arrived. (2)
+  `TileArray::create()`'s synchronous `cudaMemcpy` H2D from **pageable** memory
+  returns once the source is staged for DMA, not once the device write has
+  landed, and also lands in the legacy stream — so the pack could read the
+  field array before it was populated. Both fixed by enqueueing on the
+  exchange stream (`cudaMemsetAsync`/`cudaMemcpyAsync`).
+- **Proven by intervention, not just by observation.** The racy form is
+  retained behind `FV3_HALO_TEST_LEGACY_SETUP=1`, so the defect is
+  reproducible on demand: on the **post-fix** binary, 24/24 default repeats
+  PASS while 3 of 6 legacy-control repeats FAIL (job 58246343). Same binary,
+  same node, same MPI — only the stream ordering of the test's own setup
+  differs.
+- **Three premises in the task prompt and in §10 below were measured WRONG**,
+  and all three corrections are recorded inline in the Prompt 17 "NEW OPEN
+  DEFECT" block: (a) "Intel MPI 5/5 PASS / OpenMPI intermittent" was
+  **inverted** — pre-fix Intel MPI 2021.13 was **5/5 FAIL** and OpenMPI 4.1.6
+  was 3/5 PASS; (b) the failing value is **not** 0.0 — it is the test's own
+  `0xFF` poison, which is NaN, and `std::llround(NaN)` → `LLONG_MIN` decodes
+  through the provenance oracle to the *identical* text `tile 0 (-8,-8,0)`, so
+  the old output could not tell poison from a genuine zero (`classify()` now
+  reports `POISON-REMAINS` / `ZERO` / `WRONG-VALUE` distinctly); (c) the blast
+  radius is **not one cell** — with the first-failure suppression removed, a
+  failing occurrence loses a **whole field/edge message**: all 72 written cells
+  (3 rings × 6 along-positions × 4 levels) of a 105-element recv slot, census
+  `poison 105, zero 0, other 0`, at a correctly-computed slot offset. The
+  "always `h=1 a=1 k=1`" signature was an artifact of that suppression.
+- **The transport itself was audited and cleared** (§3/§4/§5/§7 of the task),
+  so the next pass need not redo any of it: pack→D2H is genuinely
+  stream-ordered (`fv3_gpu_runtime.cpp:912-948`, all on `d.transfer_stream`);
+  request storage is a fixed `std::array<MPI_Request, 2*4*max_halo_group_fields>`
+  value-initialized `{}`, **not** a `std::vector`, so the reallocation
+  hypothesis the task flagged is **retired**; the tag space is symmetric
+  between sender and receiver and collision-free within and across exchanges
+  (max tag 207, inside the guaranteed `MPI_TAG_UB ≥ 32767`); and every recv
+  slot provably lies inside the byte range the bulk H2D overwrites (max
+  `slot_base` + one slot == `group_buffer_elements()`), which the measured
+  offsets then confirmed empirically (315 = 3×105, 105 = 1×105).
+- **One substantial production fix, in the same defect class** (1 of 3
+  permitted; test instrumentation is §9-exempt):
+  `fv3_gpu_runtime.cpp:1290-1291`, the attach-time halo-buffer clears in
+  `attach_halo_transport`, were plain legacy-stream `cudaMemset` and are now
+  `cudaMemsetAsync` on `d.transfer_stream` — the same stream every
+  pack/transfer/unpack uses. Previously only *probably* ordered before the
+  first pack (much host work and two MPI collectives intervene), never
+  *provably* so; now a stream guarantee at zero cost.
+- **Acceptance, all measured.** OpenMPI 4.1.6, exact Prompt-15 layout (1 node /
+  6 ranks / 1 A100 / rome / R8): **24/24 consecutive PASS**, `checks: 16692
+  failures: 0` in every run, no poison remains, no MPI errors, no CUDA errors
+  (job 58246343 A). **R8 CTest 23/23** (same job, phase C) — up from Prompt
+  17's 22/23. **Intel MPI 2021.13: 5/5 PASS** (job 58246352), where this exact
+  configuration was 5/5 FAIL pre-fix — the strongest cross-stack evidence, and
+  only consistent with an MPI-independent mechanism.
+- **Standalone regression re-run and unchanged** (job 58246353, both backends
+  from the same executable in one allocation, c8/npz=10/n_split=3/k_split=1/R8/
+  6 ranks): both arms rc=0, **6 dyn_core calls** each; dyn_core **ENTRY call 1
+  BITWISE IDENTICAL on all 13 state fields, 6/6 ranks**; dyn_core EXIT **102
+  verdicts (17 fields × 6 calls) = 78 ROUND-OFF SCALE + 24 SMALL NUMERICAL
+  DIFFERENCE, zero SIGNIFICANT, zero NONFINITE**, worst `max_rel`
+  **2.034576e-11** (`w`, call 5) with no divergence trend across calls
+  (1.716/1.463/1.889/1.956/2.035/2.008 e-11); owned-box min `delp` positive and
+  **identical to all printed digits on both arms**, 9967.182763 → 9957.518684
+  Pa, nonfinite=0; zero halo-transport diagnostics. Every figure **reproduces
+  Prompt 17's record to the digit**, so neither the test fix nor the production
+  hardening perturbed the numerics.
+- **Numerical algorithm changed: NO.** Nothing was committed or pushed.
+- Lesson worth carrying forward: **a plain `cudaMemset` or a synchronous
+  `cudaMemcpy` is not ordered against a `cudaStreamNonBlocking` stream.** Both
+  are legacy-stream operations, and `cudaStreamNonBlocking` exists precisely to
+  opt out of the implicit legacy synchronization. Any setup, clear, or seed of
+  a buffer that a non-blocking stream will later read must be enqueued *on that
+  stream*. The intermittency, the stack-dependence, and the "unwritten" reading
+  all followed from this one hazard — and the "OpenMPI-specific" framing it
+  produced sent two prior passes looking in the transport.
+
+**Prompt 17 (2026-09-04) — FMS halo ownership resolved; STANDALONE CUDA
+BACKEND NOW RUNS IN THE REAL `StandAlone_FV3_Dycore.x`.** This closes the
+Prompt 16 blocker (§9 item 16) and carries Prompt 14 through to a working
+dual-backend standalone executable. Read
+`prompt_14_standalone_cuda_integration.md` §8 for the full record; the
+essentials:
+
+- **FMS ownership contract, established from source (not assumed).**
+  `mpp_start_group_update` **packs, posts and increments
+  `num_nonblock_group_update` immediately**; only `mpp_complete_group_update`
+  decrements it and rewinds the shared buffer cursor. A started-but-never-
+  completed handle therefore leaks a stack slot **and** MPI requests on every
+  `k_split` iteration — so "start it and ignore it" is illegal, and the
+  question had a definite answer rather than being a matter of taste.
+- **Design A adopted: with the CUDA backend active, `fv_dynamics` does NOT
+  ISSUE the `i_pack(1)`/`i_pack(8)` starts at all** (rather than starting and
+  abandoning them). Both are **DUPLICATE** of exchanges the CUDA dyn_core
+  already performs before the same consumers (`i_pack(1)` delp/pt/q_con ⇒
+  `H_DSCALAR`; `i_pack(8)` u/v DGRID_NE ⇒ `H_DWIND_IN`). `i_pack(10)` (tracer
+  halo) is **DISTINCT REQUIRED** — it is deliberately left outstanding across
+  `dyn_core`'s exit and is still issued on the CUDA path. The start/complete
+  balance was counted, not eyeballed: with the CUDA branch taken, every
+  started handle is completed and none leaks.
+- **The default Fortran path is source-semantically unchanged** — the skip is
+  inside an `if (use_cuda_dyncore)` arm only.
+- **Result: six MPI ranks, one tile per rank, `FV_NX=1`/`FV_NY=6`, c8/npz=10/
+  n_split=3/k_split=1/R8, 6 dyn_core calls, both backends from the SAME
+  executable in ONE Slurm allocation (job 58244118), differing only in
+  `AGCM.rc`'s `RUN_CUDA_FV3`.** Both arms exit 0 in 25 s.
+  **dyn_core ENTRY, call 1: BITWISE IDENTICAL, 6/6 ranks, all 13 state
+  fields.** dyn_core EXIT: **all 17 fields ROUND-OFF SCALE or SMALL NUMERICAL
+  DIFFERENCE at every sampled call** (1/2/3/6), worst `max_rel` 2.008e-11
+  (always `w`, its own cancellation floor), with slow near-linear growth
+  (`u` 3.5e-13 → 8.6e-13) — round-off accumulation, not divergence. Zero
+  NaN/Inf over 6 calls × 6 ranks × 13 fields; owned-box min `delp`
+  9967.18 → 9957.52 Pa.
+- **The repeated-call divergence was a real defect and is fixed: `pe`'s one
+  halo ring.** Call 1 was bitwise but call 2 was not (`pt` 1.032e-04 with the
+  *same* max at every level, `u` 1.845e+00 at exactly `j=js`/`j=je+1`, `v` at
+  exactly `i=is`/`i=ie+1`). Root cause: Fortran fills `pe`'s single halo ring
+  inside `dyn_core` via `pe_halo` (`dyn_core.F90:1504-1532`, called at `:1011`
+  under `remap_step`), CUDA never wrote it, and
+  `Lagrangian_to_Eulerian`'s D-grid wind/flux remap **reads it**
+  (`fv_mapz.F90:686/693` for u/mfy/cy, `:729/740` for v/mfx/cx) — exactly the
+  measured footprint. **This corrects §10's standing claim that the ring is
+  "proven INERT downstream of dyn_core".** Fixed by reproducing `pe_halo`'s
+  two loops on the host after the D2H (`fv3_gpu_interface_pe_halo`); proven
+  bit-for-bit equivalent because no `delp` write exists between
+  `dyn_core.F90:1011` and `:1375`, so the ring is exactly
+  `cumsum(ptop, exit delp ring)` and `delp`'s ring is already host-resident.
+  No added transfer, no added kernel, `pe_halo` itself being `private`
+  (`:142`). The secondary `pt`/`pkz` signature is **explained**: `consv_te =
+  1.0`, so corrupted seam winds corrupted total energy, whose correction
+  redistributes a *uniform* `pt` offset — which is why `pt` differed
+  identically at every `k`.
+- Other boundary-completion gaps closed in the same fix: the four flux
+  capacitors `mfx`/`mfy`/`cx`/`cy` and `ws` were never copied out
+  (`fv3_gpu_registry_export_flux_capacitors`/`_ws`); `z_rat`, `ut`/`vt` and
+  `peln` descriptors had wrong bounds. Recorded honestly: the `ws` copy-out
+  changed nothing measurably.
+- **Numerical algorithm changed: NO.** **3 of 3 permitted substantial fixes
+  consumed** (Design A start-skip; bridge/registry/ABI plumbing incl. the
+  copy-outs and descriptor corrections; `fv3_gpu_interface_pe_halo`) — any
+  further substantial change is a §12(4) stop.
+- **Regression (job 58244300, single node / 6 tasks / 1 GPU): R8 CTest
+  22/23.** The one failure is `fv3_halo_mpi_transport`. **[Prompt 18: now
+  23/23, job 58246343 phase C — `100% tests passed, 0 tests failed out of 23`.]**
+- **NEW OPEN DEFECT, found by that regression and characterized** — **RESOLVED
+  by Prompt 18 (2026-09-04): it was a CUDA stream-ordering defect in the
+  transport TEST's own device-buffer setup, not in the transport, and not an MPI
+  contract violation. Three of the bullets below were measured wrong and are
+  corrected inline.** The block is retained for its evidence trail; read
+  `prompt_18_mpi_transport_determinism.md` for the resolution. The framing was
+  right in one respect — the failure was PRE-EXISTING, NOT caused by Prompt 17,
+  and Prompt 15's "16692 checks / 0 failures" was indeed a passing sample rather
+  than a determinism guarantee. Evidence as measured in Prompt 17:
+  - Intel MPI 2021.13 build (`build_cuda_r8_intelmpi`, job 58244365, 5
+    repeats): **5/5 FAIL**, 1–2 failed checks each. **[Prompt 18: post-fix this
+    exact configuration is 5/5 PASS, job 58246352. Note also that the task
+    prompt's premise "Intel MPI: 5/5 PASS / OpenMPI intermittent" was
+    INVERTED — Intel MPI was the *worse* stack pre-fix. The rate difference
+    between stacks is timing, not semantics.]**
+  - **Prompt 15's own OpenMPI 4.1.6 build (`build_cuda_r8_mpi`, job 58244385,
+    5 repeats): 3/5 PASS, 2/5 FAIL** — that build directory and every
+    transport source predate this pass entirely, which rules this pass out as
+    the cause on provenance grounds (`fv3_gpu_halo_{exchange.cu,exchange.hpp,
+    transport.hpp,mpi.cpp}` and the test itself are byte-unchanged since
+    Prompt 15; this pass's edits are confined to the ABI/registry/bridge).
+  - Signature is stable across every occurrence: the destination cell is
+    always at **`h=1 a=1 k=1`** (first ring, first reported along-position,
+    first level) of some `(edge, field)` block, always holds **exactly 0.0**
+    (which decodes as `tile 0 (-8,-8,0)`, i.e. **unwritten**), and the
+    afflicted `(rank, tile, edge, field)` **moves between runs** — observed on
+    tiles 1/3/5, edges N and E, fields 0 and 1, in `H_DWIND_IN` and the
+    `edge E field 0` wind slots. Scalar groups were never observed failing.
+    **[Prompt 18 CORRECTION, measured: the value is NOT 0.0 — it is the test's
+    own `0xFF` poison, which is NaN, and `std::llround(NaN)` → `LLONG_MIN`
+    decodes through the oracle to the *identical* text `tile 0 (-8,-8,0)`, so
+    the old output could not distinguish poison from a genuine zero. The
+    "always `h=1 a=1 k=1`" and "scalar groups never fail" observations are both
+    artifacts of the first-failure suppression corrected in the next bullet:
+    with it removed, whole blocks fail, `h=1 a=1 k=1` is simply the first cell
+    visited, and `H_DSCALAR` fails too.]**
+  - **The true blast radius per occurrence is UNKNOWN and may be larger than
+    one cell**, because the test reports only the first failure per
+    `(edge, field)` and then `goto next_field` (`test_halo_mpi_transport.cu:328`)
+    — the check-count drop (16692 → 16621/16609/16538) is exactly those
+    skipped cells, so an entire ~71-cell block may be missing rather than one
+    cell. **Do not assume it is one cell.** **[Prompt 18: correct instinct, now
+    MEASURED. The suppression was removed; a failing occurrence loses a WHOLE
+    field/edge message — all 72 written cells (3 rings × 6 along × 4 levels) of
+    a 105-element recv slot, census `poison 105, zero 0, other 0` — at a
+    correctly-computed slot offset, and `checks:` stays at the full 16692.]**
+  - Ruled out by direct reading, so the next pass need not redo it: the
+    send-side ordering in `fv3_gpu_halo_mpi.cpp:206-216` is correct — the D2H
+    is `cudaMemcpyAsync` on the *caller's* stream (hence stream-ordered behind
+    the pack the runtime already enqueued), and the wait is
+    `cudaEventRecord`/`cudaEventSynchronize` on that same stream's event before
+    any `MPI_Isend`. The pack→D2H race is therefore **not** the lead.
+  - Recommended first diagnostics for the next pass (both cheap, both
+    instrumentation): (1) remove the `goto next_field` suppression to learn the
+    true failed-cell count per block — one cell vs a whole block points at very
+    different mechanisms; (2) dump `slot_base`/`used_bytes` per `(group, edge,
+    field)` on both donor and receiver to test a slot-offset/size disagreement.
+  - **Scope of what this does and does not invalidate.** It does **not**
+    retract Prompt 15's dyn_core-exit result (78/78 bitwise identical at 1 and
+    5 calls) or this pass's standalone comparison (all 17 exit fields
+    ROUND-OFF/SMALL over 6 calls) — those are measured outcomes and stand. It
+    **does** retract the implied claim that the six-rank transport is
+    deterministically correct, and it must be resolved before any longer
+    validation run, because the same transport is what the standalone CUDA
+    backend uses. See §9 item 18. **[Prompt 18: resolved — the transport itself
+    was never the defect, so the retraction is itself retracted; the six-rank
+    transport is now demonstrated deterministic at 24/24 consecutive OpenMPI
+    runs. The longer-validation gate is lifted.]**
+
+**Prompt 14 (2026-09-04) — standalone CUDA production integration: ATTEMPTED,
+BLOCKED, ESCALATED. No source changed, no build run.** Task was to integrate
+the Gate-C2-validated CUDA `dyn_core` backend, opt-in, into the real
+`StandAlone_FV3_Dycore.x` executable under its real production MPI
+decomposition (`FV_NX=1`/`FV_NY=6`, six separate MPI ranks, one tile per
+rank). §1/§2 (working-tree confirmation and production call-boundary
+mapping) were completed by direct source reading of
+`fv_dynamics.F90:645-655` (the real `dyn_core` call site, inside the
+`do n_map=1,k_split` loop) and `dyn_core.F90:166-263` (full signature); a
+condensed field-by-field interface table is in
+`docs/agent_handoff/prompt_14_standalone_cuda_integration.md` §2. Work then
+stopped at a **genuine, source-confirmed architectural blocker**, found while
+verifying the task's own §12 warning to check (not assume) MPI/tile mapping:
+**the only implemented CUDA halo exchange transport,
+`fv3::gpu::halo::HaloPeerGroup` (`cuda/dyn_core/include/fv3_gpu_halo_peer.hpp`,
+self-described in its own header comment as "Model B — a single process
+representing all six cubed-sphere tiles"), is single-process/six-host-thread
+only** — it rendezvouses with a process-local `std::mutex`/
+`std::condition_variable` and copies directly between raw device pointers
+that are only valid within one address space. Confirmed by direct grep
+that **no real MPI API call exists anywhere in `cuda/dyn_core/runtime` or
+`cuda/dyn_core/include`** (the only two `MPI_*` string matches in
+`fv3_gpu_runtime.cpp`, lines 829/1259, are comments, not code), and that
+`fv3_gpu_create_desc::communicator_token` — the one public-ABI field that
+looks purpose-built for a real communicator handle — is set and read
+nowhere in the codebase outside its own struct definition. This is not a
+new defect: `docs/agent_handoff/milestone_3a10_gpu_halo_exchange.md`
+already documents Model B as a deliberate placeholder at design time
+("Model B does **not** establish: MPI rank mapping, MPI request lifecycle",
+line 471; "`HaloPeerGroup` is the only piece an MPI transport replaces",
+line 955). **Running the real six-MPI-process production configuration
+therefore requires implementing a new cross-process halo transport
+first** (e.g. the host-staged real-MPI "Stage 1" already anticipated by
+`project_architecture.md`'s Communication Evolution section, never yet
+built for the CUDA side) — a genuine runtime redesign, not fixable within
+this task's 3-substantial-integration-fix budget, and matching its own hard-
+stop conditions (3) and (6). Escalated to Opus per the task's own
+instruction rather than attempted on Sonnet. A secondary, non-blocking
+finding worth reusing later: the public ABI (`fv3_gpu_api.h`) already has a
+clean, Fortran-safe, opaque-handle lifecycle (create/topology/step/
+finalize) built with this exact integration in mind, but per-run
+`NumericalConfig` installation, real (`TopologyView`-based) topology
+installation, and halo-peer-group attachment are currently only reachable
+through internal, non-ABI C++ calls (`install_config`/`set_topology`/
+`attach_halo_peer_group` in the benchmark and `fv3_gpu_internal.hpp`) — a
+public ABI extension for these will be needed regardless of which halo-
+transport direction is chosen. Full detail, the complete interface table,
+and the two candidate transport directions (host-staged MPI vs. CUDA-aware
+MPI/GPU-direct):
+`docs/agent_handoff/prompt_14_standalone_cuda_integration.md`.
+
+**Prompt 15 (2026-09-04) — cross-process MPI halo transport: COMPLETE. This
+CLOSES the Prompt 14 blocker.** The CUDA dyn_core now has a real
+cross-process halo transport, and it is **IMPLEMENTED, COMPILED, GPU EXECUTED
+across six separate MPI processes, and NUMERICALLY VALIDATED** against the
+in-process `HaloPeerGroup` path. Structure: one new interface
+(`include/fv3_gpu_halo_transport.hpp`, `class HaloTransport`) whose only
+transport-dependent surface is **`transfer()`** (make donors' packed bytes
+readable, fill my recv) and **`release_send()`**, because the proven exchange
+ordering is `compute → pack → record pack_done → [transfer] → unpack → record
+xfer_done → order consumer → [release_send]` and nothing else depends on how
+bytes cross. Rotation, sign, slot addressing, ring iteration, `dest_edges`
+filtering and the pack/unpack kernels are **shared and untouched** — the MPI
+backend contains **no edge-rotation formula of its own**. The in-process path
+was adapted, not replaced (`PeerHaloTransport`, a thin adapter over
+`HaloPeerGroup`); **no functionality was removed from `HaloPeerGroup`** and
+both transports remain available with the default unchanged. Backend
+(`runtime/fv3_gpu_halo_mpi.cpp`, `name() == "mpi_host_staged"`): two pinned
+`cudaHostAlloc` staging buffers sized **once at attach** from the max over all
+live groups (both memset at attach — the unused slot tail is literally put on
+the wire); `transfer()` = one bulk D2H of the group's contiguous send region →
+`cudaEventRecord`/`cudaEventSynchronize` on a `cudaEventDisableTiming` event
+(**strictly narrower than a stream sync, and not a device sync — there is no
+`cudaDeviceSynchronize` anywhere in the backend**) → `MPI_Irecv`/`MPI_Isend` ×
+(4 edges × fields) with `tag = ((group*4)+edge)*max_halo_group_fields + field`
+(max 207, inside the guaranteed `MPI_TAG_UB ≥ 32767`) → one `MPI_Waitall` →
+one bulk H2D; persistent device residency preserved (halo slots only, never
+model state). `release_send()` is a justified no-op (`MPI_Waitall` already
+completed). A cross-rank `agree_on_layout` (cached per-group MIN/MAX
+`MPI_Allreduce` on field count) guards positional field compaction, which is
+configuration-dependent (`H_DIVGD` only at `nord>0`, `H_HEAT` only at
+`d_con>0`) and would otherwise let two ranks read each other's buffers at the
+wrong offset. Public API (`include/fv3_gpu_communication.h`):
+`FV3_GPU_HALO_TRANSPORT_{NONE,IN_PROCESS_PEER,MPI_HOST_STAGED}`,
+`fv3_gpu_attach_mpi_halo_transport`, `fv3_gpu_detach_halo_transport`,
+`fv3_gpu_halo_transport_kind_of` — **no C++ or MPI type in the ABI**; the
+communicator crosses as the **Fortran INTEGER handle** (`MPI_Comm` is `int` in
+MPICH but an opaque pointer in Open MPI, so it cannot appear in a stable C
+ABI) and is converted with `MPI_Comm_f2c`. Built without
+`FV3_DYN_CORE_ENABLE_MPI_HALO` (default OFF), the attach entry point returns
+`FV3_GPU_UNSUPPORTED_CONFIGURATION` rather than failing to link. Rank↔tile
+mapping is the identity **rank r ↔ tile r+1** and is **verified, not trusted**
+(allgathered tile map with duplicate/range checks; per-neighbour
+`tile_of_rank_[nb.rank] == nb.tile`) — confirmed at runtime by 12 banner lines
+`rank 0 owns tile 1` … `rank 5 owns tile 6`. Evidence: **six-rank transport
+test (`tests/integration/test_halo_mpi_transport.cu`, `mpirun -np 6`, one tile
+per rank) PASS with `checks: 16692  failures: 0`** using
+`test_halo_exchange_multitile.cu`'s encode/decode provenance oracle (a
+received value proves *which donor cell* it came from) and a **LOCAL,
+non-circular** sign oracle, covering scalar (`H_W_IN`), **both** wind
+staggerings (`H_DWIND_IN` DGRID_NE **and** `H_CWIND` CGRID_NE — the transposed
+slots, which is the pair that distinguishes a slot-keyed from a
+staggering-keyed sign), the 4-field width-3 multi-ring group (`H_DSCALAR`),
+and **E11** (`H_DWIND_SEAM`, `ring_begin=0`, owned destinations). Then the
+decisive result: **the six-MPI-process dyn_core exit is BITWISE IDENTICAL to
+the single-process `HaloPeerGroup` path — 78/78 files (13 exit fields × 6
+tiles), `DIFFERS=0 MISSING=0`, at 1 dyn_core call AND at 5 calls / 15
+substeps** (job 58240534, `warpa003`), from the **same binary, same flags,
+same authoritative Gate-C2 SP0 state/geometry/config, same node, same job —
+the only difference being `--mpi-halo`**. Because the in-process path is the
+one Gate C2 validated against authoritative Fortran, **the Gate C2 numerical
+result carries over to the MPI transport unchanged for this configuration**,
+with no new Fortran run needed. Regression (job 58240280): R8 ctest **22/22
+PASS with MPI OFF** and **23/23 with MPI ON** (new `fv3_halo_mpi_transport`
+passes in 1.87 s), plus a single-process transport smoke confirming the
+`PeerHaloTransport` refactor left the default path working end to end. Zero
+NaN/Inf anywhere. **Numerical algorithm changed: NO.** **Zero of the 3
+permitted transport fixes consumed.** No performance matrix was run and the
+smoke wall-clock numbers are explicitly **not** a performance claim. Full
+detail, including the per-group contract table, the corner classification
+(nothing corner-specific is sent — the diagonal corner halo cells have no
+donor tile, and FV3's corner *rotations* are intra-tile device operations),
+and the explicit E11 mapping:
+`docs/agent_handoff/prompt_15_mpi_halo_transport.md`.
+
+**Prompt 16 (2026-09-04) — standalone CUDA production integration, resumed
+from the Prompt 15 unblock: PARTIAL, ESCALATED on a NEW finding.** Resumed
+exactly where §9 item 15 (above) said to. §1 (working trees) reused unchanged
+from Prompt 14. **§2 (public C ABI) is now COMPLETE and verified**: the two
+previously-unimplemented ABI functions declared in `fv3_gpu_api.h` —
+`fv3_gpu_set_numerical_config` and `fv3_gpu_install_production_dispatch` —
+now have real implementations, and §3/§4 (geometry/topology installation)
+needed **no new ABI**, since `fv3_gpu_set_cubed_sphere_topology` (Milestone
+3A.10) and the existing state/field-descriptor path already cover it. A real
+CMake constraint governed placement: `fv3_gpu_install_production_dispatch`
+must call `fv3_build_production_dispatch()`, which lives only in the
+`fv3_production_dispatch` static-library target, and that target already
+links **PUBLIC** against `fv3_dyn_core_gpu` — the reverse link (needed to call
+it from `fv3_gpu_runtime.cpp`, part of `fv3_dyn_core_gpu`) would be a
+static-library dependency cycle the CMakeLists.txt's own comment already
+warns against, confirmed by an actual linker failure
+(`undefined reference to fv3::gpu::fv3_build_production_dispatch`) when tried
+there first. Fixed by defining it instead in
+`cuda/dyn_core/runtime/fv3_gpu_production_dispatch.cu`, right after
+`fv3_build_production_dispatch`'s own closing brace — **1 of 3 permitted
+integration fixes consumed** (build/link-integration category). Verified: a
+full clean rebuild (`build_cuda_r8_mpibench`) succeeded with zero errors;
+login-node CTest 13/13 host-only PASS (10 GPU-labeled tests correctly
+`***Skipped`); one `gpu_a100` Slurm CTest run **22/23 PASS**, with the sole
+failure (`fv3_halo_mpi_transport`) attributable to an ad hoc `srun`
+resourcing artifact (6 requested tasks landed on 4 separate single-GPU nodes
+instead of the one node the test's design requires) rather than a code
+regression — neither new ABI function touches the MPI transport path, and
+this exact test already passed at 16,692/0 under correct single-node
+resourcing in Prompt 15. **Then, while reading the real production call site
+in Repo B to start §5 (the Fortran `ISO_C_BINDING` wrapper), a SECOND, DISTINCT
+halo-ownership ambiguity was found and the pass STOPPED and escalated on it**,
+per the task's own instruction (§10, "careful FMS-vs-CUDA halo ownership —
+STOP and escalate if ambiguous"): `fv_dynamics.F90:616-655` (the
+`do n_map=1,k_split` loop) itself **starts** two asynchronous FMS
+`start_group_halo_update` calls — `i_pack(1)` for `delp`/`pt`/`q_con`,
+`i_pack(8)` for `u`/`v` with `gridtype=DGRID_NE` — immediately *before*
+calling `dyn_core`, then passes the same `i_pack(*)` array into `dyn_core` as
+`intent(inout)` for `dyn_core` to *complete* internally at specific points.
+This is a real, load-bearing FMS halo-pipelining layer **above** `dyn_core`'s
+own internal six-tile GPU halo exchange (`PeerHaloTransport`/
+`MpiHaloTransport`) — not the same mechanism, and not previously read by any
+prompt from 6A through 15, all of which scoped their reading to inside
+`dyn_core.F90`'s own savepoint boundaries. It is consistent with, and now
+explains, an already-on-record Gate C2 detail (§4 `sp2c`: "the `u`/`v` halos
+are in flight (`i_pack(8)` started, not completed)"). Two correctness-relevant
+questions follow that neither `dyn_core.F90` nor the CUDA runtime can answer
+alone, and guessing wrong on either risks silently corrupting Fortran-side
+state in a mixed-backend run (the opposite failure mode of everything Gate C2
+validated): (1) if the CUDA branch simply skips issuing these
+`start_group_halo_update` calls (since CUDA does not consume the `i_pack`
+handles), does anything else in `fv_dynamics.F90` — a later `n_map` iteration,
+a diagnostic, FMS-internal slot bookkeeping — assume slots `i_pack(1)`/`(8)`
+were started/completed; (2) if the calls are left in place but never
+completed, does FMS's `mpp_domains` group-halo-update machinery tolerate a
+started-but-never-completed handle being reused next iteration, or does it
+deadlock/corrupt state? Resolving this safely requires reading FMS's
+halo-update-handle contract beyond `dyn_core`'s call boundary — out of this
+pass's 3-fix integration budget and Sonnet-appropriate scope per the task's
+own model policy. **No source in either repository was modified to
+investigate this** (read-only: `fv_dynamics.F90:600-670`,
+`dyn_core.F90:160-274`, both reproduced verbatim in the handoff for reuse).
+**Numerical algorithm changed: NO. 1 of 3 integration fixes consumed (the ABI
+placement fix, §7.1). Escalating per the task's own instruction rather than
+guessing on Sonnet.** Full detail: `docs/agent_handoff/prompt_14_standalone_cuda_integration.md`
+§7 (new section, appended — §0–§6 are the original Prompt 14 content,
+unchanged).
 
 ## 1. Git State
 
@@ -57,85 +649,114 @@ item below requires it.
   - Primary path: `/discover/nobackup/projects/imvi-nse/jli30/FVdycoreCubed_GridComp`
   - Also visible at: `/gpfsm/dnb06/projects/p295/jli30/FVdycoreCubed_GridComp`
 - Branch: `cuda/gpu-bringup`
-- HEAD: `a060d98ca68a2996bf54d6bd214bbc3f3f977e8e` ("Add cost-efficient Claude workflow guidance")
-- Ahead of `origin/cuda/gpu-bringup` by 4 commits (`2c57d56`, `6fc409a`,
-  `aa149dc`, `a060d98`) — **not pushed**.
-- Uncommitted Prompt 6B work in the tree (modified, not staged, not committed):
-  - `cuda/dyn_core/benchmarks/run_small_perf_bench.cpp` — `--bdt`,
-    `--sp1-boundary`, `kFv3Rdgas`, `--damp-n-sponge`, `--akap-exner`,
-    `namespace grid_geometry_6b`, and the `grid_lonlat`/`agrid_lonlat` store-order
-    fix.
-  - `cuda/dyn_core/include/fv3_gpu_internal.hpp`,
-    `cuda/dyn_core/operators/wp_d_contract.cpp`,
-    `cuda/dyn_core/operators/wp_d_contract_cuda.cpp`,
-    `cuda/dyn_core/vertical/fv3_vertical_column.hpp`,
-    `cuda/dyn_core/vertical/fv3_vertical_kernels.cu`,
-    `cuda/dyn_core/tests/vertical/test_vertical_column.cpp` — the
-    `NumericalConfig::akap_exner` two-kappa split plumbing.
-  - `cuda/dyn_core/runtime/fv3_gpu_runtime.cpp` — the `it==1` `H_DSCALAR`
-    resolve; the E11 `it==n_split` seam block + `FV3_GPU_DBG_STAGE("seam_reconcile")`;
-    the post-loop `dyn_core_exit` checkpoint with six `sp3` fields appended to
-    `targets[]`/`names[]`; the pre-loop heat-accumulator setup; extra dump targets.
-  - **E11 / heat-accumulation work (this pass):**
-    `cuda/dyn_core/include/fv3_gpu_communication.h` (`FV3_GPU_H_DWIND_SEAM` +
-    `FV3_GPU_H_GROUP_LAST`), `cuda/dyn_core/runtime/fv3_gpu_halo_exchange.{hpp,cu}`
-    (`ring_begin`, `dest_edges`, `halo_ring_count`/`halo_ring_ordinal`, the
-    `H_DWIND_SEAM` table entry), `cuda/dyn_core/runtime/fv3_gpu_halo_topology.hpp`
-    (corrected stale seam comment), `cuda/dyn_core/runtime/fv3_gpu_context.hpp`
-    (`heat_accum`), new `cuda/dyn_core/runtime/fv3_gpu_heat_accumulator.{hpp,cu}`,
-    `CMakeLists.txt`, `cuda/dyn_core/tests/runtime/test_halo_topology.cpp`
-    (T10 branch, `live_groups` 10→11),
-    `cuda/dyn_core/tests/integration/test_dispatch_smoke.cpp`
-    (`kRuntimeResolvedGroups[]` + `H_DWIND_SEAM`).
-  - `cuda/dyn_core/benchmarks/run_small_perf_bench.cpp` also carries the
-    authoritative `n_con` derivation (§4 #11) and the authoritative
-    `nf_ke = min(3, nord+1)` derivation (§4 #13).
-  - **`nf_ke` / corner-service work (this pass):**
-    `cuda/dyn_core/runtime/fv3_gpu_production_dispatch.cu` (the real
-    `corner_edge_service_cuda`, replacing `corner_service_not_implemented`) and
-    `.hpp` (stale doc paragraph corrected);
-    `cuda/dyn_core/operators/wp_d_contract_cuda.cpp` (the missing dir=2
-    `copy_corners` request); `cuda/dyn_core/operators/wp_d_operators.{hpp,cpp}`
-    (`del2_pass` split into `del2_zonal_flux` / `del2_meridional_flux` /
-    `del2_update`, with `del2_pass`/`del2_pass_sg` retained as bit-identical
-    wrappers); `cuda/dyn_core/operators/wp_d_contract.cpp` (host twin uses the
-    phase sequence); `cuda/dyn_core/tests/integration/test_dispatch_smoke.cpp`
-    (comment/printf only: three stale "fail-stub"/"fail-adapter" narrations
-    corrected; `cfg.nf_ke` stays pinned at 1 — see §10 for why the attempt to
-    raise it to 3 was reverted).
-  - **`omga` finalization work (this pass):**
-    `cuda/dyn_core/operators/wp_d_operators.{hpp,cpp}` (`omega_pem_snapshot`,
-    `omega_from_pe`, `adv_pe`, `AdvPeMetrics`, and the `adv_pe_cell_increment`
-    device/host-shared helper that derives `ec1/ec2/en1/en2`),
-    `cuda/dyn_core/operators/wp_d_cuda.cu` +
-    `wp_d_contract{,_cuda}.{hpp,cpp}` (the device twins and the two new
-    dispatch slots), `cuda/dyn_core/include/fv3_gpu_internal.hpp`
-    (`OperatorArena` grown to 12 arrays: slot 10 = omega `pem`,
-    slot 11 = omega `pb`), `cuda/dyn_core/runtime/fv3_gpu_production_dispatch.cu`
-    (`omega_pem_snapshot` / `omega_finalize` wiring, `:202-204`),
-    `cuda/dyn_core/runtime/fv3_gpu_runtime.cpp` (the `it == n_split && end_step`
-    call sites and the `omega_finalize` debug-dump stage).
-    No CMakeLists change was needed (`fv3_wp_d_cuda` already links
-    `fv3_wp_d_operators` PUBLIC) and `internal_contract_version` is
-    deliberately unchanged (the two slots are an additive tail; `run()` skips
-    nulls).
-  - Untracked omega validation tooling under `tools/savepoints/`:
-    `verify_omega_host.cpp` (drives the real host twins from authoritative
-    savepoints, no GPU) and `verify_adv_pe_geometry.cpp` (proves the harness
-    B-grid corners are the Fortran `gridstruct%grid` corners, radius-free).
-  - `.gitignore`, this file,
-    `docs/agent_handoff/prompt_6b_cuda_fortran_validation.md`.
-  - Untracked tooling under `tools/savepoints/`:
-    `compare_cuda_fortran.py` (SP1/SP2/`sp2a`/`sp2b`/`sp2c`/`sp3`),
-    `convert_sp1_boundary_to_cuda.py`, `verify_damping_column.py`,
-    `footprint_sp2_uv.py`, `probe_e11_map.py`, `probe_e11_effect.py`.
-  - **Nine-plus passes of Prompt 6B work is now uncommitted.** Worth
-    consolidating into a commit when the user asks for one.
-- Working tree also holds many untracked scratch files at repo root
-  (`*_3a11*.sh`, `task*_6c_cuda.sh`, `*.log`, `*.out`, `*.txt`, `rprobe_6b`,
-  `dt3a11v/`) and CUDA dump directories under `tools/savepoints/task*_cuda_dump/`.
-  Do not commit them; do not delete without checking they are not cited as
-  reproduction scripts by a milestone doc.
+- HEAD: `eb6d68913c932f00c87c86ff8c7b891d66f6214f` ("Optimize CUDA dyn_core
+  launch orchestration") — this commit was made by the user between agent
+  sessions (not by an agent pass) and consolidates the previously-uncommitted
+  **Prompt 12** `a2b4_global_corner_kernel` restructuring and **Prompt 13**
+  CUDA-Graph launch repair. The prior HEAD `7dda37b` ("Optimize FV3 CUDA halo
+  edge launches", also user-authored) consolidated Prompt 11's
+  `--fuse-halo-edges` work.
+- Ahead of `origin/cuda/gpu-bringup` (`191157f`) by 3 commits (`b456897`,
+  `7dda37b`, `eb6d689`) — **not pushed**.
+- Tracked working tree: **modified, uncommitted — all of it from Prompt 15**
+  (the Prompt 12/13 changes previously listed here are now committed in
+  `eb6d689`). Modified: `cuda/dyn_core/CMakeLists.txt` (+75),
+  `cuda/dyn_core/benchmarks/run_small_perf_bench.cpp` (+208, the `--mpi-halo`
+  mode), `cuda/dyn_core/include/fv3_gpu_communication.h` (+45, the public
+  transport-selection API), `cuda/dyn_core/include/fv3_gpu_context.hpp` (+23),
+  `cuda/dyn_core/include/fv3_gpu_halo_exchange.hpp` (+15),
+  `cuda/dyn_core/include/fv3_gpu_internal.hpp` (+20),
+  `cuda/dyn_core/runtime/fv3_gpu_halo_exchange.cu` (+11),
+  `cuda/dyn_core/runtime/fv3_gpu_runtime.cpp` (+295, the `HaloTransport`
+  refactor of `perform_peer_exchange`/`resolve_halo`/attach/detach). Also
+  modified: this file. New and untracked, all Prompt 15 source:
+  `cuda/dyn_core/include/fv3_gpu_halo_transport.hpp` (the interface),
+  `cuda/dyn_core/include/fv3_gpu_halo_mpi.hpp` (MPI-type-free factories),
+  `cuda/dyn_core/runtime/fv3_gpu_halo_mpi.cpp` (the host-staged MPI backend),
+  `cuda/dyn_core/tests/integration/test_halo_mpi_transport.cu` (the six-rank
+  test). All validated — see the Prompt 15 lead paragraph and
+  `prompt_15_mpi_halo_transport.md`: R8 ctest 22/22 PASS with MPI OFF and
+  23/23 with MPI ON, six-rank transport test PASS (16,692 checks / 0
+  failures), and the six-MPI-process `dyn_core_exit` **78/78 bitwise
+  identical** to the in-process path at 1 and 5 calls. The MPI path is
+  opt-in twice over (CMake `FV3_DYN_CORE_ENABLE_MPI_HALO=OFF` by default, and
+  `--mpi-halo` off by default), so the default path is provably unchanged.
+  Not committed, not pushed — do so only if explicitly requested.
+- **New in Prompt 18, uncommitted: exactly two modified files.**
+  `cuda/dyn_core/tests/integration/test_halo_mpi_transport.cu` — stream-ordered
+  poison memsets and field-array H2D (the fix), the `POISON-REMAINS`/`ZERO`/
+  `WRONG-VALUE` `classify()`, removal of the `goto next_field` first-failure
+  suppression, per-block `BLOCK FAIL … slot census` diagnostics, the owned-box
+  check rewritten from early-exit to counting (`OWNED-BOX MOVED`), and the
+  `FV3_HALO_TEST_DEBUG` / `FV3_HALO_TEST_LEGACY_SETUP` env switches; and
+  `cuda/dyn_core/runtime/fv3_gpu_runtime.cpp` (~:1290-1291) — attach-time halo
+  buffer clears converted to `cudaMemsetAsync` on `d.transfer_stream`, with the
+  reasoning appended to the existing milestone-3A.10 §20 comment. New handoff
+  doc `docs/agent_handoff/prompt_18_mpi_transport_determinism.md` (commit with
+  the source). **Do not commit** the job scripts `p18_phaseA.sbatch`,
+  `p18_accept.sbatch`, `p18_intelmpi.sbatch`, `p18_transport.sbatch` or any
+  `p18_*.out` log. Nothing was committed or pushed.
+- **New in Prompt 17, all uncommitted, in TWO repositories.** In this repo
+  (`FVdycoreCubed_GridComp`): new Fortran bridge layer
+  `cuda/interface/fv3_gpu_dyncore_bridge.F90`, `fv3_gpu_abi_mod.F90`,
+  `fv3_gpu_field_registry.F90` plus `cuda/interface/CMakeLists.txt`; new
+  `cuda/dyn_core/runtime/fv3_gpu_registry_shim.cpp`; modified
+  `cuda/dyn_core/include/fv3_gpu_api.h`,
+  `cuda/dyn_core/runtime/fv3_gpu_runtime.cpp`,
+  `runtime/fv3_gpu_production_dispatch.cu`,
+  `cuda/dyn_core/operators/wp_d_contract.cpp`, `cuda/dyn_core/CMakeLists.txt`;
+  build/run helpers `cuda_intelmpi_build.sh`, `p17_rebuild_exe.sh`,
+  `p17_rebuild_all.sh`, `p17_regress.sbatch`, `p17_halo_repeat.sbatch`,
+  `p17_halo_ompi.sbatch`. In the **fixture** repo's nested `@fvdycore`
+  (`GEOSfvdycore_fortran_perf/src/Components/@FVdycoreCubed_GridComp/@fvdycore`):
+  modified `model/fv_dynamics.F90` (the Design A backend branch + the `dce`/`dcx`
+  savepoint calls), `model/dyn_core.F90` (savepoints only, as before),
+  `CMakeLists.txt` (link the CUDA archives), and new
+  `model/fv3_savepoint_mod.F90`. **Do not commit** `build_cuda_r8_intelmpi/`,
+  the `experiments/` trees, `*.log`, or any `p17_*.out` job log. Nothing was
+  committed or pushed.
+- **New in Prompt 16, also uncommitted:** `cuda/dyn_core/include/fv3_gpu_api.h`
+  (+2 declarations: `fv3_gpu_set_numerical_config`, `fv3_gpu_install_production_dispatch`,
+  +the `fv3_gpu_numerical_config` struct), `cuda/dyn_core/runtime/fv3_gpu_runtime.cpp`
+  (+the `fv3_gpu_set_numerical_config` implementation), and
+  `cuda/dyn_core/runtime/fv3_gpu_production_dispatch.cu` (+the
+  `fv3_gpu_install_production_dispatch` implementation — placed here, not in
+  `fv3_gpu_runtime.cpp`, to avoid a static-library dependency cycle; see the
+  Prompt 16 lead paragraph). Full clean rebuild verified; R8 ctest 22/23 GPU +
+  13/13 host (one unrelated resourcing artifact, not a regression — see Prompt
+  16 lead paragraph). Not committed, not pushed.
+- Untracked at repo root: many one-off scratch shell scripts/logs from prior
+  passes (`task*_6c_cuda.sh`, `sp*rerun*.sh`, `*_3a11*.py`, `cln*.txt`,
+  `cmp_nord*.txt`, `det_diff_*.txt`, `pre*.txt`, `rprobe_6b`, `scratch_6b/`,
+  build helper scripts like `omega_build*.sh`/`r8ctest_final.sh`), plus
+  `tools/` (savepoint validation tooling, e.g. `verify_omega_host.cpp`,
+  `verify_adv_pe_geometry.cpp`, `compare_cuda_fortran.py` — reusable, not
+  scratch) and `perf_rerun_logs/` (sbatch scripts + job logs for Prompts
+  7/8/9/11/12, including new `prompt12_a2b4_tuning.sbatch`,
+  `prompt12_a2b4_kernel.patch`, their `*_58238626.out` log, and
+  `ncu_p12_{before,after}.csv` — the latter two contain only an
+  `ERR_NVGPUCTRPERM` permission-denial message, not real profiling data; see
+  `prompt_12_a2b4_kernel_tuning.md` §2). New this pass:
+  `perf_rerun_logs/prompt13_graph_repair.sbatch`, its
+  `prompt13_graph_repair_58238910.out` log, `nsys_p13_{before,after}.nsys-rep`
+  and their generated `.sqlite` (**profiler artifacts — do not commit**), and
+  `docs/agent_handoff/prompt_13_architectural_optimization.md`. Also untracked
+  from prior passes: `docs/agent_handoff/prompt_12_a2b4_kernel_tuning.md`,
+  `prompt_10_copy_corners_batching.md`,
+  `docs/agent_handoff/prompt_11_next_launch_target.md`,
+  `docs/agent_handoff/prompt_14_standalone_cuda_integration.md`. **New this
+  pass (Prompt 15), untracked:**
+  `docs/agent_handoff/prompt_15_mpi_halo_transport.md` (the handoff — commit
+  with the source), plus **artifacts that must NOT be committed**:
+  `build_cuda_r8_mpi/` and `build_cuda_r8_mpibench/` (build dirs),
+  `scratch_p15/` (the two dyn_core_exit dump trees compared bitwise in §14),
+  `perf_rerun_logs/prompt15_mpi_halo.sbatch` +
+  `prompt15_mpi_halo_58240280.out`, and
+  `perf_rerun_logs/prompt15_mpi_dyncore.sbatch` +
+  `prompt15_mpi_dyncore_58240534.out`. Do not commit or
+  delete any of these without checking they are not cited as reproduction
+  scripts by a milestone doc; do not commit or push unless explicitly
+  requested.
 
 ## 2. Authoritative Fortran Source
 
@@ -161,9 +782,21 @@ item below requires it.
 GEOS/FV3 Fortran -> ISO_C_BINDING / stable C ABI -> WP-E GPU context
     -> persistent device-resident CUDA dyn_core (WP-A/B/C/D)
     -> six-tile GPU-side cubed-sphere halo exchange
+           -> HaloTransport: { PeerHaloTransport | MpiHaloTransport }
 ```
 CUDA backend optional; Fortran backend preserved. See
 `docs/agent_instructions/project_architecture.md` for full detail (unchanged).
+
+**Prompt 15 addition:** the halo exchange is now split at a
+`HaloTransport` interface (`include/fv3_gpu_halo_transport.hpp`) with two
+interchangeable backends — `PeerHaloTransport` (in-process, six host threads,
+the historical "Model B" `HaloPeerGroup`; still the default) and
+`MpiHaloTransport` (host-staged real MPI, six separate processes, one tile per
+rank — the production decomposition). Topology, pack/unpack kernels, rotation
+and sign logic are shared; only `transfer()`/`release_send()` differ. This is
+the concrete realization of `project_architecture.md`'s "Stage 1" host-staged
+MPI; Stage 2 (CUDA-aware MPI) and Stage 3 (comm/compute overlap) become new
+backends behind the same interface, not a redesign.
 
 ## 4. Implemented CUDA dyn_core Coverage
 
@@ -172,6 +805,13 @@ CUDA backend optional; Fortran backend preserved. See
 - n_split acoustic loop: IMPLEMENTED, GPU EXECUTED (n_split=3 authoritative).
 - Six-tile GPU-side halo exchange: IMPLEMENTED, GPU EXECUTED, liveness
   confirmed by `fv3_dispatch_smoke` Phase E causality test (R8 and R4).
+- **Cross-process (real MPI) six-tile halo exchange (Prompt 15): IMPLEMENTED,
+  COMPILED, GPU EXECUTED across six separate MPI processes, and NUMERICALLY
+  VALIDATED against the in-process path — `dyn_core_exit` 78/78 (13 fields × 6
+  tiles) BITWISE IDENTICAL at 1 and at 5 dyn_core calls.** Opt-in twice
+  (CMake `FV3_DYN_CORE_ENABLE_MPI_HALO`, default OFF; bench `--mpi-halo`,
+  default off). Detail: the Prompt 15 lead paragraph and
+  `prompt_15_mpi_halo_transport.md`.
 - Persistent device residency: IMPLEMENTED, GPU EXECUTED.
 - Per-level damping translation layer (`fv3_damping_translation.{hpp,cpp}`):
   IMPLEMENTED, COMPILED, host-unit-tested.
@@ -625,9 +1265,62 @@ fusion/batching of the many small repetitive kernels; CUDA Graphs to amortize
 per-launch issue latency; consolidation of the halo/corner-service kernel
 family (~18% of kernel time). **No numerical code was changed.**
 
+**Prompt 11 update (2026-09-04, jobs 58238397/58238413):** with
+`--fuse-halo-edges` (pack/unpack halo-edge fusion, opt-in, default off; see
+summary above and `prompt_11_next_launch_target.md`), 32×32/R8 resident
+median falls from the Prompt-7-baseline-consistent 29.20 ms/call to
+**23.28 ms/call (−20.28%)**, and whole-dyn_core-call kernel launches fall
+17,730→16,074/call (−9.34%), kernel busy time 74.0→67.44 ms/call (−8.86%).
+`cudaLaunchKernel` remains 90.0% of CUDA API time (vs 90.6% baseline) — the
+launch-bound classification is unchanged in kind, only reduced in magnitude.
+GPU-side memory-op time is unchanged (≈2.47 ms/call, 91.4% D2D). Combined with
+Prompt 9's `--fuse-corner-fill`: 23.86 ms/call — very slightly slower than
+`--fuse-halo-edges` alone, recorded but not chased further (still bitwise
+identical). **No numerical code was changed.**
+
+**Prompt 13 update (2026-09-04, job 58238910, node `warpa013`) — CUDA Graph
+mode is now functional and measured.** All figures 32×32 / R8 / resident /
+`--fuse-halo-edges`, same job, same node, same binary ±`--cuda-graph`,
+`--warmup 20 --iters 100 --repeats 5`, median of 5:
+
+| configuration | ms/call | per-repeat spread |
+|---------------|---------|-------------------|
+| graph OFF (reference) | 21.660791 | 0.149 |
+| graph ON (`--cuda-graph`) | **20.546787** | 0.497 |
+
+Whole-dyn_core-call improvement **−5.14%** (−1.114 ms), above both spreads.
+The cross-session Prompt 12 reference (22.255549 ms/call) would read −7.7%,
+but the same-node BEFORE above is the honest comparand and is what is
+claimed. nsys (two short runs, before/after in the same job, normalized over
+25 dyn_core calls × 6 tiles): `cudaLaunchKernel` 16,182.0 →
+**11,067.1 per dyn_core call (−31.6%)**; per tile 2,697.0 → 1,844.5 — the
+BEFORE figure reproduces Prompt 11's recorded 2,697 exactly, which validates
+the normalization. `cudaLaunchKernel` share of CUDA API time 89.0% → 78.2%.
+`cudaGraphLaunch` = 450 = 25 calls × 3 substeps × 6 tiles, *including* the 6
+capture occurrences — direct proof the repaired capture arm launches.
+
+**Material regime change, and the reason further launch-count work is not
+recommended: the launch-latency model is now broken.** `wall ≈
+launches_per_tile × median cudaLaunchKernel latency` fit Prompt 7 (2,955 ×
+8.14 µs = 24.05 vs 26.01 measured, 92%) and Prompt 11 (2,697 × 7.54 µs =
+20.34 vs 23.28, 87%). Here a **−31.6% launch reduction bought only −5.14%
+wall clock.** Corroborating evidence from the same traces: host issue time per
+tile per call fell 22.07 → 16.45 ms (−25%, nsys-inflated) while
+`cudaStreamSynchronize` total time rose **0.44 → 135.5 ms** (Max 0.036 →
+12.999 ms) — the host now *waits on the device* rather than the device waiting
+on the host. Against a kernel-busy floor of 11.24 ms/tile/call versus 20.55
+achieved, the case is now **GPU-EXECUTION-BOUND**. Any future estimate of a
+launch-count optimization's value must be discounted accordingly; do not
+assume proportionality.
+
 ## 7. Current Validation Boundary
 
 - Gate C1 (integrated dyn_core GPU execution): **CLOSED** (milestone 3A.9).
+- **Cross-process MPI halo transport (Prompt 15): CLOSED.** Six separate MPI
+  processes, one tile per rank, produce a `dyn_core_exit` state **BITWISE
+  IDENTICAL** to the Gate-C2-validated in-process path (78/78 files, at 1 and
+  at 5 dyn_core calls), plus a six-rank provenance test at 16,692 checks / 0
+  failures. Same configuration scope as Gate C2 and no wider.
 - Prompt 6A (authoritative Fortran savepoints): **CLOSED** — see §8 history.
 - Prompt 6B Task-J in-loop instrumentation: **CLOSED.** `sp2a`/`sp2b`/`sp2c`
   exist, are labelled with the real `it`, and the c8 reference was regenerated
@@ -661,6 +1354,35 @@ family (~18% of kernel time). **No numerical code was changed.**
   round-off-neutral for this fixture only). See §10.
 - Do not claim numerical equivalence from the performance baseline in §6, nor
   from the Prompt 6A savepoints alone (Fortran-only).
+- **Cross-process MPI halo transport (Prompt 15): VALIDATED by equivalence, not
+  by a new Fortran comparison.** The six-MPI-process `dyn_core_exit` is BITWISE
+  IDENTICAL (78/78 files = 13 fields × 6 tiles) to the in-process
+  `HaloPeerGroup` path at both 1 and 5 dyn_core calls, from the same binary and
+  configuration on the same node. Since the in-process path is the one Gate C2
+  validated against authoritative Fortran, the Gate C2 result carries over to
+  the MPI transport **for this configuration and no wider**. This is bitwise
+  equivalence to a validated reference — the strongest available form — but it
+  is explicitly *not* an independent Fortran comparison of the MPI path, and
+  the Gate C2 scope caveats above apply unchanged.
+
+- **Standalone production integration (Prompt 17): the CUDA dyn_core backend
+  RUNS INSIDE THE REAL `StandAlone_FV3_Dycore.x`** under the production
+  decomposition (`FV_NX=1`/`FV_NY=6`, six MPI ranks, one tile per rank), and
+  agrees with the Fortran backend from the same executable: **dyn_core ENTRY
+  call 1 BITWISE IDENTICAL 6/6 ranks on all 13 state fields**, dyn_core EXIT
+  **all 17 fields ROUND-OFF SCALE or SMALL NUMERICAL DIFFERENCE at calls
+  1/2/3/6** (worst `max_rel` 2.008e-11, always `w`). This is a *short-run*
+  integration result — 6 dyn_core calls, c8/npz=10/n_split=3/k_split=1/R8 — and
+  is **not** an extension of Gate C2's scope to any other configuration.
+  ~~It is gated for longer validation by the intermittent transport defect in
+  §10.~~ **Prompt 18: that gate is LIFTED** — the transport defect was a
+  test-harness CUDA stream-ordering hazard, is fixed, and the six-rank transport
+  now passes 24/24 consecutive OpenMPI runs. The standalone short run was
+  re-verified afterwards and reproduces every Prompt 17 figure to the digit
+  (all 6 calls compared this time: entry call 1 BITWISE on 13 state fields 6/6
+  ranks; exit 102 verdicts = 78 ROUND-OFF + 24 SMALL, worst `max_rel`
+  2.034576e-11, zero SIGNIFICANT, zero NONFINITE, `delp` positive and identical
+  on both arms). **Longer standalone validation is now unblocked** (§9 item 17).
 
 ## 8. Current Task
 
@@ -675,23 +1397,20 @@ pass: COMPLETE.** See §6 above and
 detail. No optimization was performed (explicitly out of scope for that pass).
 No numerical code was changed.
 
-**Prompt 8 — CUDA Graphs prototype: BLOCKED.** See summary above and
-`docs/agent_handoff/prompt_8_cuda_graphs_prototype.md` for full detail. Do not
-resume graph work without first deciding how to handle its two findings: (1) a
-numerical divergence in a single graph-mode call that needs runtime
-investigation (device-pointer/parameter bindings across the halo-exchange
-boundary are the leading hypothesis, not yet tested), and (2) a suspected
-job-resourcing confound (`--ntasks=1 --cpus-per-task=12` + `mpirun
---oversubscribe`) that produced ~8× inflated timings for both graph and
-non-graph modes in that pass and may also be implicated in a replay crash.
-**The next task is optimization**, but the recommended path is now either (a)
-resolve the CUDA Graphs correctness defect first if that investigation is
-authorized, or (b) fall back to one of the other two Prompt 7 candidates:
-kernel fusion/batching of the many small repetitive kernels, or
-halo/corner-service kernel-family consolidation (~18% of kernel time). Either
-way, re-establish a clean (properly-resourced) timing baseline before drawing
-conclusions from any run using `perf_rerun_logs/prompt8_graph.sbatch`'s
-resource request.
+**Prompt 8 — CUDA Graphs prototype: was BLOCKED, now SUPERSEDED by Prompt 13
+(see below).** Its two findings are resolved/explained: (1) the numerical
+divergence was **not** a device-pointer/parameter-binding problem — that
+leading hypothesis was wrong; the capture arm simply never launched the
+captured graph, so one `d_sw` substep was dropped (Prompt 13 §2); and (2) the
+suspected resourcing confound is **confirmed** — its sbatch ran `mpirun -np 6
+--oversubscribe` over a bench that already spawns 6 tile threads, i.e. 36
+tile-contexts / 36 threads on one A100 with 12 CPUs, which its own trace
+proves (`cudaStreamBeginCapture` = 36 = 6×6; `cudaGraphLaunch` = 2,664 = 74 ×
+36). **Do not reuse `perf_rerun_logs/prompt8_graph.sbatch`'s resource
+request**; use `perf_rerun_logs/prompt13_graph_repair.sbatch`, which invokes
+the benchmark directly with no `mpirun`. Read
+`prompt_8_cuda_graphs_prototype.md` only for historical context; its
+conclusions about graph viability are retracted.
 
 **Prompt 9 — narrow kernel-fusion prototype: COMPLETE.** See summary above and
 `docs/agent_handoff/prompt_9_kernel_fusion_validation.md` for full detail.
@@ -710,7 +1429,199 @@ halo/corner-service family generally (~18% of kernel time, per Prompt 7),
 `a2b4_global_corner_kernel` (108 calls/call), `pack_edge_kernel` (1,056
 calls/call). **Numerical algorithm changed: NO.**
 
-**Most recent pass — `omga` exit finalization.** Reused the existing 6C
+**Prompt 10 — `copy_corners_kernel` batching characterization: COMPLETE, NO
+IMPLEMENTATION.** Full detail:
+`docs/agent_handoff/prompt_10_copy_corners_batching.md`. Reused Prompt 9's
+existing nsys trace (no new profiling); read every one of the 11 production
+`launch_copy_corners_cuda` call sites (10 in `wp_b_cuda.cu`, 1 in
+`fv3_gpu_production_dispatch.cu`) and their callers. Reconstructed a
+per-tile-per-dyn_core-call inventory (≈192, ×6 tiles ≈1,152, matching the
+empirical 1,140 within ~1%). All four batching dimensions the task specified
+were ruled out on direct evidence, not assumption:
+- **(A) tile-batching** — the six tiles run as independent concurrent host
+  threads (`run_small_perf_bench.cpp:3277-3303`), each with its own GPU
+  context/stream; no shared launch surface exists. Redesign-level, not
+  attempted.
+- **(B) same-field/direction merge** and **(D) adjacent fusion** — every
+  loop-based call site (`del6_vt_flux_cuda`, `deln_flux_pass`) has a real
+  intervening consumer kernel between its `dir=1` and `dir=2` corner calls
+  that reads the `dir=1` rotation before `dir=2` overwrites the same cells.
+  Proven non-reorderable, not assumed.
+- **(C) cross-field merge** — the four `scalar_transport` calls in `d_sw`
+  (`delp`/`w`/`pt`/`vort`) looked independent but are a proven strict
+  sequential pipeline (S7→S8→S10→S11→S12→S14, and separately S32→S33→S34);
+  the three direct `del6_vt_flux_cuda` calls (`z2`/`wk`/`w`) live in three
+  separate subsystems with no proven-safe reorder relationship.
+One narrower, genuinely-safe lever was found and quantified, then rejected on
+cost/benefit: merging the *outer* per-`nord` corner calls in
+`del6_vt_flux_cuda`/`deln_flux_pass` across different `nord` values (they
+touch disjoint vertical-level subsets of the same buffer, so the rotation
+itself is nord-independent) — ceiling ≈180 of 17,730 total launches (≈1.0%),
+below Prompt 9's own measured wall-clock noise floor, at the cost of a new
+`LevelFilter` mode and restructuring two Gate-C2-validated damping operators
+at 5 call sites. Per the task's own instructions ("do not force [a] target if
+dependencies prove otherwise"; HARD STOP on "negligible launch reduction"),
+**no code was written, no build was touched, and no Slurm job was run.**
+**Numerical algorithm changed: N/A (no change made).** Higher-leverage unfused
+targets carried forward unchanged from Prompt 9: `a2b4_global_corner_kernel`
+(108 calls/call, 6.2% of kernel time), `pack_edge_kernel` (1,056 calls/call,
+3.6%, higher call count than `copy_corners` and not yet characterized), and
+the halo/corner-service family generally (~18% of kernel time).
+
+**Prompt 11 — pack/unpack halo-edge fusion: COMPLETE, IMPLEMENTED, and
+MEASURED with a real improvement.** Full detail:
+`docs/agent_handoff/prompt_11_next_launch_target.md`. Characterized exactly 2
+candidates as required: `pack_edge_kernel`/`unpack_edge_kernel` (~2,076
+combined launches/call, 6.8% of kernel time — carried forward from Prompt
+9/10) and `a2b4_global_corner_kernel` (108 launches/call, 6.2–6.6% of kernel
+time). Selected the pack/unpack family — it is the only one of the two whose
+launch-count ceiling (~1,548/call, ≈8.7% of the whole-call baseline) clears
+the task's ≥3% GO/NO-GO threshold; `a2b4_global_corner_kernel`'s ceiling
+(≤108/call, ≤0.61%) cannot, and its real fix is kernel-time/occupancy tuning,
+explicitly deferred by project policy. Implemented `--fuse-halo-edges`
+(opt-in, default off): new `pack_edge4_kernel`/`unpack_edge4_kernel` merge
+the 4-edge loop (west/east/south/north) into one launch per `(halo group,
+field)`, since each edge's send/recv slot is disjoint with **no
+producer/consumer dependency between edges** — unlike Prompt 10's
+`copy_corners` dir=1/dir=2 case, which had a real intervening consumer.
+**Numerical algorithm changed: NO** — same index arithmetic, same values,
+same buffer addresses. Validated `dyn_core_exit` **78/78 fields × tiles
+BITWISE IDENTICAL** (both alone and combined with Prompt 9's
+`--fuse-corner-fill`), R8 ctest PASS, both smokes PASS. Measured: whole-call
+kernel launches 17,730→16,074/call (**−9.34%**), kernel busy time
+74.0→67.44 ms/call (**−8.86%**), 32×32/R8 resident wall-clock 29.20→23.28
+ms/call (**−20.28%**, reproducible, spread ≤0.33 ms across 5 repeats — well
+above the noise floor that made Prompt 9's own wall-clock claim unusable).
+One nsys profile was run (gated correctly: only after validation PASSED and
+improvement cleared ≥3%). Outlook recorded as **DIMINISHING** for further
+local launch-count fusion in the halo/corner-service family — the two
+largest-ceiling remaining targets (`copy_corners_kernel`'s axes, this
+family's edge axis) are both now characterized to completion (one ruled out,
+one implemented); what remains in that family is individually below the ≥3%
+threshold, so the next step should be kernel-time/occupancy tuning or
+revisiting the blocked CUDA Graphs prototype (Prompt 8), both explicitly
+deferred architectural work, not another local fusion pass.
+
+**Prompt 12 — `a2b4_global_corner_kernel` compute tuning: COMPLETE, MODERATE
+value (−2.15%).** See the leading summary, §9 item 7, and
+`prompt_12_a2b4_kernel_tuning.md`. Bitwise identical (156/156). `ncu` was
+platform-blocked; see §10.
+
+**Prompt 13 — architecture-level optimization: COMPLETE, CUDA GRAPH REPAIR
+SELECTED AND IMPLEMENTED (−5.14%).** Full detail:
+`docs/agent_handoff/prompt_13_architectural_optimization.md`. Compared two
+architecture-level directions from source before implementing anything: **(A)
+repair CUDA Graph replay safety for a bounded capture region** versus **(B)
+reduce host launch/orchestration overhead by explicit stage/tile batching
+without graphs**. Selected A because it classified **LOCAL** — a missing
+`cudaGraphLaunch`, not a graph-semantics or communication problem — whereas
+B's only ≥5%-ceiling candidates were MODERATE-to-RUNTIME-REDESIGN.
+- **§1 host-orchestration characterization** (compact diagram in the handoff,
+  no kernel enumeration): 6 host threads in **one** process
+  (`run_small_perf_bench.cpp:3297-3310`, `kTiles=6`), one GPU context per tile
+  (`:2822`), all six sharing the device's CUDA **primary** context (only
+  `cudaSetDevice` is called; `cudaStreamCreateWithFlags` Num Calls = 12 = 2
+  streams × 6 tiles); host-side `n_split` acoustic loop
+  (`fv3_gpu_runtime.cpp:1826-2071`) over a 13-slot `NumericalDispatch` table;
+  10 halo resolve sites in-loop (7 fire per substep) plus `H_HEAT` after it; 6
+  events, all `cudaEventDisableTiming`; **zero device syncs inside the loop on
+  the default path** (only two host `pg->barrier()` calls ordering enqueue);
+  one lazy at-most-once `heat_accum` `cudaMalloc` before the loop.
+- **§2 root cause of the Prompt 8 failure — verified, not hypothesized.**
+  Stream-captured work is **recorded, not executed**. The capture arm did
+  BeginCapture → run → EndCapture → Instantiate with **no `cudaGraphLaunch`**,
+  and the `} else` bound the fallback `run(dispatch.dgrid_dynamics)` to
+  non-graph mode only, so one whole `d_sw` substep (transport,
+  divergence/vorticity damping, KE/`heat_source` generation) was dropped on
+  the first substep of the first `fv3_gpu_dyn_core_step` per context per
+  repeat — matching Prompt 8's O(1) *uncorrelated* wind divergence exactly.
+  Every alternative mechanism was affirmatively excluded (8-row table in the
+  handoff): **graph-node parameter updates required = ZERO** (no per-substep
+  scalar reaches `dgrid_dynamics`); device pointers are allocated once and
+  arena bases re-derived byte-identically; halo data is LIVE inside the region
+  (base frozen, data ordered in by `cudaStreamWaitEvent(compute_stream,
+  event_halo_xfer)`); no CUDA API call inside the region except
+  `cudaPeekAtLastError()`. The one by-value host scalar that *could* differ
+  between calls is `DSwOptions::dt` (`= bdt/n_split`), handled by a
+  capture-time invariance guard rather than node rewriting.
+- **§6/§7 prototype and validation.** ~15 lines across 2 files
+  (`runtime/fv3_gpu_runtime.cpp`, `include/fv3_gpu_context.hpp`); **capture
+  region unchanged — `dgrid_dynamics` only; halo exchange is NOT captured.**
+  Ladder: 1 call (the capture occurrence — precisely what Prompt 8 got wrong)
+  **78/78 bitwise identical**; 5 calls (1 capture + 14 replays/tile)
+  **78/78 bitwise identical**; 600-call / 1,800-substep / 1,770-replay stress
+  clean — **no illegal memory access, no NONFINITE, no FAIL lines**. Prompt
+  8's replay crash did not reproduce; most plausibly a consequence of the same
+  defect (subsequent substeps on corrupted state) and/or the 36-context
+  oversubscription — stated as inference, since it can no longer be reproduced
+  to test. 60 `[FV3_GPU_GRAPH] capture+instantiate_ms=` lines (11.9–16.2 ms) =
+  6 tiles × 10 graph-mode invocations, confirming exactly one capture per
+  context per repeat and nothing re-capturing mid-run.
+- **§8 performance:** 21.660791 → 20.546787 ms/call (**−5.14%**), launches
+  16,182 → 11,067/call (**−31.6%**) — see §6 above for the full tables and for
+  the regime-change finding that retires Direction B.
+- **§9/§10 cost control:** one architecture choice, one prototype, 32×32/R8
+  only, **zero of the three permitted fix cycles consumed** (the prototype
+  worked on the first attempt), no Fortran rerun, no R4, no new savepoints, no
+  individual-kernel tuning, `ncu` not run. Ended on hard-stop condition "the
+  prototype succeeds and is measured".
+**Numerical algorithm changed: NO.** Graph mode remains opt-in
+(`--cuda-graph`, default off), so the default path is provably unchanged.
+
+**Prompt 14 — standalone CUDA production integration: BLOCKED/ESCALATED, then
+UNBLOCKED by Prompt 15.** Its §2 production `dyn_core` call-boundary interface
+table (`fv_dynamics.F90:645-655` call site, `dyn_core.F90:166-263` signature,
+field by field) is complete and reusable as-is. Its blocker — no cross-process
+halo transport — is closed; see Prompt 15. Its secondary finding still stands:
+`NumericalConfig` installation and real `TopologyView`-based topology
+installation are still only reachable through internal C++
+(`install_config`/`set_topology`), so a public ABI extension for those is still
+needed. Detail: `prompt_14_standalone_cuda_integration.md`.
+
+**Prompt 15 — cross-process MPI halo transport: COMPLETE. CLOSES the Prompt 14
+blocker.** Full detail: `docs/agent_handoff/prompt_15_mpi_halo_transport.md`;
+summary in the lead paragraph at the top of this file. In brief: a
+`HaloTransport` interface with two backends (`PeerHaloTransport` in-process,
+default; `MpiHaloTransport` host-staged real MPI, six processes, one tile per
+rank), sharing all topology/rotation/sign/pack/unpack logic so the MPI backend
+duplicates **no** edge-rotation formula; a public C ABI for transport selection
+with **no C++/MPI type** (communicator crosses as the Fortran INTEGER handle);
+and `HaloPeerGroup` functionality fully preserved. Evidence: six-rank
+provenance test **16,692 checks / 0 failures** covering scalar, both wind
+staggerings (DGRID_NE *and* the transposed CGRID_NE), the 4-field width-3
+multi-ring group, and E11; six-MPI-process `dyn_core_exit` **78/78 BITWISE
+IDENTICAL** to the in-process path at 1 and 5 calls; R8 ctest **22/22 MPI-OFF /
+23/23 MPI-ON**. **Numerical algorithm changed: NO.** Zero of 3 permitted
+transport fixes consumed. Method notes worth carrying forward:
+- **Put the transport seam where the ordering already is.** Reading the proven
+  exchange ordering first (`pack → pack_done → [transport] → unpack →
+  xfer_done → consumer → [release]`) showed that exactly two steps are
+  transport-dependent, so the interface has exactly two methods and no logic
+  could be duplicated even by accident. Designing the interface from the
+  ordering rather than from the MPI call list is what kept the rotation
+  formulas in one place.
+- **Verify the mapping instead of trusting it.** The rank↔tile identity was
+  confirmed from source *and* then checked at runtime by allgathering the tile
+  map and cross-checking every neighbour's `(rank, tile)` pair. A mis-wired
+  launcher now fails at attach rather than exchanging plausible-looking wrong
+  data.
+- **Test the transposed pair, not just one wind group.** `H_DWIND_*` and
+  `H_CWIND` carry the same two staggerings in *opposite* argument slots; a
+  staggering-keyed sign would pass one and fail the other. Both were exercised
+  deliberately for that reason.
+- **Prove equivalence against the already-validated path, not against a
+  loosened tolerance.** Running both transports from the same binary, same
+  flags, same node, same job — differing only in `--mpi-halo` — made BITWISE
+  the achievable bar and made any difference attributable to the transport
+  alone. No new Fortran run was needed.
+- **Collective-safety hazards are design problems, not debugging problems.** A
+  lone SKIP-77, a mid-run failure, and a premature detach would each hang or
+  corrupt the other five ranks; all three were handled up front
+  (`MPI_Allreduce(MPI_MIN)` on device usability, `MPI_Abort` instead of
+  `return false`, teardown before the timing reduction) rather than diagnosed
+  from a hung job.
+
+**Earlier pass — `omga` exit finalization.** Reused the existing 6C
 savepoints (no new fixture run, no new Fortran instrumentation). Scope was the
 exit `omga` only. **One fix used**, of the three permitted: the missing omega
 finalization path, implemented as `omega_pem_snapshot` + `omega_from_pe` +
@@ -860,30 +1771,201 @@ committed): `GEOSfvdycore_fortran_perf/experiments/c8_L10_savepoint_6{a,c}_run{1
    validated the approach (bitwise-identical, ctest clean) but only moved the
    launch count 17,730→17,370/call (−2.0%) — too small a target to call the
    fusion/batching optimization candidate closed.
-5. **RESUME HERE.** Either (a) investigate the CUDA Graphs numerical/replay
-   defect in `dgrid_dynamics` if the user authorizes continued graph work
-   (start from the leading hypothesis in `prompt_8_cuda_graphs_prototype.md`
-   §4: device-pointer/parameter bindings captured across the halo-exchange
-   boundary), or (b) extend the now-validated fusion approach to a
-   higher-leverage target — `copy_corners_kernel` (1,140 calls/dyn_core-call)
-   or the broader halo/corner-service kernel family (~18% of kernel time) are
-   the largest unfused counts identified so far — or (c) halo/corner-service
-   kernel-family consolidation more broadly. Whichever is chosen, first
-   re-take a clean timing baseline with a properly-resourced Slurm job
-   (Prompt 8's `--ntasks=1`+`--oversubscribe` job produced timings ~8× the
-   Prompt 7 reference and should not be reused as-is; Prompt 9's job was
-   properly resourced but used few enough repeats that its wall-clock read is
-   not conclusive — use more repeats next time before quoting a % speedup).
-6. Before extending the Gate C2 claim beyond this configuration, close the
+5. ~~Characterize `copy_corners_kernel` (1,140 calls/dyn_core-call) as a
+   batching target~~ — **DONE, NO IMPLEMENTATION WARRANTED (Prompt 10)**. See
+   summary above and `prompt_10_copy_corners_batching.md`. All four batching
+   dimensions were ruled out by direct source reading (tile-batching needs a
+   runtime redesign; every same-buffer `dir=1`/`dir=2` pair has a proven
+   intervening consumer; the apparent cross-field candidates are a proven
+   sequential pipeline). The one safe partial lever found tops out at ≈1.0%
+   of total launches — below Prompt 9's measured noise floor.
+6. ~~Characterize `pack_edge_kernel`/`unpack_edge_kernel` and
+   `a2b4_global_corner_kernel` as launch-fusion targets, rank them, implement
+   the winner if it clears a 3% whole-call threshold~~ — **DONE, IMPLEMENTED
+   AND MEASURED (Prompt 11)**. See summary above and
+   `prompt_11_next_launch_target.md`. Pack/unpack halo-edge fusion
+   (`--fuse-halo-edges`) selected over `a2b4_global_corner_kernel` (whose cost
+   is kernel-time-bound at only 108 calls/call, below threshold). Measured
+   17,730→16,074 launches/call (−9.34%), 74.0→67.44 ms/call kernel time
+   (−8.86%), and a reproducible 32×32/R8 resident wall-clock improvement of
+   −20.28% (29.20→23.28 ms/call median of 5 repeats). Bitwise identical to
+   default on all 13 exit fields × 6 tiles, alone and combined with Prompt 9's
+   `--fuse-corner-fill`. This closes out option (b) from the prior version of
+   this item.
+7. ~~Local launch-count fusion of the halo/corner-service family had
+   diminishing headroom; characterize `a2b4_global_corner_kernel` as a
+   compute/kernel-time problem instead of a launch-count problem~~ — **DONE,
+   MODERATE VALUE (Prompt 12)**. See summary above and
+   `prompt_12_a2b4_kernel_tuning.md`. Restructured the launch from 1 block/128
+   threads (10 active, 1 SM used, up to 4 corners serialized per thread) to
+   `dim3(4, levels, 1)`/1 thread — same formula, same summation order,
+   bitwise-identical (156/156). Measured **−2.15%** whole-dyn_core-call
+   (22.743409→22.255549 ms/call, 32×32/R8/resident/`--fuse-halo-edges`) —
+   MODERATE, below the 3% HIGH-VALUE bar. **ncu profiling is platform-blocked
+   on this Discover allocation** (`ERR_NVGPUCTRPERM` — GPU performance-counter
+   access denied to this account), so the bottleneck classification
+   (SERIAL/LOW-PARALLELISM primary, OCCUPANCY-BOUND secondary) is
+   source-reading inference, not ncu-measured. See §10 for this as a new
+   recorded platform constraint.
+8. ~~Two paths forward: (a) request `ncu` counter access for further
+   kernel-time tuning; or (b) investigate the CUDA Graphs numerical/replay
+   defect in `dgrid_dynamics`~~ — **(b) DONE (Prompt 13): the graph defect was
+   LOCAL, is repaired, and graph mode now measures −5.14%.** See the leading
+   summary, §6, §8 and `prompt_13_architectural_optimization.md`. Its leading
+   hypothesis (device-pointer/parameter bindings across the halo boundary) was
+   **wrong**; the capture arm never launched the captured graph. Path (a)
+   remains open and unattempted (`ncu` is still platform-blocked, §10).
+9. ~~The recommended next milestone is STANDALONE CUDA INTEGRATION, not
+   further local performance work~~ — **ATTEMPTED (Prompt 14), BLOCKED,
+   ESCALATED to Opus; then UNBLOCKED by Prompt 15 (item 14) and now resumable
+   at item 15 — RESUME THERE, not here.**
+   Rationale, all measured
+   in Prompt 13 (§6): the workload is now **GPU-execution-bound**, not
+   host-launch-bound — a −31.6% launch reduction bought only −5.14% wall
+   clock, and `cudaStreamSynchronize` total time rose 0.44 → 135.5 ms. The
+   launch-latency model that made Prompts 7/9/11/12 straightforward to
+   estimate no longer predicts benefit, so the remaining launch-side lever
+   (Direction B, explicit stage/tile batching; the largest candidate is
+   collapsing `c_sw`'s per-level launches, −5,670/call = −35.3%, numerical
+   risk NONE by proven level independence) is now worth only ~5% for a
+   MODERATE-scope change across ~31 signatures — a materially worse
+   value/risk ratio than it looked pre-Prompt-13. Genuine further speedup
+   would need kernel-time/occupancy work on the individually expensive
+   kernels (`riem_solver3_kernel`/`riem_solver_c_kernel`, ~144–148 μs avg
+   each), which is **gated on `ncu` counter access** (§10) and is explicitly
+   deferred by `project_architecture.md` ("Performance Work Comes Later").
+   Confirm scope with the user before starting any further optimization pass.
+   If resuming performance work, the current same-node reference is Prompt
+   13's: **21.660791 ms/call** (32×32/R8/resident/`--fuse-halo-edges`, graph
+   off) and **20.546787 ms/call** (same + `--cuda-graph`); reuse
+   `perf_rerun_logs/prompt13_graph_repair.sbatch`'s resourcing, never Prompt
+   8's.
+10. Before extending the Gate C2 claim beyond this configuration, close the
    recorded gaps in §10 in this order: R4 validation (currently only compiled and
    ctest-clean, never savepoint-compared); `MOIST_CAPPA`/`USE_COND` for any moist
    configuration; the four `a_imp <= 0.999` inert-but-non-authoritative knobs
    (`scale_m`, `m_split`, `delt_max`); `pe`'s unwritten halo ring; the
    un-localized `fv3_dispatch_smoke` Phase C failure at `nf_ke > 1`.
-7. Consider consolidating the ten-plus passes of uncommitted Prompt 6B/7/8/9
-   work into a commit (**only when the user asks** — do not push or merge).
-   This is now a natural commit point: Gate C2 is closed and the tree is
-   ctest-clean.
+11. ~~Consider consolidating the ten-plus passes of uncommitted Prompt 6B/7/8/9
+    work into a commit~~ — **DONE**, by the user, in `b456897` (not by an agent
+    pass; see §1). Not pushed. Push/merge only if explicitly requested.
+12. ~~Consolidate the uncommitted Prompt 11 pack/unpack halo-edge fusion work
+    into a commit~~ — **DONE**, by the user, in `7dda37b` (not by an agent
+    pass; see §1). Not pushed.
+13. ~~Consolidate the uncommitted Prompt 12/13 work~~ — **DONE**, by the user,
+    in `eb6d689` ("Optimize CUDA dyn_core launch orchestration"; not by an
+    agent pass — see §1). Not pushed. What is now uncommitted is the **Prompt
+    15 MPI halo transport** (8 modified files + 4 new source files + this file
+    + `prompt_15_mpi_halo_transport.md`), plus the still-untracked Prompt
+    10/11/12/13/14 handoff docs and `perf_rerun_logs/*.sbatch` scripts —
+    pending explicit user request; not committed or pushed (see §1). **Do not
+    commit** the profiler artifacts (`nsys_p13_*.nsys-rep`, `*.sqlite`), the
+    build directories (`build_cuda_r8_mpi/`, `build_cuda_r8_mpibench/`),
+    `scratch_p15/`, or any `*.out` job log.
+14. ~~Prompt 14 blocked on the absence of a cross-process halo transport~~ —
+    **UNBLOCKED (Prompt 15): the transport now exists and is validated.** A
+    `HaloTransport` interface with a host-staged real-MPI backend (six
+    processes, one tile per rank) produces a `dyn_core_exit` state BITWISE
+    IDENTICAL to the Gate-C2-validated in-process path, with the in-process
+    `HaloPeerGroup` fully preserved and the MPI path opt-in. See the Prompt 15
+    lead paragraph, §3, §4, §7, §8, and
+    `docs/agent_handoff/prompt_15_mpi_halo_transport.md`. Direction chosen:
+    **host-staged MPI** — `project_architecture.md`'s "Stage 1". Stage 2
+    (CUDA-aware MPI) and Stage 3 (comm/compute overlap) are new backends behind
+    the same interface, not a redesign, and remain deferred.
+15. ~~RESUME HERE — standalone CUDA production integration, second
+    attempt~~ — **STARTED (Prompt 16), PARTIAL: item (1) below is DONE; items
+    (2)-(4) are BLOCKED — see item 16.** Prompt 14's blocker is gone, so the
+    work it deferred was the next step, in this order:
+    1. **Extend the public C ABI for per-run setup.** `NumericalConfig`
+       installation and real `TopologyView`-based topology installation are
+       still only reachable through internal, non-ABI C++
+       (`install_config`/`set_topology` in the benchmark and
+       `fv3_gpu_internal.hpp`). Transport attachment is *already* public
+       (`fv3_gpu_attach_mpi_halo_transport` /
+       `fv3_gpu_detach_halo_transport` / `fv3_gpu_halo_transport_kind_of`,
+       `include/fv3_gpu_communication.h`) — model the new entry points on
+       those, and keep the same rule: no C++ or MPI type in the ABI.
+    2. **Write the Fortran `ISO_C_BINDING` wrapper and branch the real call
+       site** at `fv_dynamics.F90:645-655` (inside `do n_map=1,k_split`),
+       keeping the Fortran backend the default. The field-by-field interface
+       table in `prompt_14_standalone_cuda_integration.md` §2 is complete and
+       reusable as-is — do not re-derive it.
+    3. **Pass the GEOS/FV3 communicator through as the Fortran INTEGER
+       handle** (`MPI_Comm_c2f` on the caller side); this is already what the
+       transport expects, and is why no MPI type appears in the ABI.
+    4. Run the real `StandAlone_FV3_Dycore.x` under `FV_NX=1`/`FV_NY=6`, six
+       ranks, and compare against the Fortran backend.
+    Note on what is *not* yet proven: the standalone Fortran backend was not
+    re-verified in Prompt 14 or 15 (no build of it was run in either pass), and
+    ABI/compiler-family compatibility with an Intel production GEOS build
+    remains an open question flagged in `discover_platform.md` — the CUDA side
+    is GCC-based.
+    - Sub-item (1), the public C ABI, is now **DONE (Prompt 16)** — see the
+      Prompt 16 lead paragraph and
+      `prompt_14_standalone_cuda_integration.md` §7.1.
+16. ~~Resolve the `i_pack`/FMS group-halo-update ownership question before
+    writing any more of the Fortran wrapper~~ — **DONE (Prompt 17): ownership
+    RESOLVED from FMS source, Design A adopted, and the standalone CUDA
+    backend now runs and compares.** `mpp_start_group_update` packs/posts and
+    increments `num_nonblock_group_update` immediately and only
+    `mpp_complete_group_update` unwinds it, so abandoning a started handle
+    leaks a slot and MPI requests per `k_split` — the CUDA arm therefore does
+    not *issue* `i_pack(1)`/`i_pack(8)` (both DUPLICATE of CUDA's own
+    `H_DSCALAR`/`H_DWIND_IN` before the same consumers) while `i_pack(10)`
+    (tracer, DISTINCT REQUIRED) is still issued. See the Prompt 17 lead
+    paragraph and `prompt_14_standalone_cuda_integration.md` §8.
+    **Original text retained below for the source-evidence trail.**
+16b. ~~Fix the intermittent `fv3_halo_mpi_transport` failure before any longer
+    standalone validation run~~ — **DONE (Prompt 18): root-caused, fixed, and
+    the transport is DETERMINISTIC at 24/24 consecutive OpenMPI runs (16692
+    checks / 0 failures each), Intel MPI 5/5 PASS, R8 CTest 23/23.** The defect
+    was **not** in the transport: the test harness issued its own `0xFF` poison
+    `cudaMemset` and its field-array H2D on the **legacy** stream, unordered
+    against the `cudaStreamNonBlocking` exchange stream. Not an MPI contract
+    violation, not an OpenMPI bug. Three prior premises were measured wrong —
+    the Intel-MPI-vs-OpenMPI comparison was inverted, the failing value was
+    poison rather than 0.0, and the blast radius is a whole 105-element recv
+    slot rather than one cell. One production hardening applied
+    (`fv3_gpu_runtime.cpp:1290-1291` attach-time clears → `cudaMemsetAsync` on
+    `d.transfer_stream`). The standalone short run was re-verified unchanged.
+    See the Prompt 18 lead paragraph and
+    `prompt_18_mpi_transport_determinism.md`.
+17. ~~RESUME HERE — continue standalone validation: a longer multi-`k_split` /
+    multi-day run~~ — **DONE (Prompt 19): PASS.** Stage A (72 dyn_core calls,
+    k_split=1) and Stage B (12 dyn_core calls, k_split=2, the smallest
+    unambiguous multi-`k_split` case) both PASS with zero SIGNIFICANT
+    differences, no jump at the k_split/remap boundary, and `delp` positive on
+    both backends. See the Prompt 19 lead paragraph and
+    `docs/agent_handoff/prompt_19_longer_standalone_validation.md`. **RESUME
+    HERE — next validation envelope is R4 savepoint comparison, then wider
+    grids.** The reproduction recipe
+    (`p17_both.sbatch`, `p17_rebuild_exe.sh`, `p17_rebuild_all.sh`,
+    `p17_regress.sbatch`, `compare_dcx_backends.py --stage {dce,dcx}`) is in
+    `prompt_14_standalone_cuda_integration.md` §8.9; the Prompt 19
+    `p19_stageA_*`/`p19_stageB_*` experiment directories under
+    `GEOSfvdycore_fortran_perf/experiments/` are a ready-made template for
+    varying grid/precision similarly. Note the still-open
+    items: ABI/compiler-family compatibility with an Intel *production* GEOS
+    build is untested (this fixture links GCC-built CUDA archives into an
+    Intel-Fortran executable successfully, which is evidence but not proof for
+    full GEOS), and the four `a_imp <= 0.999` knobs plus
+    `MOIST_CAPPA`/`USE_COND` remain as recorded in §10.
+16-original. **RESUME HERE — resolve the `i_pack`/FMS group-halo-update ownership
+    question before writing any more of the Fortran wrapper.** Found this
+    pass (Prompt 16); full detail in the Prompt 16 lead paragraph above and
+    `prompt_14_standalone_cuda_integration.md` §7.2. Concretely:
+    `fv_dynamics.F90:620/626/627/630` starts FMS group-halo updates
+    (`i_pack(1)` for `delp`/`pt`/`q_con`, `i_pack(8)` for `u`/`v`
+    `gridtype=DGRID_NE`) and passes `i_pack(*)` into `dyn_core` at `:645` for
+    completion inside it — a layer above and separate from `dyn_core`'s own
+    CUDA six-tile halo exchange. Read FMS's `mpp_domains`
+    `start_group_halo_update`/handle-completion contract (not yet read by any
+    prompt) to determine whether the CUDA branch may safely skip issuing
+    these calls, or must complete them some other way, before writing §5 (the
+    Fortran `ISO_C_BINDING` wrapper) or branching the real call site at §6.
+    Escalate to Opus if the FMS contract itself is ambiguous or under-
+    documented, per the task's own model policy.
 
 Carry forward the ordering that found 13 of 13 input-fidelity root causes:
 **audit input fidelity — values, store order, registration, and *derived* config
@@ -906,6 +1988,115 @@ briefly produced false FAILs this pass:
 
 ## 10. Known Open Issues / Deferred Items
 
+- **RESOLVED (Prompt 18, 2026-09-04) — the intermittent
+  `fv3_halo_mpi_transport` failure. Recorded here as a standing CODING
+  CONSTRAINT, because the hazard class is easy to reintroduce.** **A plain
+  `cudaMemset` on device memory, and a synchronous `cudaMemcpy` H2D from
+  pageable memory, are BOTH legacy-stream operations and are NOT ordered
+  against a stream created with `cudaStreamNonBlocking`** — which is how
+  `d.transfer_stream` and the transport test's exchange stream are both
+  created, precisely to opt out of implicit legacy synchronization. Any clear,
+  poison-fill, or seed of a buffer that a non-blocking stream will later read
+  must be enqueued **on that stream** (`cudaMemsetAsync`/`cudaMemcpyAsync`).
+  Two live instances were found and fixed: the transport test's `0xFF` poison
+  memsets plus its `TileArray::create()` field-array H2D (the measured cause of
+  the intermittent six-rank failure — whole-slot `POISON-REMAINS`, 6 of 12
+  repeats), and, as hardening in the same class,
+  `fv3_gpu_runtime.cpp:1290-1291`'s attach-time halo-buffer clears. Two useful
+  artifacts to reuse rather than rebuild: **`FV3_HALO_TEST_LEGACY_SETUP=1`**
+  reproduces the defect on demand from the fixed binary (3 of 6 repeats fail),
+  which is how the fix was proven to be the differentiator rather than a
+  timing coincidence; and **`FV3_HALO_TEST_DEBUG=1`** emits the per-block
+  diagnostics (`BLOCK FAIL n/m cells | group … | tag … | slot offset … | slot
+  census: poison/zero/other`) plus a `classify()` that distinguishes
+  `POISON-REMAINS` from `ZERO` from `WRONG-VALUE`. Keep that distinction: a
+  `0xFF`-poisoned R8 is NaN, `std::llround(NaN)` → `LLONG_MIN`, and the
+  provenance oracle decodes that to the *same* text as a genuine 0.0
+  (`tile 0 (-8,-8,0)`) — which is exactly why two prior passes read the symptom
+  as "unwritten" and looked inside the transport. Detail:
+  `prompt_18_mpi_transport_determinism.md`.
+- **RESOLVED (Prompt 15, 2026-09-04) — was the BLOCKING item for standalone
+  integration.** A real cross-process halo transport now exists
+  (`runtime/fv3_gpu_halo_mpi.cpp`, host-staged MPI, six processes / one tile
+  per rank) behind a `HaloTransport` interface, with `HaloPeerGroup` preserved
+  as the default in-process backend, and it is validated BITWISE against that
+  path at the dyn_core exit. Direction taken: `project_architecture.md`'s
+  "Stage 1" host-staged MPI. See the Prompt 15 lead paragraph, §3/§4/§7/§8,
+  §9 items 14–15, and `prompt_15_mpi_halo_transport.md`. Two limits recorded
+  so they are not assumed away: the transport requires a communicator of
+  **exactly 6 ranks** with a one-tile-per-rank map (it refuses anything else
+  at attach), and the staging is **host-staged** — CUDA-aware MPI/GPU-direct
+  (Stage 2) and comm/compute overlap (Stage 3) are still unimplemented, and
+  are new backends behind the same interface rather than changes to it. The
+  original finding is retained below for context.
+  **(Historical, Prompt 14, 2026-09-04): the CUDA
+  halo exchange transport (`HaloPeerGroup`, `fv3_gpu_halo_peer.hpp`) is
+  single-process/six-host-thread only ("Model B") and has no cross-process
+  (MPI or otherwise) counterpart anywhere in the codebase.** Real production
+  is six separate MPI ranks/processes (`FV_NX=1`/`FV_NY=6`); `HaloPeerGroup`
+  rendezvouses with a process-local `std::mutex`/`std::condition_variable`
+  and copies between raw device pointers only valid in one address space —
+  neither works across OS processes. Confirmed by grep that no real MPI API
+  call exists in `cuda/dyn_core/runtime`/`cuda/dyn_core/include`, and that
+  `fv3_gpu_create_desc::communicator_token` is unwired everywhere outside its
+  own definition. This is a known, previously self-documented scope
+  limitation from Milestone 3A.10 (`milestone_3a10_gpu_halo_exchange.md:471,955`),
+  not a newly introduced defect. Closing it requires implementing a real
+  cross-process halo transport (candidates: host-staged real MPI, matching
+  `project_architecture.md`'s own deferred "Stage 1"; or CUDA-aware MPI/
+  GPU-direct, its "Stage 2/3") — a runtime redesign, escalated to Opus rather
+  than attempted here. See §9 item 14 and
+  `docs/agent_handoff/prompt_14_standalone_cuda_integration.md`.
+- **New platform constraint (Prompt 12, 2026-09-04): `ncu` (Nsight Compute)
+  profiling is BLOCKED by GPU performance-counter permissions on this
+  Discover `gpu_a100` allocation.** Both scoped `ncu` invocations in job
+  58238626 (`--kernel-name a2b4_global_corner_kernel`) returned
+  `ERR_NVGPUCTRPERM — The user does not have permission to access NVIDIA GPU
+  Performance Counters on the target device`. The wrapped application ran
+  normally in both cases; only counter collection was denied. This is a
+  driver/administrative restriction (`NVreg_RestrictProfilingToAdminUsers`-
+  style), not a flag or kernel-name error, and not fixable from an
+  unprivileged job submission. Any future task that needs `ncu` (as opposed
+  to `nsys`, which has worked throughout Prompts 7/9/11/13) should either
+  request NCCS grant counter access for this account, or plan to rely on
+  source-reading/`nsys`-only evidence instead. Detail:
+  `prompt_12_a2b4_kernel_tuning.md` §2. **This constraint is now the binding
+  one for further performance work** — see the next item.
+- **New performance finding (Prompt 13, 2026-09-04): the workload is
+  GPU-EXECUTION-BOUND, so launch-count optimization is no longer the right
+  lever.** Measured, not inferred: a −31.6% reduction in `cudaLaunchKernel`
+  per dyn_core call (16,182 → 11,067) bought only **−5.14%** wall clock, and
+  `cudaStreamSynchronize` total time rose **0.44 → 135.5 ms** (Max 0.036 →
+  12.999 ms) — the host now waits on the device. The `wall ≈ launches_per_tile
+  × launch latency` model that fit Prompt 7 (92%) and Prompt 11 (87%) is
+  therefore **retired**; do not use it to estimate a future optimization's
+  value. Consequence: **Direction B (explicit stage/tile batching without
+  graphs) is de-prioritized** even though its largest candidate is
+  numerically risk-free (collapsing `c_sw`'s per-level launches, −5,670/call =
+  −35.3%; level independence proven three ways — driver comment at
+  `cgrid/fv3_cgrid_predictor.cu:710-716`, a per-level-disjoint arena, and zero
+  `k±1` accesses), because it would now be worth only ~5% for a MODERATE-scope
+  change across ~31 kernel signatures. Real further speedup requires
+  kernel-time/occupancy work on `riem_solver3_kernel`/`riem_solver_c_kernel`,
+  which is gated on the `ncu` permission above. Detail:
+  `prompt_13_architectural_optimization.md` §8.
+- **CUDA Graph mode (`--cuda-graph`): FUNCTIONAL, opt-in, validated
+  bitwise — but its scope is narrow.** Prompt 13 repaired the missing
+  `cudaGraphLaunch` in the capture arm (Prompt 8's "replay diverges" defect).
+  Recorded limits, so they are not rediscovered or accidentally widened: the
+  captured region is **`dgrid_dynamics` only** and deliberately excludes the
+  halo exchange (bounded by `resolve(H_CWIND)` before and
+  `resolve(H_DSCALAR)` after, capture mode `ThreadLocal`); capture freezes
+  `DSwOptions::dt = bdt/n_split` by value into every node, so replay **refuses
+  with `FV3_GPU_UNSUPPORTED_CONFIGURATION`** if `bdt`/`n_split` differ from
+  the capture-time pair (a fixed timestep for the context lifetime is
+  required — a variable-timestep configuration would need
+  `cudaGraphExecKernelNodeSetParams` or re-capture); one capture per context
+  per benchmark repeat, ~11.9–16.2 ms each, which must be amortized. Default
+  remains off, so the default path is provably unchanged. Prompt 8's replay
+  crash did not reproduce across 1,770 replays, but that is **absence of
+  reproduction, not a proven root cause** — if it ever resurfaces, treat it as
+  open again.
 - **`nf_ke` / corner service: IMPLEMENTED** (was Gate-C2-blocking). The exit
   `pt` now validates at ROUND-OFF SCALE; see §4 #12/#13 and
   `prompt_6b_cuda_fortran_validation.md` §21. Three things came out of it that
@@ -1030,13 +2221,29 @@ briefly produced false FAILs this pass:
   tiles 2/3/4" symptom does not reproduce. E11 is live exactly at `it=3` for
   n_split=3, and its footprint there was measured directly (only
   `u(is:ie,je+1,:)` / `v(ie+1,js:je,:)` change; 0.0 off-line).
-- **`pe`'s one Fortran halo ring is NOT WRITTEN by CUDA** at the dyn_core exit
-  (`pe` is declared `pe(is-1:ie+1, 1:npz+1, js-1:je+1)`). The ring still holds
-  the harness 1e-15 poison sentinel, so including it reported max|diff| ≈ 1.0e+05
-  — a coverage gap, not a numerical disagreement. `SP3_DEFINED_BOX["pe"]` in
-  `tools/savepoints/compare_cuda_fortran.py` is narrowed to the owned box with
-  the ring classified separately. Decide whether the ring must be written before
-  GEOS integration (it depends on what consumes `pe` downstream of dyn_core).
+- ~~**`pe`'s one Fortran halo ring is NOT WRITTEN by CUDA**, a coverage gap
+  with no known downstream consumer~~ — **RESOLVED (Prompt 17), and the
+  "no consumer" half of this item was WRONG.** The ring *is* consumed:
+  `Lagrangian_to_Eulerian`'s D-grid wind/flux vertical remap reads it at
+  `fv_mapz.F90:686/693` (driving `u`/`mfy`/`cy` at `j=js` and `j=je+1`) and
+  `:729/740` (driving `v`/`mfx`/`cx` at `i=is` and `i=ie+1`). Leaving it
+  unwritten produced an O(1) standalone divergence from the **second** dyn_core
+  call onward (`u` 1.845e+00 confined to exactly `j=js`/`j=je+1`, `v` to
+  exactly `i=is`/`i=ie+1` — the footprint is what identified the consumer),
+  plus a *uniform-in-k* `pt` offset of 1.032e-04 via the `consv_te = 1.0`
+  energy fixer. Fixed by reproducing `pe_halo` (`dyn_core.F90:1504-1532`, called
+  at `:1011` under `remap_step`) on the host after the D2H as
+  `fv3_gpu_interface_pe_halo`; bit-for-bit equivalent because no `delp` write
+  exists between `:1011` and `:1375`, so the ring is exactly
+  `cumsum(ptop, exit delp ring)` and `delp`'s own ring is already host-resident.
+  `pe_halo` is `private` (`:142`), hence reproduced rather than called. The
+  standalone-comparison narrowing note still applies to
+  `compare_cuda_fortran.py`'s `SP3_DEFINED_BOX["pe"]`, which is unchanged.
+  **General lesson worth keeping: "unwritten but apparently inert" is a claim
+  about consumers, and it was never checked past `dyn_core`'s own exit.** Two
+  sibling boundary items were closed in the same fix — the four flux
+  capacitors (`mfx`/`mfy`/`cx`/`cy`) and `ws` were also never copied out, and
+  `z_rat`/`ut`/`vt`/`peln` descriptors had wrong bounds.
 - **`clamp_nord_cap` (D1)** caps the WP-B group loop at `ng-1==2`, so
   `nord_k==3` silently gets zero divergence damping while still returning
   success. **Not a defect at production `nord=2`** — `clamp_nord_cap(2,3) = 2`,
