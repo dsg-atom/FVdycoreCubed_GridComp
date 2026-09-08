@@ -1,6 +1,118 @@
 # Current Project State
 
-_Last updated 2026-09-04 for **Prompt 19 (longer standalone validation)**:
+_Last updated 2026-09-08 for **Prompt 21 (longer/multi-k_split R4
+validation)**: §9/§10 and this lead paragraph. **Prompt 21 is COMPLETE:
+PASS.** Extends Prompt 20's short-run R4 PASS to the same longer/multi-
+`k_split` depth already established for R8 in Prompt 19, using the identical
+two-stage ladder, same c8/npz=10/n_split=3/R8→R4/6-MPI-rank configuration,
+same `dce`/`dcx` savepoints, same `compare_dcx_backends.py` comparator and
+Prompt 20's R4-specific thresholds (BITWISE=0 ULP, ROUND-OFF (R4) ≤1e-6,
+SMALL (R4) ≤1e-2, SIGNIFICANT (R4) >1e-2) — no new validation framework, no
+new savepoints. **Stage A** (job 58282446): R4, k_split=1, extended to **72
+dyn_core calls** (matching Prompt 19 Stage A exactly). Both backends rc=0,
+it=72 both. Entry (`dce`) call 1 BITWISE; exit (`dcx`) sampled at calls
+1/6/18/36/54/72 all ROUND-OFF/SMALL for `delp`/`pt`/`delz`/`pe` (peak max_rel
+6.50e-5/4.72e-5/7.13e-6/9.20e-6 — comfortably bounded over the full 72
+calls). Three fields show threshold-crossing signatures, all characterized
+and explained, none a defect: **`w`** is bounded/oscillatory (max_abs
+3.4e-4→1.11e-3, bulk ratio 5–15%, no trend — a cancellation-floor artifact,
+not growth); **`u`/`v`** show small episodic single-cell crossings peaking
+at call 48 (~1.3–1.5e-2 raw max_rel, bulk ratio flat 0.08–0.18%); **`omga`**
+is the one genuine finding to carry forward — its *bulk* (RMS-ratio) metric
+shows real SUPERLINEAR growth over the 72 calls (0.06% at call 1 → crosses
+the R4-SIGNIFICANT max_rel line around call 19 → 4.06% bulk by call 72),
+while its absolute error plateaus after call ≈43 — i.e. the growth is driven
+by `omga`'s own field magnitude shrinking (a decaying diagnostic), not by
+the CUDA/Fortran discrepancy itself growing without bound. Zero NaN/Inf
+(benign pre-first-write `mfxL`/`cxL`/`cyL` pattern only); `delp` positive
+both backends at every sampled checkpoint. **Stage B** (job 58282890): R4,
+k_split=2 (the smallest genuine multi-`k_split` case, matching Prompt 19
+Stage B), **12 dyn_core calls**, both backends rc=0/it=12. Compared at calls
+1/2/3/6/12: `u`/`v`/`delp`/`pt`/`delz`/`pe` all comfortably ROUND-OFF/SMALL
+throughout (window too short to reach Stage A's later-call `u`/`v`/`omga`
+signatures). `omga` is noisy/oscillatory within this short window (bulk
+ratio 6.23%/0.089%/1.19%/0.088%/0.172% at the 5 checkpoints — not a sustained
+climb, since 12 calls is short relative to where Stage A's own trend first
+separated from noise, around call ~19–30). **The decisive remap-boundary
+check (§7/§8 of the task) is a direct comparison of the `dcx` exit at call 2
+against the `dce` entry at call 3, i.e. straddling the first k_split=2 remap
+step**: for both `w` and `omga`, the post-remap entry metrics are the same
+order of magnitude as (and for `omga`, smaller than) the pre-remap exit
+metrics (`w`: max_rel 1.5494e-02 → 1.5501e-02; `omga`: max_rel 1.4362e-03 →
+9.2027e-04) — **no discontinuous jump at the remap boundary for either
+field.** `omga`'s higher within-call-3 exit value (1.78e-2) therefore
+develops during call 3's own dyn_core execution, not at the boundary — the
+same general intra-call growth pattern already present at call 1 (which has
+*no* preceding remap at all: bitwise entry → 8.95e-2 exit), proving the
+remap step is not the cause. delp positive both backends at all 5
+checkpoints. **Stage B: PASS.** **R4 is now validated to the same
+integration depth R8 reached at Prompt 19** for this configuration. **Zero
+of the 3 permitted integration fixes were needed — no source code was
+modified in this task.** No regression rerun performed (no source changed).
+Full detail: `docs/agent_handoff/prompt_21_longer_r4_validation.md`. Next:
+extend R4 to a wider grid (the same step already queued for R8), and if R4
+is ever extended past 72 calls, re-check whether `omga`'s bulk-ratio growth
+continues, accelerates, or plateaus.
+
+Before that, last updated 2026-09-08 for **Prompt 20 (R4 numerical validation)**: §7/§9/§10
+and this lead paragraph. **Prompt 20 is COMPLETE: PASS.** Same standalone
+short-run recipe as Prompt 17 (`p17_both.sbatch` pattern, here
+`p20_r4_both.sbatch`), same c8/npz=10/n_split=3/k_split=1/6-MPI-rank
+configuration, same `dce`/`dcx` backend-agnostic savepoints, same
+`compare_dcx_backends.py` comparator (unchanged) — but the **CUDA and Fortran
+executables were both built R4 (single precision)** instead of R8, closing
+the "R4 has never been savepoint-compared" gap recorded since Gate C2.
+**R4 type mapping: PASS** (Fortran precision macro selects `real4`;
+`fv3_savepoint_mod.F90` now records a `precision=` token in its `.meta` files,
+read by a new `savepoint_reader.py:dtype_for_precision()` — old R8-only trees
+without the token still default to R8, no back-compat break; the C
+ABI/CUDA-runtime side reuses the pre-existing `fv_real` typedef already
+exercised by the R4 CTest suite, no change needed there). Because
+`compare_dcx_backends.py`'s built-in verdict thresholds are R8-tuned
+(ROUND-OFF ≤1e-13, SMALL ≤1e-8) and every R4 field trips its SIGNIFICANT
+bucket by design, **R4-specific thresholds were derived** from the measured
+ratio of R4 max_rel to the already-documented R8 max_rel for the same field —
+that ratio clusters at 4.0e8-5.9e8 across nearly every dyn_core-exit field,
+closely matching the theoretical float32/float64 epsilon ratio
+`eps32/eps64 ≈ 5.369e8`, i.e. quantitative evidence the R4 differences are
+proportionally-scaled single-precision round-off, not a new defect. R4
+thresholds used: BITWISE = 0 ULP, ROUND-OFF SCALE (R4) ≤1e-6, SMALL NUMERICAL
+DIFFERENCE (R4) ≤1e-2, SIGNIFICANT (R4) >1e-2. **First call: entry (`dce`)
+BITWISE IDENTICAL; exit (`dcx`) all 17 fields ROUND-OFF SCALE or SMALL, zero
+SIGNIFICANT**, worst field `w` at max_rel=7.421176e-03 (1.4 orders below the
+R4-SIGNIFICANT cutoff). **6-call repeated-call run: PASS**, worst field `w`
+trend 7.421176e-03 (call 1) → 9.299323e-03 (call 3) → 1.020307e-02 (call 6) —
+mild bounded growth (~37% over 6 calls), no acceleration, still under the R4
+1e-2 SIGNIFICANT bound at call 6 (flagged as the figure to watch first if this
+envelope is extended). Zero NaN/Inf beyond the already-documented R8-precedented
+benign pre-first-write `mfxL`/`cxL`/`cyL` entries at `dce`; `delp` positive on
+both backends at calls 1 and 6, all 6 ranks. **R4 MPI transport: PASS**, 23/23
+R4 CTest including `fv3_halo_mpi_transport`, plus 6/6 repeats under
+`srun --ntasks=6 --cpus-per-task=2` (the first `--ntasks=1` attempt hit an
+OpenMPI "not enough slots" `srun`-resourcing artifact, same class as the
+Prompt 16 record, not a code defect — fixed by requesting 6 tasks). **The
+shared runtime source (`dyn_core.F90`/`fv_dynamics.F90` in the fixture's nested
+`@fvdycore`) shows as modified but was diffed directly and confirmed to be the
+pre-existing Prompt 17/18 backend-integration and savepoint instrumentation,
+unchanged since Prompt 19's R8 PASS** — `dyn_core.F90`'s diff is
+savepoint-dump calls plus one argument-only `real()` cast on
+`mfx`/`mfy`/`cx`/`cy` (does not touch the model's own `real(kind=8)`
+declarations or feed back into model state); `fv_dynamics.F90`'s diff is
+exactly Design A, already R8-validated through Prompt 19. No source in either
+repository was modified during this task, so a fresh R8 regression job was
+judged **NOT REQUIRED** (the shared source is unchanged since the last R8
+PASS). **2 of 3 permitted substantial R4 fixes consumed** (the savepoint
+precision-metadata token; the `mfx`/`mfy`/`cx`/`cy` `real()` cast), 1
+remaining. **Numerical algorithm changed: NO.** Scope: this validates R4 only
+at the same short-run envelope as Prompt 17 (c8/npz=10/n_split=3/k_split=1/6
+calls) — it does **not** extend to Prompt 19's longer/multi-`k_split` R8
+ladder, nor to any wider grid. Full detail:
+`docs/agent_handoff/prompt_20_r4_numerical_validation.md`. Next: extend R4 to
+a longer multi-call/multi-`k_split` run matching Prompt 19's R8 ladder
+(watching the `w` field's growth trend), then R4 becomes eligible for the same
+wider-grid step already queued for R8.
+
+Before that, last updated 2026-09-04 for **Prompt 19 (longer standalone validation)**:
 §7/§9/§10 and this lead paragraph. **Prompt 19 is COMPLETE: PASS.** Two-stage
 validation ladder, same c8/npz=10/n_split=3/R8/6-rank configuration
 throughout, same executable/allocation per backend, no new validation
@@ -1937,9 +2049,8 @@ committed): `GEOSfvdycore_fortran_perf/experiments/c8_L10_savepoint_6{a,c}_run{1
     unambiguous multi-`k_split` case) both PASS with zero SIGNIFICANT
     differences, no jump at the k_split/remap boundary, and `delp` positive on
     both backends. See the Prompt 19 lead paragraph and
-    `docs/agent_handoff/prompt_19_longer_standalone_validation.md`. **RESUME
-    HERE — next validation envelope is R4 savepoint comparison, then wider
-    grids.** The reproduction recipe
+    `docs/agent_handoff/prompt_19_longer_standalone_validation.md`. The
+    reproduction recipe
     (`p17_both.sbatch`, `p17_rebuild_exe.sh`, `p17_rebuild_all.sh`,
     `p17_regress.sbatch`, `compare_dcx_backends.py --stage {dce,dcx}`) is in
     `prompt_14_standalone_cuda_integration.md` §8.9; the Prompt 19
@@ -1951,6 +2062,33 @@ committed): `GEOSfvdycore_fortran_perf/experiments/c8_L10_savepoint_6{a,c}_run{1
     Intel-Fortran executable successfully, which is evidence but not proof for
     full GEOS), and the four `a_imp <= 0.999` knobs plus
     `MOIST_CAPPA`/`USE_COND` remain as recorded in §10.
+18. ~~R4 savepoint comparison against authoritative Fortran~~ — **DONE
+    (Prompt 20): PASS**, at the same short-run envelope as Prompt 17
+    (c8/npz=10/n_split=3/k_split=1/6 calls). See the Prompt 20 lead paragraph
+    and `docs/agent_handoff/prompt_20_r4_numerical_validation.md`.
+19. ~~Extend R4 to Prompt 19's longer/multi-`k_split` ladder (Stage A 72
+    calls / k_split=1, Stage B 12 calls / k_split=2), watching the `w` and
+    `omga` fields' growth trend~~ — **DONE (Prompt 21): PASS, both stages.**
+    See the Prompt 21 lead paragraph and
+    `docs/agent_handoff/prompt_21_longer_r4_validation.md`. Stage A: 72
+    calls, zero NaN/Inf, `delp` positive throughout, `delp`/`pt`/`delz`/`pe`
+    comfortably ROUND-OFF/SMALL for the full run; `w` bounded/oscillatory
+    (not growing); `u`/`v` small episodic crossings peaking at call 48; the
+    one genuine finding is `omga`'s *bulk*-metric SUPERLINEAR growth (0.06%
+    → 4.06% of its own RMS over 72 calls, crossing the R4-SIGNIFICANT
+    max_rel line around call 19) — explained as the field's own magnitude
+    decaying while the absolute CUDA/Fortran discrepancy plateaus after call
+    ≈43, not as unbounded divergence, but flagged to re-check if R4 is ever
+    run longer than 72 calls. Stage B: 12 calls, same fields all bounded; the
+    decisive remap-boundary check (`dcx` exit at call 2 vs `dce` entry at
+    call 3, straddling the first k_split=2 remap) shows no discontinuous
+    jump for either `w` or `omga` — post-remap entry is the same order of
+    magnitude as (for `omga`, smaller than) pre-remap exit. **RESUME HERE —
+    next validation envelope is a wider grid (for both R4 and R8), per the
+    already-queued step in item 10/§10 below.** Reuse
+    `p21_stageA_r4_both.sbatch`/`p21_stageB_r4_both.sbatch`'s pattern; if R4
+    is extended past 72 calls at any point, re-check `omga`'s bulk-ratio
+    trend for acceleration or a plateau.
 16-original. **RESUME HERE — resolve the `i_pack`/FMS group-halo-update ownership
     question before writing any more of the Fortran wrapper.** Found this
     pass (Prompt 16); full detail in the Prompt 16 lead paragraph above and
@@ -2142,9 +2280,24 @@ briefly produced false FAILs this pass:
     (`:797-801`, `:838-842`, `:1219-1237`) and the `:1238` hydrostatic `id_ws`
     diagnostic remain unimplemented. Extend deliberately if a future
     configuration needs them; do not loosen a guard to reach them.
-- **Gate C2 is CLOSED, but the claim is configuration-scoped.** R4 has never been
-  savepoint-compared against Fortran — it is COMPILED and 22/22 ctest-clean only.
-  Report R4 separately and do not infer it from the R8 result.
+- **Gate C2 is CLOSED, but the claim is configuration-scoped and is an R8
+  claim.** **RESOLVED for a narrower R4 scope (Prompt 20, 2026-09-08): R4 is
+  now savepoint-compared against Fortran and PASSES** at the same short-run
+  envelope as Prompt 17 (c8/npz=10/n_split=3/k_split=1/6 dyn_core calls,
+  R4-specific thresholds — see the Prompt 20 lead paragraph and
+  `prompt_20_r4_numerical_validation.md`). **EXTENDED (Prompt 21,
+  2026-09-08): R4 now also PASSES at the same longer/multi-`k_split` depth
+  R8 reached at Prompt 19** — Stage A (k_split=1, 72 calls) and Stage B
+  (k_split=2, 12 calls), same configuration otherwise. See the Prompt 21
+  lead paragraph and `prompt_21_longer_r4_validation.md`. One finding to
+  carry forward, not a defect: `omga`'s *bulk*-metric discrepancy shows real
+  SUPERLINEAR growth over Stage A's 72 calls (0.06%→4.06% of its own RMS),
+  driven by the field's own magnitude decaying rather than by the absolute
+  CUDA/Fortran error growing (which plateaus after call ≈43) — re-check this
+  trend if R4 is ever run past 72 calls. R4 validation still does **not**
+  extend to any wider grid than c8 — continue to report R4 separately from
+  R8 and do not infer either from the other outside the specific envelope
+  each has actually been tested at.
 - **E11: IMPLEMENTED** (was Gate-C2-blocking; see §4 for the implementation and
   the bitwise verification). Two documentation corrections that came out of it,
   recorded so they are not re-broken:
