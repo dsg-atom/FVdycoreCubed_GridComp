@@ -181,6 +181,16 @@ contains
       crc = fv3_gpu_create(cd, ctx, err)
       call check(crc, err, 'fv3_gpu_create')
 
+      ! Prompt 29: minimal opt-in override to enable the already-validated
+      ! dgrid_dynamics CUDA Graph capture/replay path (Prompt 8/13), reusing
+      ! the same env_flag_enabled() helper as the two Prompt 28 fusion flags.
+      ! Must be set before the first fv3_gpu_dyn_core_step; right after
+      ! fv3_gpu_create satisfies that and matches the runtime's own
+      ! documented contract. Default OFF -- unchanged behavior when unset.
+      crc = fv3_gpu_set_cuda_graph_mode(ctx, &
+           merge(1_c_int, 0_c_int, env_flag_enabled('RUN_CUDA_FV3_GRAPH')), err)
+      call check(crc, err, 'fv3_gpu_set_cuda_graph_mode')
+
       ! ---- register state, and perform the one initial H2D --------------------
       ! Every registered array must already hold its final value here, because
       ! fv3_gpu_initialize_state is the initial host-to-device copy. That
@@ -599,10 +609,15 @@ contains
       cfg%grid_type    = int(Atm%flagstruct%grid_type, c_int8_t)
       cfg%reserved0    = 0
 
-      ! Both launch optimizations stay off: the default path is the one validated
-      ! bitwise, and neither is needed for a correctness bring-up.
-      cfg%fuse_corner_fill = 0
-      cfg%fuse_halo_edges  = 0
+      ! Both launch-fusion optimizations default OFF -- the default path is
+      ! the one validated bitwise (Prompts 9/11). Either can be opted into at
+      ! run time via environment variable, with no rebuild and no change to
+      ! the numerical kernels themselves; this only selects which
+      ! already-validated launch pattern the runtime uses (Prompt 28).
+      cfg%fuse_corner_fill = merge(1_c_int8_t, 0_c_int8_t, &
+           env_flag_enabled('RUN_CUDA_FV3_FUSE_CORNER_FILL'))
+      cfg%fuse_halo_edges  = merge(1_c_int8_t, 0_c_int8_t, &
+           env_flag_enabled('RUN_CUDA_FV3_FUSE_HALO_EDGES'))
 
       if (Atm%flagstruct%a_imp <= 0.999) then
          call mpp_error(FATAL, 'fv3_gpu_fill_numerical_config: the CUDA dyn_core '// &
@@ -612,6 +627,25 @@ contains
       endif
 
    end subroutine fv3_gpu_fill_numerical_config
+
+   ! Prompt 28: minimal opt-in override for the two already-validated launch-
+   ! fusion modes (RUN_CUDA_FV3_FUSE_HALO_EDGES / RUN_CUDA_FV3_FUSE_CORNER_FILL,
+   ! YES/1/TRUE, case-insensitive). Unset or any other value keeps the default
+   ! OFF behavior identical to every prior run.
+   function env_flag_enabled(name) result(enabled)
+      character(len=*), intent(in) :: name
+      logical :: enabled
+      character(len=16) :: val
+      integer :: vlen, istat
+      call get_environment_variable(trim(name), value=val, length=vlen, status=istat)
+      enabled = .false.
+      if (istat == 0 .and. vlen > 0) then
+         select case (trim(adjustl(val)))
+         case ('YES','yes','Yes','1','TRUE','true','True')
+            enabled = .true.
+         end select
+      endif
+   end function env_flag_enabled
 
    subroutine check(crc, err, api)
       integer,             intent(in) :: crc

@@ -1,11 +1,17 @@
 # Current Project State
 
-_Last updated 2026-09-14 (Prompt 26 pass: rank/GPU execution-architecture
-characterization — six CUDA contexts time-slicing one A100 was the dominant
-performance cost, and CUDA MPS recovers 3.92× with no source change; see
-§8/§9/§11). Full chronological detail for every
-prompt below remains in `docs/agent_handoff/prompt_*.md` and
-`docs/agent_handoff/milestone_*.md` — this file is deliberately no longer a
+_Last updated 2026-09-14 (Prompt 30 pass: production-readiness closure
+attempt — confirmed via source, not new jobs, that `MOIST_CAPPA`/`USE_COND`/
+`a_imp <= 0.999` are UNIMPLEMENTED (not merely unvalidated) in the CUDA
+backend, by explicit, triply-gated, well-documented design predating this
+prompt (milestone 3A.9); nonzero-`q_con`-alone cannot be isolated from that
+gap because the authoritative Fortran fixture compiles `MOIST_CAPPA`/
+`USE_COND` unconditionally. Intel-Fortran<->CUDA ABI verified sound by
+construction (fixed-width `iso_c_binding` types, runtime
+`abi_version`/`struct_bytes` guards, explicit `MPI_Comm_f2c`). See §5/§9/§11
+and `prompt_30_production_config_closure.md`. Full chronological detail for
+every prompt remains in `docs/agent_handoff/prompt_*.md` and
+`docs/agent_handoff/milestone_*.md`; this file is deliberately no longer a
 substitute for those._
 
 ## 1. Project Goal
@@ -36,7 +42,13 @@ terminology) — unchanged and not repeated here.
 - Authoritative standalone Fortran fixture (separate tree, used for savepoint
   generation and dual-backend comparison):
   `/discover/nobackup/projects/imvi-nse/jli30/GEOSfvdycore_fortran_perf`
-  - Executable: `install/bin/StandAlone_FV3_Dycore.x` (Intel `ifort` build).
+  - Executable: `build/bin/StandAlone_FV3_Dycore.x` (Intel `ifort` build) is
+    the authoritative freshly-built copy; `install/bin/` is not reliably
+    kept in sync with source rebuilds (found stale in Prompt 29). Each
+    experiment job directory under `experiments/` keeps its own local copy
+    of the binary — also not auto-synced; refresh with `cp -f` after any
+    rebuild and verify via `strings <bin> | grep <new-env-var>` before
+    relying on a new flag in a reused job directory.
   - Its nested `@fvdycore/model/{dyn_core.F90,fv_dynamics.F90}` carry
     uncommitted savepoint instrumentation only (no numerical change).
 - CUDA source lives under `cuda/dyn_core/` (implementation) and
@@ -59,31 +71,33 @@ GEOS/FV3 Fortran -> ISO_C_BINDING / stable C ABI -> WP-E GPU context
   from `project_architecture.md`; not restated here.
 - `HaloTransport` interface (`include/fv3_gpu_halo_transport.hpp`) has two
   interchangeable backends sharing all topology/rotation/sign/pack/unpack
-  logic:
-  - `PeerHaloTransport` — in-process, six host threads ("Model B"), default.
-  - `MpiHaloTransport` — host-staged real MPI, six separate processes, one
-    tile per rank (the production decomposition). Opt-in via CMake
-    (`FV3_DYN_CORE_ENABLE_MPI_HALO`, default OFF) and runtime
-    (`--mpi-halo`, default off). This is Stage 1 of
-    `project_architecture.md`'s Communication Evolution; Stage 2 (CUDA-aware
-    MPI) and Stage 3 (comm/compute overlap) are unimplemented future backends
-    behind the same interface, not a redesign.
+  logic: `PeerHaloTransport` (in-process, six host threads, default) and
+  `MpiHaloTransport` (host-staged real MPI, six processes, one tile/rank —
+  opt-in via CMake `FV3_DYN_CORE_ENABLE_MPI_HALO`/runtime `--mpi-halo`,
+  default off). This is Stage 1 of `project_architecture.md`'s Communication
+  Evolution; Stages 2/3 are unimplemented future backends behind the same
+  interface, not a redesign.
 - Public C ABI (`fv3_gpu_api.h`, `fv3_gpu_communication.h`) covers: lifecycle
   (create/topology/step/finalize), `NumericalConfig` installation
-  (`fv3_gpu_set_numerical_config`), production dispatch installation
-  (`fv3_gpu_install_production_dispatch`), and halo-transport selection
-  (`fv3_gpu_attach_mpi_halo_transport` / `_detach_halo_transport` /
-  `_halo_transport_kind_of`). No C++ or MPI type crosses the ABI — an MPI
-  communicator crosses as a Fortran INTEGER handle via `MPI_Comm_f2c`.
+  (`fv3_gpu_set_numerical_config`, includes `fuse_corner_fill`/
+  `fuse_halo_edges`), production dispatch installation, halo-transport
+  selection, and CUDA Graph mode as a dedicated function
+  (`fv3_gpu_set_cuda_graph_mode`, distinct from the struct-field fusion
+  flags — Prompt 8, Fortran-reachable since Prompt 29). No C++ or MPI type
+  crosses the ABI — an MPI communicator crosses as a Fortran INTEGER handle
+  via `MPI_Comm_f2c`.
 - Fortran bridge layer: `cuda/interface/{fv3_gpu_dyncore_bridge.F90,
   fv3_gpu_abi_mod.F90, fv3_gpu_field_registry.F90}`. The real production call
-  site is `fv_dynamics.F90`'s `do n_map=1,k_split` loop; the CUDA branch there
-  does not issue the FMS `i_pack(1)`/`i_pack(8)` group-halo-update starts
-  (both are duplicates of exchanges the CUDA dyn_core already performs before
-  the same consumers), while `i_pack(10)` (tracer halo, distinct/required) is
-  still issued. This ownership question is resolved — see §7.
+  site is `fv_dynamics.F90`'s `do n_map=1,k_split` loop; the CUDA branch
+  there skips the FMS `i_pack(1)`/`i_pack(8)` group-halo-update starts
+  (duplicates of exchanges CUDA dyn_core already performs), keeps
+  `i_pack(10)` (tracer halo, required). Resolved, see §6.
 - CPU/CUDA backend selection is via `RUN_CUDA_FV3` in `AGCM.rc`; default
-  Fortran path is unchanged when CUDA is off.
+  Fortran path is unchanged when CUDA is off. Opt-in performance knobs, all
+  default OFF, env-var controlled in `fv3_gpu_dyncore_bridge.F90` via a
+  shared `env_flag_enabled(name)` helper (YES/1/TRUE, case-insensitive):
+  `RUN_CUDA_FV3_FUSE_HALO_EDGES`, `RUN_CUDA_FV3_FUSE_CORNER_FILL` (Prompt
+  28), `RUN_CUDA_FV3_GRAPH` (Prompt 29).
 
 ## 4. Implemented Capabilities
 
@@ -94,32 +108,30 @@ GEOS/FV3 Fortran -> ISO_C_BINDING / stable C ABI -> WP-E GPU context
   IMPLEMENTED, COMPILED, GPU EXECUTED, NUMERICALLY VALIDATED (see §5/§6).
 - Persistent device residency: IMPLEMENTED, GPU EXECUTED — no full-state
   host/device transfer between work packages.
-- `omga` finalization path (pem snapshot, `omega_from_pe`, `adv_pe`,
-  `ec1/ec2/en1/en2` derived from existing authoritative B-grid geometry, not
-  invented), E11 seam reconciliation (`FV3_GPU_H_DWIND_SEAM`), the
-  `heat_source`/`diss_est` per-substep accumulator, `corner_edge_service_cuda`
-  (dir=1 and dir=2 `copy_corners` rotations), and the derived `n_con`/`nf_ke`
-  config values (from `vtdm4`, `nord`) are all IMPLEMENTED and were the fixes
-  that closed Gate C2 (§5). Detail of each fix (root cause, change, "numerical
-  algorithm changed: NO" for all): `prompt_6b_cuda_fortran_validation.md`
-  §19-§22.
+- `omga` finalization path, E11 seam reconciliation
+  (`FV3_GPU_H_DWIND_SEAM`), the `heat_source`/`diss_est` per-substep
+  accumulator, `corner_edge_service_cuda`, and the derived `n_con`/`nf_ke`
+  config values are all IMPLEMENTED and were the fixes that closed Gate C2
+  (§5). All confirmed "numerical algorithm changed: NO"; detail in
+  `prompt_6b_cuda_fortran_validation.md` §19-§22.
 - Thirteen input-fidelity/layout defects (grid metrics, `bdt`, `ptop`/`zs`,
   `dp_ref`, `rdgas`, `n_sponge`, `edge_*` weights, Exner-kappa split,
   `grid_lonlat` store order, `cv_air`, `n_con`, corner service, `nf_ke`) were
-  found and fixed during Gate C2 closure — full list and evidence in
-  `prompt_6b_cuda_fortran_validation.md` §4/§19-§22. All confirmed
-  "numerical algorithm changed: NO".
-- CUDA Graph capture mode (`--cuda-graph`, opt-in, default off): FUNCTIONAL.
-  Captures `dgrid_dynamics` only (halo exchange NOT captured); freezes
-  `DSwOptions::dt` by value (refuses replay if `bdt`/`n_split` change from
-  capture time). Validated bitwise-identical to non-graph path at 1 and 5
-  dyn_core calls, and a 600-call stress run with no illegal memory access.
-  Detail: `prompt_13_architectural_optimization.md`.
+  found/fixed during Gate C2 closure — same reference.
+- CUDA Graph capture mode: FUNCTIONAL, IMPLEMENTED (Prompt 8, repaired
+  Prompt 13), Fortran-reachable via `RUN_CUDA_FV3_GRAPH` on the standalone
+  path since Prompt 29. Captures `dgrid_dynamics` only (halo exchange NOT
+  captured); freezes `dt` by value (refuses replay if `bdt`/`n_split` change
+  from capture time). Bitwise-identical to non-graph path at every depth
+  tested (1/5/600 calls internal harness, Prompt 13; 10/100/310 calls real
+  standalone path, Prompt 29). Real standalone benefit: 4.80%, LOW,
+  see §8/§9.
 - Launch-fusion optimizations, opt-in, default off, all bitwise-identical to
-  default: `--fuse-corner-fill` (`c_sw` corner-fill pair fusion, Prompt 9),
-  `--fuse-halo-edges` (4-edge pack/unpack fusion, Prompt 11).
-  `a2b4_global_corner_kernel` was restructured for parallelism (not
-  launch-count) in Prompt 12; also bitwise-identical, always-on (not a flag).
+  default: `--fuse-corner-fill`/`RUN_CUDA_FV3_FUSE_CORNER_FILL` (Prompt 9,
+  reachable from standalone path Prompt 28), `--fuse-halo-edges`/
+  `RUN_CUDA_FV3_FUSE_HALO_EDGES` (Prompt 11, reachable Prompt 28).
+  `a2b4_global_corner_kernel` was restructured for parallelism (Prompt 12);
+  also bitwise-identical, always-on (not a flag).
 
 ## 5. Numerical Validation Matrix
 
@@ -134,272 +146,217 @@ hord_tm=6`, `hord_dp=-6`, `vtdm4=0.01`, `grid_type=0`, `hydrostatic=false`,
 | R8 | c8 | 1 | 72 dyn_core calls (Stage A) | **PASS** | `w` max_rel 5.12e-11 at call 72, flat/sublinear growth |
 | R8 | c8 | 2 | 12 dyn_core calls (Stage B) | **PASS** | `w` max_rel 3.53e-11 at call 6; no jump at remap boundary |
 | R4 | c8 | 1 | 6 dyn_core calls | **PASS** (R4-scaled thresholds) | `w` max_rel 1.02e-2 at call 6, bounded growth |
-| R4 | c8 | 1 | 72 dyn_core calls (Stage A) | **PASS** | `omga` bulk-ratio grows superlinearly to ~4% by call 72 (magnitude-decay artifact, not divergence; see note below) |
+| R4 | c8 | 1 | 72 dyn_core calls (Stage A) | **PASS** | `omga` bulk-ratio grows superlinearly to ~4% by call 72 (magnitude-decay artifact, not divergence; see note) |
 | R4 | c8 | 2 | 12 dyn_core calls (Stage B) | **PASS** | no discontinuity at remap boundary |
 | R8 | c16 | 1 (bdt=1800, resolution-scaled) | 6 calls | **PASS** | `w` max_rel ≈6.7e-11 |
-| R8 | c32 | 1 (bdt=1200, resolution-scaled) | 6 calls | **PASS** (1 explained non-blocking anomaly) | `mfyL` dce-entry-only 2-cell uninitialized-memory artifact, both backends independently, see note below; real exit-state agreement clean |
-| R4 | c16 | 1 (bdt=1800, reused from R8) | 6 calls | **PASS** | `w` max_rel 6.80e-2 (dcx call 3) — small-denominator artifact, see note |
-| R4 | c32 | 1 (bdt=1200, reused from R8) | 6 calls | **PASS** (largest ratio of all rows, explained) | `w` max_rel 2.39e-1 (dce call 3) — same small-denominator artifact as c16, scaled by finer grid; absolute agreement stays ≤5.9e-5 and bulk stats match, see note |
+| R8 | c32 | 1 (bdt=1200, resolution-scaled) | 6 calls | **PASS** (1 explained non-blocking anomaly) | `mfyL` dce-entry-only 2-cell uninitialized-memory artifact, both backends independently; real exit-state agreement clean |
+| R4 | c16 | 1 (bdt=1800, reused from R8) | 6 calls | **PASS** | `w` max_rel 6.80e-2 (dcx call 3) — small-denominator artifact |
+| R4 | c32 | 1 (bdt=1200, reused from R8) | 6 calls | **PASS** (largest ratio, explained) | `w` max_rel 2.39e-1 (dce call 3) — same small-denominator artifact, scaled by finer grid; absolute agreement stays ≤5.9e-5 |
+| R8 | c32 | 1 | Graph ON vs Graph OFF, 10 calls (Prompt 29) | **PASS** | `dcx`/exit: BITWISE (0 ULP); `dce`/entry: same pre-existing `mfyL` artifact as the row above, reproduced identically in both modes |
 
-Grading scale used throughout: BITWISE (0 ULP) / ROUND-OFF SCALE (R8 ≤1e-13,
-R4 ≤1e-6) / SMALL NUMERICAL DIFFERENCE (R8 ≤1e-8, R4 ≤1e-2) / SIGNIFICANT
-(above those). R4 thresholds were derived from the measured R4/R8 max_rel
-ratio (≈4-6e8, matching the float32/float64 epsilon ratio), not assumed.
+Grading scale: BITWISE (0 ULP) / ROUND-OFF SCALE (R8 ≤1e-13, R4 ≤1e-6) /
+SMALL NUMERICAL DIFFERENCE (R8 ≤1e-8, R4 ≤1e-2) / SIGNIFICANT (above those).
+R4 thresholds derived from the measured R4/R8 max_rel ratio (≈4-6e8,
+matching the float32/float64 epsilon ratio), not assumed.
 
 Notes carried forward (not re-derivable from the table):
-- `omga`'s R4 bulk-metric growth (Stage A, 72 calls) is driven by the field's
-  own magnitude shrinking (a decaying diagnostic), not by the absolute
-  CUDA/Fortran discrepancy growing — that discrepancy plateaus after call
-  ≈43. Re-check this trend if R4 is ever run past 72 calls.
-- `pe`'s single Fortran halo ring was originally not written by CUDA; this
-  was found to have a real downstream consumer (`Lagrangian_to_Eulerian`'s
-  D-grid remap) and is now fixed via `fv3_gpu_interface_pe_halo` (host-side
-  `pe_halo` reproduction, bit-for-bit from the already-resident `delp` ring).
-- Zero NaN/Inf across all PASS rows; `delp` stays positive on both backends
-  at every checkpoint in every PASS row.
-- **R8/R4 c16/c32 rows (Prompt 23)**: resolution-scaled `bdt` (1800s/1200s)
-  came from pre-existing, previously-run clean Fortran-only baseline configs
-  (`c16_L10_dyncore_perf`, `c32_L10_dyncore_perf` — 336/504 dyn_core calls,
-  0 NaN/Range_Warn each), not a new search; `n_split=3`/`k_split=1` held
-  fixed at every resolution. The `w`/`omga` max_rel figures at R4 c16/c32 are
-  a small-denominator ratio artifact (tiny, matching-magnitude fields with
-  near-zero local values), not a growing or CUDA-specific divergence —
-  verified by direct raw-value/bulk-statistic inspection, not assumed. Detail:
-  `prompt_23_resolution_timestep_validation.md`.
-- Numerical algorithm changed: **NO**, for every fix behind every row above.
+- `omga`'s R4 bulk-metric growth (Stage A, 72 calls) is driven by the
+  field's own magnitude shrinking, not the absolute discrepancy growing —
+  that plateaus after call ≈43.
+- `pe`'s single Fortran halo ring is reproduced host-side via
+  `fv3_gpu_interface_pe_halo` (bit-for-bit from the resident `delp` ring) —
+  a real downstream consumer (`Lagrangian_to_Eulerian`) needed it.
+- Zero NaN/Inf across all PASS rows; `delp` stays positive at every
+  checkpoint in every PASS row.
+- c16/c32 rows (Prompt 23): resolution-scaled `bdt` (1800s/1200s) came from
+  pre-existing clean Fortran-only baselines, not a new search;
+  `n_split=3`/`k_split=1` held fixed at every resolution.
+- Numerical algorithm changed: **NO**, for every fix/flag behind every row.
 
-Full field-by-field tables: `prompt_6b_cuda_fortran_validation.md` (Gate C2),
-`prompt_19_longer_standalone_validation.md` (R8 depth), `prompt_20_r4_numerical_validation.md`
-(R4 first pass), `prompt_21_longer_r4_validation.md` (R4 depth),
-`prompt_22_wider_grid_validation.md` (c16 blocker, now resolved — see
-`prompt_23_resolution_timestep_validation.md`).
+Full field-by-field tables: `prompt_6b_cuda_fortran_validation.md` (Gate
+C2), `prompt_19_longer_standalone_validation.md` (R8 depth),
+`prompt_20_r4_numerical_validation.md`/`prompt_21_longer_r4_validation.md`
+(R4), `prompt_22_wider_grid_validation.md`/
+`prompt_23_resolution_timestep_validation.md` (c16/c32),
+`prompt_29_standalone_cuda_graph.md` (Graph ON/OFF guard).
 
 ## 6. MPI / Communication Status
 
-- Cross-process six-rank halo transport (`MpiHaloTransport`, host-staged
-  MPI): IMPLEMENTED, COMPILED, GPU EXECUTED across six separate MPI
-  processes. Validated bitwise-identical to the in-process `PeerHaloTransport`
-  path (78/78 fields = 13 exit fields × 6 tiles) at 1 and 5 dyn_core calls,
-  plus a dedicated six-rank provenance test at 16,692 checks / 0 failures
-  (covers scalar groups, both wind staggerings DGRID_NE/CGRID_NE, multi-ring
-  groups, and the E11 seam group).
-- Rank↔tile mapping is identity (rank r ↔ tile r+1), verified at runtime
-  (not just trusted) via an allgathered, cross-checked tile map.
-- **MPI transport determinism issue: RESOLVED.** An intermittent
-  `fv3_halo_mpi_transport` CTest failure was root-caused to a CUDA
-  stream-ordering defect in the *test harness* (plain `cudaMemset` /
-  synchronous `cudaMemcpy` are not ordered against a
-  `cudaStreamNonBlocking` stream) — not in the transport, not an MPI
-  contract violation, not an OpenMPI bug. Fixed in the test and hardened in
-  production (`fv3_gpu_runtime.cpp` attach-time clears now use
-  `cudaMemsetAsync` on the transfer stream). Now deterministic at 24/24
-  consecutive OpenMPI runs and 5/5 Intel MPI runs. **Standing coding
-  constraint**: any buffer setup/clear/poison that a non-blocking stream will
-  later read must be enqueued on that stream, not the legacy stream. Detail:
-  `prompt_18_mpi_transport_determinism.md`.
-- **FMS/CUDA halo ownership ambiguity: RESOLVED.** `mpp_start_group_update`
-  packs/posts/increments its counter immediately; only
-  `mpp_complete_group_update` unwinds it, so a started-but-abandoned handle
-  leaks a slot and MPI requests per `k_split` iteration. Resolution (Design
-  A): the CUDA branch does not issue `i_pack(1)`/`i_pack(8)` at all (both are
-  duplicates of CUDA's own pre-consumer exchanges); `i_pack(10)` (tracer) is
-  still issued. Default Fortran path is unchanged (skip is inside an
-  `if (use_cuda_dyncore)` arm). Detail:
-  `prompt_14_standalone_cuda_integration.md` §8,
-  `prompt_15_mpi_halo_transport.md`.
-- CUDA-aware MPI (Stage 2) and communication/computation overlap (Stage 3)
-  remain unimplemented future work — deferred by project policy, not
-  attempted.
+- Cross-process six-rank halo transport (`MpiHaloTransport`): IMPLEMENTED,
+  COMPILED, GPU EXECUTED across six MPI processes. Validated
+  bitwise-identical to in-process `PeerHaloTransport` (78/78 fields at 1/5
+  calls) plus a dedicated six-rank provenance test (16,692 checks/0
+  failures).
+- Rank<->tile mapping is identity (rank r <-> tile r+1), verified at runtime.
+- **MPI transport determinism: RESOLVED** (Prompt 18) — root cause was a
+  CUDA stream-ordering defect in the *test harness*, not the transport;
+  fixed and hardened (`cudaMemsetAsync` on the transfer stream at
+  attach-time). Deterministic at 24/24 OpenMPI + 5/5 Intel MPI runs.
+  **Standing constraint**: any buffer setup a non-blocking stream will read
+  must be enqueued on that stream, not the legacy stream.
+- **FMS/CUDA halo ownership ambiguity: RESOLVED** (Prompt 14/15) — CUDA
+  branch skips `i_pack(1)`/`i_pack(8)` (duplicates of CUDA's own
+  pre-consumer exchanges), keeps `i_pack(10)` (tracer). Default Fortran
+  path unchanged (skip is inside `if (use_cuda_dyncore)`).
+- CUDA-aware MPI (Stage 2) and comm/compute overlap (Stage 3) remain
+  unimplemented future work — measured LOW priority, see §8.
 
 ## 7. Standalone Integration Status
 
-- The CUDA dyn_core backend runs inside the real `StandAlone_FV3_Dycore.x`
-  under the true production decomposition (`FV_NX=1`/`FV_NY=6`, six MPI
-  ranks, one tile per rank), from the same executable as the Fortran backend
-  (selected via `AGCM.rc`'s `RUN_CUDA_FV3`).
-- Public C ABI for per-run setup (`NumericalConfig` install, production
-  dispatch install, topology/transport attach) is complete; no internal-only
-  C++ entry point is required for standalone integration anymore.
-- Numerically validated at the depths in §5 (R8: 1/72/12-call ladders at c8,
-  6-call at c16/c32; R4: 1/72/12-call ladders at c8, 6-call at c16/c32) — all
-  PASS.
+- CUDA dyn_core runs inside the real `StandAlone_FV3_Dycore.x` under the
+  true production decomposition (`FV_NX=1`/`FV_NY=6`, six MPI ranks, one
+  tile/rank), same executable as Fortran (selected via `AGCM.rc`'s
+  `RUN_CUDA_FV3`).
+- Public C ABI for per-run setup (config/dispatch/topology/transport/Graph)
+  is complete; no internal-only C++ entry point needed for standalone
+  integration.
+- Numerically validated at the depths in §5 — all PASS.
 - ABI/compiler-family compatibility with a full **Intel-compiler production
-  GEOS build** is not independently proven — this fixture successfully links
-  GCC-built CUDA archives into an Intel-Fortran executable, which is evidence
-  but not proof for the full GEOS production build. Revisit explicitly before
-  final production linkage.
+  GEOS build** is not independently proven — this fixture links GCC-built
+  CUDA archives into an Intel-Fortran executable (evidence, not proof for
+  the full GEOS production build). Revisit before final production linkage.
 
 ## 8. Performance Status
 
-**Corrected attribution (Prompt 24).** The table below (job 58238910,
-Prompt 13) and the `milestone_3a12` §8 "CUDA reference" numbers were both
-measured on the internal single-process `run_small_perf_bench` C++ harness
-(`--ntasks=1`, no MPI, all six tiles resident in one process) — **not** on
-the real standalone `StandAlone_FV3_Dycore.x` six-rank MPI integration path.
-Confirmed by direct inspection of `perf_rerun_logs/nsys_profile.sbatch` and
-the CLI-flag source locations (`cuda/dyn_core/CMakeLists.txt`,
-`benchmarks/run_small_perf_bench.cpp`). Neither `--fuse-halo-edges` nor
-`--cuda-graph` is reachable from the Fortran/standalone integration path at
-all — `fv3_gpu_dyncore_bridge.F90:604-605` hardcodes
-`cfg%fuse_corner_fill=0`/`cfg%fuse_halo_edges=0` at config install, and no
-CUDA Graph field exists in the ABI. Kept below for internal-harness history
-only; do not cite as standalone-integration performance.
+Current best validated standalone-path configuration: **MPS ON +
+`RUN_CUDA_FV3_FUSE_HALO_EDGES=YES` + `RUN_CUDA_FV3_FUSE_CORNER_FILL=YES`**.
+`RUN_CUDA_FV3_GRAPH` is available (Prompt 29) but NOT part of the
+recommended default (LOW benefit — see below). All figures are the real
+standalone six-rank MPI path (`StandAlone_FV3_Dycore.x`, c32, R8,
+`n_split=3`/`k_split=1`, `bdt=1200s`, 6 MPI ranks/1 A100) unless marked
+"internal harness"; measured via `fv_timing_mod`'s `DYN_CORE` timer,
+100 calls/rep, median of 3-5 reps, savepoints off during timing.
 
-| Configuration (internal harness only) | ms/call | vs. reference |
-|---|---|---|
-| Graph off (reference) | 21.660791 | — |
-| Graph on (`--cuda-graph`) | 20.546787 | −5.14% |
+| Stage | Config | ms/call | vs. prior |
+|---|---|---|---|
+| Fortran reference | 6 ranks, CPU | 19.930 | — |
+| CUDA, no MPS, no fusion (Prompt 24, job 58295284) | 6 ranks, 1 A100, time-sliced contexts | 105.563 | 5.30x slower than Fortran |
+| + CUDA MPS (Prompt 26/27, jobs 58380090/58380469) | same + MPS ON | 27.075 / 26.965 | 3.92x faster |
+| + fuse_halo_edges + fuse_corner_fill (Prompt 28) | same + both fusion flags | 25.464 | −6.13% |
+| + CUDA Graph (Prompt 29, job 58382771) | same + `RUN_CUDA_FV3_GRAPH=YES` | 24.300 | −4.80% (LOW, not default) |
 
-**Real standalone-integration baseline (Prompt 24, authoritative for the
-production path).** c32, R8, `npz=10`, `n_split=3`, `k_split=1`,
-`bdt=1200s`, 6 MPI ranks (`FV_NX=1`/`FV_NY=6`, one tile/rank), one A100/one
-node, real host-staged MPI (Intel MPI, not OpenMPI — the runtime launcher
-for this Intel-compiled fixture, distinct from the OpenMPI module used for
-CUDA compilation). Both backends measured via `fv_timing_mod`'s existing
-`DYN_CORE` timer, 100 calls/rep, 5 reps, savepoints disabled to avoid timer
-contamination. Job 58295284, all reps rc=0/0 Range_Warn/0 NaN.
+Net: CUDA at 24.300 ms/call vs. Fortran's 19.930 ms/call = **1.22x slower**
+(was 5.30x slower pre-MPS). All steps bitwise/numerically neutral (§5 + each
+prompt's own guard).
 
-| Backend | median ms/call | spread |
-|---|---|---|
-| Fortran (6 ranks, CPU) | 19.930 | 0.6% |
-| CUDA (6 ranks, 1 A100) | 105.563 | 0.74% |
+Root-cause chain (full detail in the cited files, not repeated here):
+- **MPS is the dominant lever** (Prompt 26): the real bottleneck was 6 CUDA
+  contexts time-slicing one A100, not MPI/kernel-compute/H2D-D2H.
+  `prompt_26_rank_gpu_architecture.md`.
+- **Post-MPS profile is launch/orchestration + kernel-compute, MIXED,
+  diffuse** (Prompt 27): pre-MPS "host-sync-bound" (~56%) attribution is
+  superseded; post-MPS the largest bucket is `cudaLaunchKernel` (~51% of
+  traced `DYN_CORE`), no single kernel >5.6%. `prompt_27_mps_operational_profile.md`.
+- **Launch fusion cut launches 2955->2637/call (−10.76%)**, but
+  `cudaEventSynchronize` stayed flat (~28-30%) — sync is GPU-producer-wait
+  under MPS context-sharing, not host slack, and does not respond to
+  launch-count reduction. `prompt_28_standalone_launch_reduction.md`.
+- **CUDA Graph (Prompt 29) cut launch ops further** (2637->1805/call,
+  −31.6%; `cudaLaunchKernel` API time 15.81->12.30 ms/call), but whole-call
+  improvement was only 4.80% (< 5% MODERATE floor -> **LOW**) because
+  `cudaEventSynchronize` rose in this trace (9.98->12.27 ms/call), the same
+  GPU-producer-wait bottleneck now dominating over launch/API cost.
+  Numerical guard BITWISE on `dcx`/exit fields (10 calls x 6 ranks x 17
+  fields); replay stability confirmed over 310 calls / 930 substep replays,
+  0 errors. `RUN_CUDA_FV3_GRAPH` is real and bitwise-safe but **not added
+  to the recommended default** per the <5% threshold.
+  `prompt_29_standalone_cuda_graph.md`.
 
-CUDA is **0.189× (~5.30× slower)** than Fortran per `dyn_core` call in this
-real integration — the opposite of the internal-harness picture above. No
-CUDA runtime perf flags are enabled or selectable here; this is the only
-CUDA execution path this integration currently exposes.
+CUDA-aware MPI, kernel-tuning, and rank/GPU redesign all remain LOW/NOT
+JUSTIFIED (halo traffic 312 msgs/call all ≤64KB; device transfer ~2% of
+`DYN_CORE`; MPS already at the 1-context ceiling) — Prompts 25a/26.
 
-nsys diagnostic breakdown (10-call rank-0 trace, job 58295418, diagnostic
-only, not part of the timed result): host synchronization
-(`cudaEventSynchronize`) ~59.27 ms/call (~56%), launch/orchestration
-(`cudaLaunchKernel`) ~17.33 ms/call (~16%), full GPU kernel-compute sum (all
-171 distinct kernels) ~11.19 ms/call (~11%), H2D+D2H copy ~0.66 ms/call
-(<1%). **Dominant bottleneck: HOST-SYNCHRONIZATION-BOUND**, with
-host-staged MPI (six separate CUDA contexts sharing one A100, one per MPI
-rank) as a corroborated secondary factor; both H2D/D2H-transfer-bound and
-kernel-compute-bound are ruled out by direct measurement. Detail, full
-per-rep tables, and reasoning: `prompt_24_standalone_performance_validation.md`.
-**Prompt 26 re-attributes the ~56% host-synchronization term**: most of it was
-ranks blocked on a *time-sliced shared GPU*, not on MPI or on copies — see
-"Execution architecture" below. Re-profile under MPS before using this
-breakdown to choose any further optimization.
-
-**Execution architecture and CUDA MPS (Prompt 26 — the dominant lever).**
-Confirmed from source and runtime, not assumed: the standalone production
-mapping is `6 MPI ranks -> 6 tiles (1/rank) -> 6 primary CUDA contexts ->
-1 A100`, time-sliced, 2 `cudaStreamNonBlocking` streams per context, MPS not
-in use (a node MPS daemon exists but belongs to another user; this account
-never attached to it). One tile per PE is fixed by the authoritative FMS
-decomposition (`fv_mp_mod.F90:662`), so multi-tile-per-rank is a Fortran
-decomposition redesign, not a CUDA change.
-
-Context count on the shared GPU — not transport, not kernels — is the
-dominant cost. Measured three independent ways at c32/R8:
-
-| Experiment | 1 ctx | 2 ctx | 3 ctx | 6 ctx |
-|---|---|---|---|---|
-| Synthetic probe, total work fixed, no MPI (job 58380039) | 28.085 | 30.711 | 35.724 | 72.484 ms/call (**2.58×**) |
-| Real dyn_core, internal harness (job 58380039) | 28.725 | — | — | 102.980 ms/call (3.59×, transport confound recorded) |
-| Real standalone path, ctx/GPU via `CUDA_VISIBLE_DEVICES` (job 58380134) | — | — | 54.410 (2 GPUs) | 106.007 ms/call (1.95×) |
-
-Scaling is superlinear; the knee is between 3 and 6 contexts.
-
-**CUDA MPS result (job 58380090, same node/GPU/config/binary, zero source
-change, 3 reps each):** `DYN_CORE` median 106.261 ms/call MPS-off →
-**27.075 ms/call MPS-on = 3.924×**; whole-run `TOTAL` 14.7257 s → 5.8631 s
-(2.51×); `COMM_TOTAL` 0.1151 s → 0.0296 s (3.89×); `REMAPPING` unchanged.
-The MPS-off leg reproduces Prompt 24's 105.563 within 0.7%. Against the
-same-node Fortran 19.930 ms/call, CUDA goes from **0.188× (5.33× slower)** to
-**0.736× (1.36× slower)**. MPS on one GPU beats two GPUs without MPS
-(27.1 vs 54.4) and reaches the 1-context ceiling (28.1-28.7).
-
-MPS is **bitwise-neutral**: 1230/1296 savepoints byte-identical vs the
-Prompt 23 c32/R8 reference; the 66 that differ are all `dce_*_mfyL.bin` /
-`dce_*_cxL.bin` dce-*entry* dumps, and an MPS-off control re-run (job
-58380203) differs in exactly the same 66 files — i.e. the already-documented
-§5 uninitialized-read artifact, not an MPS effect. No exit/state field differs.
-
-Current priority call (Prompts 25a + 26, supersedes Prompt 24's "CUDA-aware
-MPI: HIGH"): **rank/GPU context sharing — RESOLVED OPERATIONALLY via MPS**;
-**CUDA-aware MPI priority: LOW** (halo traffic is 312 messages/call of only
-8712 B and 2904 B, 100% ≤64 KB, device-direct ceiling ~1.02-1.04×, and
-`COMM_TOTAL` fell 3.89× under MPS alone, showing the "MPI wait" was GPU
-serialization); **kernel-tuning priority: LOW** (compute ~11% of per-call
-cost); **rank/tile ownership redesign (multi-tile rank): NOT JUSTIFIED** (it
-cannot beat the 1-context ceiling MPS already reaches for free).
-Detail: `prompt_25a_fv3_halo_characterization.md`,
-`prompt_26_rank_gpu_architecture.md`.
-
-Fortran R8 median `DYN_CORE` ms/call reference (6 MPI ranks, Intel/AVX2,
-unchanged since Prompt 7): 8×8 12.730, 16×16 16.704, 32×32 30.261 — the
-32×32 figure differs slightly from Prompt 24's 19.930 because Prompt 7 used
-a different `bdt`/run depth; not a discrepancy, just a different sample.
+Internal single-process harness (`run_small_perf_bench`, no MPI, Prompt 13)
+is NOT representative of the real path above — kept only as provenance for
+the original (retracted) 5.14% CUDA Graph estimate: Graph off 21.66 / Graph
+on 20.55 ms/call, internal harness only.
 
 `ncu` (Nsight Compute) profiling remains platform-blocked
-(`ERR_NVGPUCTRPERM`) on this Discover allocation — carried forward from
-Prompt 13, not re-tested in Prompts 24/26 since compute was never the
-bottleneck; `nsys` remains usable and was used for all profiling above.
+(`ERR_NVGPUCTRPERM`); `nsys` is unaffected and was used for all profiling
+above.
 
 ## 9. Known Limitations / Unvalidated Envelope
 
-- **Resolved (Prompt 23).** The Prompt 22 c16 CFL-timestep blocker (both
-  backends NaN-blowup at c16 with the c8-tuned `bdt=3600s` unchanged) is
-  closed: resolution-scaled `bdt` (1800s at c16, 1200s at c32, `n_split=3`/
-  `k_split=1` unchanged) — sourced from pre-existing, previously-run clean
-  Fortran-only baselines, not a new search — is stable in both backends at
-  c16 and c32, R8 and R4, at the same 6-call depth as Prompt 22's own attempt.
-  See §5 and `prompt_23_resolution_timestep_validation.md`.
-- R4/R8 validation now covers c8 (deepest: 72/12-call ladders) and c16/c32
-  (6-call depth, matching Prompt 22's original attempt depth). Do not infer
-  behavior at run depths beyond what's in §5's table for any grid/precision
-  combination — c16/c32 have not been run past 6 calls.
-- `MOIST_CAPPA`/`USE_COND` are compiled in authoritative Fortran but not in
-  CUDA. Proven round-off-neutral only because `q_con ≡ 0` in every tested
-  fixture; must be closed before any moist (`q_con ≠ 0`) configuration.
-- Four `a_imp <= 0.999`-only knobs (`scale_m`, `m_split`, `delt_max`,
-  `scale_z`) are non-authoritative but proven inert under the tested
-  `a_imp = 1.0` configuration. Must be corrected before any `a_imp <= 0.999`
-  run.
-- `ncu` (Nsight Compute) profiling is platform-blocked
-  (`ERR_NVGPUCTRPERM`) on this Discover allocation; `nsys` is unaffected.
-- `fv3_dispatch_smoke` Phase C fails if that test's own `cfg.nf_ke` pin is
-  raised from 1 to the authoritative 3 — not localized (three `gpu_a100` job
-  attempts to capture the diagnostic stayed queued); the test pin is left at
-  1. Not evidence against the production corner service, which is exercised
-  and validated at `nf_ke=3` in the real dyn_core path (§5).
-- CUDA-aware MPI and communication/computation overlap (Stages 2/3) are
-  unimplemented future work — and now measured LOW priority (§8).
-- **CUDA MPS is an operational configuration, not yet integrated.** The 3.92×
-  `DYN_CORE` gain in §8 requires a per-node user MPS daemon
-  (`CUDA_MPS_PIPE_DIRECTORY`/`CUDA_MPS_LOG_DIRECTORY` + `nvidia-cuda-mps-control
-  -d`, torn down with `quit`) started by the job script; no GEOS/standalone job
-  script does this yet. Requires `compute_mode=Default` (true on Discover
-  `gpu_a100`). Not tested at grids other than c32, at depths beyond 100
-  `dyn_core` calls, at R4, or across multiple nodes.
-- Multi-GPU (candidate F) is already implemented (`dev = mod(comm_rank,
-  device_count)`) but was validated only at 2 GPUs / 3 contexts per GPU;
-  `--gres=gpu:4` would not schedule during Prompt 26, so 4-GPU and
-  MPS+multi-GPU composition are unmeasured.
+- R4/R8 validation covers c8 (deepest: 72/12-call ladders) and c16/c32
+  (6-call depth only, resolution-scaled `bdt`, Prompt 23). Do not infer
+  behavior beyond the depths in §5 for any grid/precision combination.
+- `MOIST_CAPPA`/`USE_COND`: **confirmed UNIMPLEMENTED in CUDA, not merely
+  unvalidated** (Prompt 30) — triple-gated rejection (top-level runtime
+  fence `fv3_gpu_runtime.cpp:1101-1102`, WP-B kernel-launch fence
+  `wp_b_dsw_cuda.cu:889`, Fortran-bridge forced-zero
+  `fv3_gpu_dyncore_bridge.F90:595-596`), by explicit design predating this
+  prompt (flagged at milestone 3A.9). Prompt 30 also found nonzero `q_con`
+  cannot be tested in isolation against the authoritative Fortran fixture,
+  because that fixture compiles `MOIST_CAPPA`/`USE_COND` in unconditionally
+  (`@fvdycore/CMakeLists.txt:130`) — closing this requires implementing the
+  Riemann-solver `peg`/`gm2`/`cp2` terms (`nh_utils.F90:372-390`) in CUDA, a
+  dedicated future WP-C/WP-B numerical-implementation prompt, not a
+  config/validation task. See `prompt_30_production_config_closure.md`.
+- `a_imp <= 0.999` (RIM_2D/SIM3p0 vertical branches): **confirmed
+  UNIMPLEMENTED in CUDA** (Prompt 30), triple-gated (runtime fence
+  `fv3_gpu_runtime.cpp:1082-1083`, Riemann-solver launcher fence
+  `fv3_riem_solver_c.cu:247-251`, Fortran-bridge `mpp_error(FATAL)` guard
+  `fv3_gpu_dyncore_bridge.F90:622-627`). `a_imp` is read from the real
+  namelist (not hardcoded); only SIM1 (`a_imp=1.0`, the required first-run
+  value) is implemented. Closing this is a second, independent, similarly
+  dedicated future implementation prompt. The four downstream
+  `a_imp <= 0.999`-only knobs (`scale_m`, `m_split`, `delt_max`, `scale_z`)
+  remain proven inert at the tested `a_imp = 1.0` and unreachable while the
+  gate above stands.
+- `ncu` profiling is platform-blocked (`ERR_NVGPUCTRPERM`); `nsys`
+  unaffected.
+- `fv3_dispatch_smoke` Phase C fails if its own `cfg.nf_ke` pin is raised
+  from 1 to the authoritative 3 — not localized, test pin left at 1; not
+  evidence against the production corner service (validated at `nf_ke=3`
+  in the real dyn_core path, §5).
+- CUDA-aware MPI / comm-compute overlap (Stages 2/3): unimplemented,
+  measured LOW priority (§8).
+- CUDA MPS (`fv3_mps_lifecycle.sh`, Prompt 27) requires
+  `compute_mode=Default` (true on Discover `gpu_a100`); only tested at
+  c32/R8, up to ~310-call depth, one node. Not yet wired into every
+  standing job script as the default (only one-off Prompt 27-29 scripts).
+- Launch fusion (`RUN_CUDA_FV3_FUSE_HALO_EDGES`/`_FUSE_CORNER_FILL`, Prompt
+  28) and CUDA Graph (`RUN_CUDA_FV3_GRAPH`, Prompt 29): both default OFF,
+  both bitwise-safe, both only measured at c32/R8/6-rank/1-A100/MPS-ON; not
+  yet tested at other grids, precisions, or without MPS. Graph's
+  refusal-on-`dt`/`n_split`-change behavior (Prompt 8 source, unchanged)
+  was not operationally re-exercised in Prompt 29 (held fixed all run).
+- Multi-GPU (`dev = mod(comm_rank, device_count)`) implemented but
+  validated only at 2 GPUs/3 contexts-per-GPU; 4-GPU and MPS+multi-GPU
+  composition unmeasured (`--gres=gpu:4` would not schedule during
+  Prompt 26).
+- `install/bin/StandAlone_FV3_Dycore.x` and per-experiment job-directory
+  binary copies are not auto-synced with `build/bin/` after a rebuild
+  (discovered Prompt 29) — always refresh and verify via `strings` before
+  trusting a newly-added flag in a reused job directory.
 
 ## 10. Current Git / Working-Tree State
 
 - Repository: `FVdycoreCubed_GridComp`, branch `cuda/gpu-bringup`.
-- HEAD: `6817f8d` ("Document wider-grid FV3 CUDA validation"). Ahead of
-  `origin/cuda/gpu-bringup` — not pushed. Push/merge only on explicit request.
-- Tracked modification: this file only (`docs/agent_handoff/CURRENT_STATE.md`).
+- HEAD: `2e6327f` ("Document MPS rank-GPU performance architecture"). Ahead
+  of `origin/cuda/gpu-bringup` — not pushed. Push/merge only on explicit
+  request.
+- Uncommitted source (Prompt 28+29, not committed — awaiting explicit
+  request): `cuda/interface/fv3_gpu_dyncore_bridge.F90`
+  (`env_flag_enabled` helper, `RUN_CUDA_FV3_FUSE_HALO_EDGES`/
+  `RUN_CUDA_FV3_FUSE_CORNER_FILL`/`RUN_CUDA_FV3_GRAPH` wiring),
+  `cuda/interface/fv3_gpu_abi_mod.F90` (new `fv3_gpu_set_cuda_graph_mode`
+  public declaration + interface, Prompt 29).
+- Tracked modification: `docs/agent_handoff/CURRENT_STATE.md`.
 - Untracked at repo root: numerous scratch shell scripts/logs/probes from
   prior prompts (`task*_6c_cuda.sh`, `sp*rerun*.sh`, `p1[7-8]_*.sbatch`,
   `cln*.txt`, `cmp_nord*.txt`, `det_diff_*.txt`, `pre*.txt`, `scratch_*/`,
-  build helpers) plus reusable tooling directories `tools/` (savepoint
-  validation, e.g. `compare_dcx_backends.py`, `verify_omega_host.cpp`) and
-  `perf_rerun_logs/` (sbatch scripts + job logs for Prompts 7-13). Untracked
-  handoff docs: `prompt_22_wider_grid_validation.md`,
-  `prompt_24_standalone_performance_validation.md`,
-  `prompt_25a_fv3_halo_characterization.md`, and (created this pass)
-  `prompt_26_rank_gpu_architecture.md`. Also untracked from this pass:
-  `scratch_p26/` (context-scaling probe `ctx_scaling_probe.cu`, its sbatch
-  driver, job logs) and, in the separate Fortran fixture tree
-  `<fortran_perf>/experiments/`, `p26_*.sbatch` + `p26_*.out`.
+  build helpers), reusable tooling under `tools/` (savepoint validation,
+  e.g. `compare_dcx_backends.py`), and `perf_rerun_logs/` (Prompts 7-13
+  sbatch/logs). Untracked handoff docs for every prompt from 22 through 30
+  (see §12); Prompt 30 (`prompt_30_production_config_closure.md`) is
+  source-inspection only — no source file was modified. In the separate
+  Fortran fixture tree
+  `<fortran_perf>/experiments/`: per-prompt sbatch scripts/`.out` logs/nsys
+  CSVs (Prompts 24-29), `fv3_mps_lifecycle.sh`, and job directories
+  `p24_c32_r8_cuda(_nsys)`/`p28_c32_r8_cuda_guard` (reused across Prompts
+  24/27/28/29) plus profiler artifacts (`.nsys-rep`/`.sqlite`) under
+  `p24_c32_r8_cuda_nsys/`.
 - Do not commit: build directories (`build_cuda_r8*/`), profiler artifacts
   (`*.nsys-rep`, `*.sqlite`), `scratch_*/`, any `*.out` Slurm log.
 - Do commit (if explicitly requested): legitimate source fixes, permanent
@@ -407,27 +364,49 @@ bottleneck; `nsys` remains usable and was used for all profiling above.
 
 ## 11. Next Recommended Task
 
-The standalone CUDA performance gap is now explained and mostly closed
-operationally (§8): six MPI ranks time-slicing one A100 through six separate
-CUDA contexts was the dominant cost, and enabling CUDA MPS — no source,
-topology, or numerical change — gives 3.92× on `DYN_CORE` (106.3 → 27.1
-ms/call) and 2.51× whole-run, moving CUDA from 5.33× slower than Fortran to
-1.36× slower, bitwise-neutral. This **supersedes** Prompt 24's "CUDA-aware
-MPI: HIGH" call; CUDA-aware MPI, kernel tuning, and rank/tile-ownership
-redesign are all now LOW priority or not justified.
+Prompt 29 closed the CUDA Graph question raised at the end of Prompt 28:
+Graph is now reachable from the standalone path (`RUN_CUDA_FV3_GRAPH`),
+numerically safe (BITWISE), and stable under repeated replay, but its real
+whole-`dyn_core` benefit (4.80%) falls just under the 5% MODERATE floor ->
+**LOW**. It is NOT part of the recommended default production mode.
+**Standing recommended optimized standalone CUDA mode remains unchanged
+since Prompt 28: MPS ON + `RUN_CUDA_FV3_FUSE_HALO_EDGES=YES` +
+`RUN_CUDA_FV3_FUSE_CORNER_FILL=YES`** (25.464-25.526 ms/call, 1.28-1.36x
+slower than Fortran, down from 5.30x pre-MPS).
 
-Recommended next step: **integrate MPS operationally and re-profile under
-it.** Specifically (a) add MPS daemon start/teardown to the standalone (and
-later GEOS) job scripts as a documented, opt-in operational setting, and
-(b) take a short `nsys` trace *under MPS* before choosing any further
-optimization, since MPS invalidates Prompt 24's ~56%-host-synchronization
-bucket attribution. Confirm scope with the user first, per
-`project_architecture.md`'s "Performance Work Comes Later".
+No further standalone dyn_core launch/orchestration optimization is
+currently justified: `cudaEventSynchronize` (GPU-producer-wait under MPS
+context-sharing) is now the dominant remaining cost and does not respond to
+launch-count reduction (fusion or Graph); CUDA-aware MPI and kernel tuning
+remain LOW priority (§8); rank/GPU redesign is NOT JUSTIFIED (MPS already
+at the 1-context ceiling).
 
-Alternative track, unchanged: production GEOS integration (moist
-`q_con ≠ 0` / `MOIST_CAPPA`/`USE_COND`, `a_imp <= 0.999` knobs,
-Intel-compiler ABI verification). Confirm scope with the user before starting
-either track.
+**Prompt 30 attempted Track 1 (production GEOS integration closures) and
+found it BLOCKED-BY-DESIGN, not merely unvalidated**: `MOIST_CAPPA`,
+`USE_COND`, and `a_imp <= 0.999` are confirmed unimplemented in CUDA
+(triple-gated rejections, source-documented since milestone 3A.9); nonzero
+`q_con` cannot be tested in isolation from that gap because the
+authoritative Fortran fixture compiles `MOIST_CAPPA`/`USE_COND`
+unconditionally. Intel-Fortran ABI verification (the one Track-1 item that
+was reachable) PASSED. See §9 and `prompt_30_production_config_closure.md`.
+
+Three open tracks — confirm scope with the user before starting any:
+1. **CUDA MOIST_CAPPA/USE_COND implementation** — a dedicated WP-C/WP-B
+   numerical-implementation prompt: add the Riemann-solver `peg`/`gm2`/
+   `cp2` terms (`nh_utils.F90:372-390`) to `fv3_riem_solver_c.cu`, construct
+   a source-backed nonzero-`q_con` fixture, then re-run Gate-C2-style
+   validation. Not a config/plumbing task.
+2. **CUDA `a_imp <= 0.999` (RIM_2D/SIM3p0) implementation** — a second,
+   independent, similarly-scoped numerical-implementation prompt.
+3. **Operational wiring** — fold the MPS lifecycle helper + the two fusion
+   flags (the standing recommended mode) into every standing GEOS/
+   standalone job script as the new default, not just the one-off Prompt
+   27-29 job scripts. Lower-risk than 1/2; does not require new numerical
+   work.
+
+Until 1 or 2 closes, "broader GEOS integration" remains bounded to the
+already-validated production first-run subset (`hord_*=±6`, `grid_type=0`,
+`hydrostatic=false`, `a_imp=1.0`, `use_cond=moist_cappa=0`).
 
 ## 12. Detailed Handoff References
 
@@ -441,17 +420,17 @@ only when the current task requires that level of detail (per
 - `prompt_6b_cuda_fortran_validation.md` — Gate C2 closure: all thirteen
   input-fidelity fixes, all in-loop boundaries, all exit fields, `omga`
   finalization, E11, heat accumulator, `n_con`/`nf_ke`.
-- `prompt_7_post_gate_c2_performance_baseline.md` — baseline re-establishment
-  and nsys profiling after Gate C2.
-- `prompt_8_cuda_graphs_prototype.md` — historical; conclusions retracted by
-  Prompt 13 (see that file instead for the real CUDA Graphs status).
+- `prompt_7_post_gate_c2_performance_baseline.md` — baseline
+  re-establishment and nsys profiling after Gate C2.
+- `prompt_8_cuda_graphs_prototype.md` — historical; conclusions retracted
+  by Prompt 13.
 - `prompt_9_kernel_fusion_validation.md`, `prompt_10_copy_corners_batching.md`,
   `prompt_11_next_launch_target.md`, `prompt_12_a2b4_kernel_tuning.md` —
   launch-fusion/kernel-tuning characterization and implementation sequence.
 - `prompt_13_architectural_optimization.md` — CUDA Graph capture repair;
   the GPU-execution-bound regime finding.
 - `prompt_14_standalone_cuda_integration.md` — production call-boundary
-  interface table; FMS/CUDA halo ownership resolution (§8).
+  interface table; FMS/CUDA halo ownership resolution.
 - `prompt_15_mpi_halo_transport.md` — `HaloTransport` interface and
   `MpiHaloTransport` implementation/validation.
 - `prompt_18_mpi_transport_determinism.md` — root cause and fix for the
@@ -460,29 +439,44 @@ only when the current task requires that level of detail (per
   (k_split=2) validation ladder.
 - `prompt_20_r4_numerical_validation.md`, `prompt_21_longer_r4_validation.md`
   — R4 c8 first-pass and depth-matched validation.
-- `prompt_22_wider_grid_validation.md` — c16 CFL-instability blocker (resolved
-  in Prompt 23).
+- `prompt_22_wider_grid_validation.md` — c16 CFL-instability blocker
+  (resolved in Prompt 23).
 - `prompt_23_resolution_timestep_validation.md` — resolution-scaled `bdt`
   evidence and c16/c32 R8/R4 validation closing the Prompt 22 blocker.
 - `prompt_24_standalone_performance_validation.md` — real standalone-path
-  Fortran-vs-CUDA timing (§8), the internal-harness-vs-real-path attribution
-  fix, and the nsys-based bottleneck classification.
-- `prompt_25a_fv3_halo_characterization.md` — halo message-size/count census
-  (24 transports, 312 messages, 8712 B / 2904 B only) and the LOW
-  CUDA-aware-MPI benefit ceiling.
+  Fortran-vs-CUDA timing, internal-harness-vs-real-path attribution fix,
+  nsys-based bottleneck classification.
+- `prompt_25a_fv3_halo_characterization.md` — halo message-size/count
+  census and the LOW CUDA-aware-MPI benefit ceiling.
 - `prompt_26_rank_gpu_architecture.md` — rank/GPU/context architecture map,
-  context-scaling measurements, the CUDA MPS 3.92× result and its bitwise
-  guard, and the A-F candidate ranking (§8).
+  context-scaling measurements, the CUDA MPS 3.92x result and its bitwise
+  guard, and the A-F candidate ranking.
+- `prompt_27_mps_operational_profile.md` — MPS operationalized as a
+  job-scoped opt-in lifecycle helper; post-MPS `nsys` profile and the MIXED
+  launch-orchestration/kernel-compute reclassification.
+- `prompt_28_standalone_launch_reduction.md` — `fuse_halo_edges`/
+  `fuse_corner_fill` exposed on the standalone path; bitwise numerical
+  guard; MODERATE (6.13%) timing result; CUDA Graph ABI JUSTIFIED decision
+  (not implemented at that point).
+- `prompt_29_standalone_cuda_graph.md` — CUDA Graph exposed on the
+  standalone path (`RUN_CUDA_FV3_GRAPH`); bitwise numerical guard; replay
+  stability; 4.80% timing result classified LOW; nsys bucket comparison.
+- `prompt_30_production_config_closure.md` — production-readiness closure
+  attempt: confirmed `MOIST_CAPPA`/`USE_COND`/`a_imp<=0.999` unimplemented
+  by design (triple-gated); Stage-A/`q_con` coupling to that gap; Intel
+  Fortran ABI verification PASS; no remaining undocumented hardcoded
+  production assumptions found; no source changed.
 - `milestone_3a*.md`, `wp-*.md` — work-package-level implementation history
   (WP-A/B/C/D/E), pre-Gate-C2.
 
 ---
 
 CURRENT_STATE maintenance policy:
-- This file holds **current truth only** — replace superseded facts in place
-  rather than appending a new dated paragraph.
+- This file holds **current truth only** — replace superseded facts in
+  place rather than appending a new dated paragraph.
 - Detailed chronological history, per-field numerical tables, and resolved
-  debugging narratives belong in the prompt-specific handoff docs (§12), not
-  here.
-- Keep this file at or below 35,000 characters. If an update would exceed
-  that, compact an existing section before adding new content.
+  debugging narratives belong in the prompt-specific handoff docs (§12),
+  not here.
+- Keep this file at or below 30,000 characters (hard ceiling 35,000). If an
+  update would exceed that, compact an existing section before adding new
+  content.

@@ -317,6 +317,7 @@ module fv3_gpu_abi_mod
    public :: fv3_gpu_sync_to_host
    public :: fv3_gpu_event_wait
    public :: fv3_gpu_get_capabilities
+   public :: fv3_gpu_set_cuda_graph_mode
    public :: fv3_gpu_finalize
    public :: fv3_gpu_attach_mpi_halo_transport
    public :: fv3_gpu_detach_halo_transport
@@ -413,6 +414,21 @@ module fv3_gpu_abi_mod
          type(c_ptr), value                        :: ctx
          type(fv3_gpu_capabilities), intent(inout) :: caps
       end function fv3_gpu_get_capabilities
+
+      ! Prompt 8 (CUDA Graphs prototype), exposed via Prompt 29. Opt-in only;
+      ! must be called before the first fv3_gpu_dyn_core_step on this context
+      ! -- callers set this once, right after fv3_gpu_create. Rejects being
+      ! toggled after a graph has already been captured (FV3_GPU_STATE_CONFLICT).
+      ! Scope is deliberately narrow: only the dgrid_dynamics stage is
+      ! captured/replayed; every other stage and all cross-tile halo
+      ! communication run exactly as in default mode.
+      integer(c_int) function fv3_gpu_set_cuda_graph_mode(ctx, enabled, err) &
+                              bind(C, name="fv3_gpu_set_cuda_graph_mode")
+         import :: c_int, c_ptr, fv3_gpu_error
+         type(c_ptr), value                 :: ctx
+         integer(c_int), value              :: enabled
+         type(fv3_gpu_error), intent(inout) :: err
+      end function fv3_gpu_set_cuda_graph_mode
 
       ! Takes fv3_gpu_context ** -- it nulls the caller's handle -- so the dummy
       ! is a non-VALUE type(c_ptr), i.e. a pointer to the handle variable.
