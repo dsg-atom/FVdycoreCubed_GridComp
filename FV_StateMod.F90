@@ -35,6 +35,7 @@ module FV_StateMod
    use fv_update_phys_mod, only: fv_update_phys
    use sw_core_mod, only: d2a2c_vect
    use fv_sg_mod, only: fv_subgrid_z
+   use Held_Suarez_ForcingMod, only: Held_Suarez_Forcing
 
    use fv_diagnostics_mod, only: prt_maxmin, prt_minmax, range_check, &
                                  get_vorticity, updraft_helicity, calculate_shear_06, bunkers_vector, helicity_relative_CAPS
@@ -86,6 +87,11 @@ private
   ! CUDA backend selection (0=fortran, 1=cuda)
   integer, save :: fv3_dyncore_backend = 0
   logical, save :: fv3_cuda_initialized = .false.
+
+  ! Held-Suarez idealized dry-core forcing, default OFF. Read once in
+  ! FV_Setup via RUN_HELD_SUAREZ; does not branch on the backend selector
+  ! above, and OFF preserves normal standalone behavior unchanged.
+  logical, save :: HELD_SUAREZ = .false.
 
   public FV_Atm
   public FV_Setup, FV_InitState, FV_Run, FV_Finalize, FV_DA_Incs
@@ -818,6 +824,9 @@ contains
   FV_HYDROSTATIC = FV_Atm(1)%flagstruct%hydrostatic
   DEBUG          = FV_Atm(1)%flagstruct%fv_debug
   call MAPL_GetResource(MAPL, DEBUG, 'DEBUG_STATE:', default=DEBUG, RC=STATUS)
+
+  call MAPL_GetResource(MAPL, HELD_SUAREZ, 'RUN_HELD_SUAREZ:', default=HELD_SUAREZ, RC=STATUS)
+  VERIFY_(STATUS)
 
   call MAPL_MemUtilsWrite(VM, trim(Iam), RC=STATUS )
   VERIFY_(STATUS)
@@ -2020,6 +2029,17 @@ subroutine FV_Run (STATE, EXPORT, CLOCK, GC, PLE0, RC)
     v_dt(:,:,:) = 0.0
     t_dt(:,:,:) = 0.0
     w_dt(:,:,:) = 0.0
+
+    ! Held-Suarez idealized dry-core forcing (opt-in, default OFF via
+    ! RUN_HELD_SUAREZ). Backend-neutral: updates the common FV_Atm(1)
+    ! state (pt, u, v) in place, strictly before the Fortran/CUDA dyn_core
+    ! dispatch below, so whichever backend runs this step sees the same
+    ! forced state. Does not branch on fv3_dyncore_backend.
+    if (HELD_SUAREZ) then
+       call Held_Suarez_Forcing(FV_Atm(1)%u, FV_Atm(1)%v, FV_Atm(1)%pt, &
+            FV_Atm(1)%pe, FV_Atm(1)%ps, FV_Atm(1)%gridstruct%agrid, &
+            npz, myDT, kappa, FV_Atm(1)%bd)
+    endif
 
 #ifdef USE_FV3_CUDA
     ! CUDA dyn_core backend

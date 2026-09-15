@@ -8,7 +8,7 @@ set (srcs
   GetWeightsC2C.F90
   GetWeights.F90
   CubeHalo.F90
-  Cube2LatLon.F90 LatLon2Cube.F90 AppGridCreate.F90 FV_StateMod.F90
+  Cube2LatLon.F90 LatLon2Cube.F90 AppGridCreate.F90 Held_Suarez_ForcingMod.F90 FV_StateMod.F90
   AdvCore_GridCompMod.F90
   DynCore_GridCompMod.F90 CreateInterpWeights_GridCompMod.F90
   StandAlone_DynAdvCore_GridCompMod.F90
