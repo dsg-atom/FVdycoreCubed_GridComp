@@ -1,18 +1,13 @@
 # Current Project State
 
-_Last updated 2026-09-15 (Prompt 33 pass: multi-day/high-resolution
-Held-Suarez validation + Fortran-vs-CUDA performance scaling, branch
-`experiment/held-suarez-e2e`, orthogonal to the `cuda/gpu-bringup` mainline
-this file otherwise tracks). Extended the HS validation ladder through C128
-and 10-day duration — both bitwise-identical to Fortran at the NetCDF level
-(Stages C/D); built a C32->C64->C128 performance scaling table showing CUDA
-overtakes Fortran per-call cost at higher resolution under the standing
-MPS+fusion mode (Stage E). See §8a/§9a/§11 and
-`prompt_33_hs_multiday_highres_performance.md`. Prompts 30-32
-(production-config closure; HS integration smoke test; HS scientific
-validation) remain summarized in §9/§11 and fully detailed in their own
-handoff docs (§12); this file holds current truth only, not chronological
-narrative._
+_Last updated 2026-09-15 (Prompt 34: C32 dyn_core perf re-measured onto the
+exact C64/C128 timing methodology, branch `experiment/held-suarez-e2e`,
+orthogonal to the `cuda/gpu-bringup` mainline. Supersedes Prompt 33's
+mismatched-baseline C32 figure — CUDA already overtakes Fortran at C32, not
+just from C64 up. See §8a/§9a/§11 and `prompt_34_c32_perf_reconciliation.md`.
+Prompts 30-33 remain summarized in §8a/§9/§11 and fully detailed in their
+own handoff docs (§12); this file holds current truth only, not
+chronological narrative._
 
 ## 1. Project Goal
 
@@ -270,35 +265,37 @@ JUSTIFIED (halo traffic 312 msgs/call all ≤64KB; device transfer ~2% of
 (`ERR_NVGPUCTRPERM`); `nsys` is unaffected and was used for all profiling
 above.
 
-## 8a. Held-Suarez / Resolution Performance Scaling (Prompt 33)
+## 8a. Held-Suarez / Resolution Performance Scaling (Prompt 33, reconciled Prompt 34)
 
 30 dyn_core calls/rep, 3 reps/config, savepoints off, standing MPS+fusion
-mode, `fv_timing_mod` flat `DYN_CORE` FMS-clock line (total seconds across
-all calls in the run / n_calls = ms/call; **first-call warmup included** —
-methodology differs from §8's 100-call/rep figures, which is documented as
-"warmup-excluded"; treat this table as directionally reliable, not a
-like-for-like replacement of §8's C32 number).
+mode (`RUN_CUDA_FV3_FUSE_HALO_EDGES=YES`, `RUN_CUDA_FV3_FUSE_CORNER_FILL=YES`,
+Graph off), `fv_timing_mod` flat `DYN_CORE` FMS-clock line (total seconds
+across all calls in the run / n_calls = ms/call; **first-call warmup
+included** throughout — differs from §8's 100-call/rep warmup-excluded
+figures, so not a like-for-like replacement of §8's C32 number, but now
+internally consistent C32/C64/C128 to each other). C32 re-measured Prompt 34
+with the identical methodology (RUN_DT=1200s, JOB_SGMT=10h -> 30 calls,
+resolution-only diff from the C64/C128 job scripts); C64/C128 unchanged from
+Prompt 33.
 
-| Grid | Fortran ms/call | CUDA ms/call | CUDA/Fortran |
-|---|---|---|---|
-| C32 (§8, different methodology — not re-measured here) | 19.930 | 25.464 | 1.28x slower |
-| C64 | 59.4 | 56.9 | **0.96x — CUDA faster** |
-| C128 | 237.4 | 210.9 | **0.89x — CUDA faster** |
+| Grid | Fortran ms/call | CUDA ms/call | Speedup F/C | CUDA/Fortran |
+|---|---|---|---|---|
+| C32 | 20.72 | 19.88 | 1.04 | **0.96 — CUDA faster** |
+| C64 | 59.4 | 56.9 | 1.04 | **0.96 — CUDA faster** |
+| C128 | 237.4 | 210.9 | 1.13 | **0.89 — CUDA faster** |
 
-Finding: the CUDA/Fortran gap **NARROWS then REVERSES** with resolution —
-CUDA overtakes Fortran between C32 and C64 under the same MPS+
-fuse_halo_edges+fuse_corner_fill mode, consistent with GPU parallelism
-amortizing fixed per-call launch/sync overhead better as grid-point count
-grows. Both backends scale sub-linearly C32->C64 then ~linearly C64->C128
-(consistent with fixed-overhead amortization being larger at the smaller
-grid). Rep-to-rep agreement <0.5% at every config (tight, reproducible).
+C32 reps: Fortran total_s 0.6237/0.6210/0.6216 (median 0.6216 -> 20.72
+ms/call); CUDA total_s 0.6215/0.5945/0.5963 (median 0.5963 -> 19.88 ms/call).
+All 6 C32 reps: rc=0, 0 NaN/Inf/Range_Warn/error hits.
 
-Caveat: since C32 here was not re-measured under this exact 30-call
-methodology, "CUDA overtakes Fortran at C64" is directionally strong (both
-backends individually show physically sensible, highly reproducible
-scaling) but not proven to the same rigor tier as §5/§8's C32 figures. A
-follow-on task re-measuring C32 with this identical 30-call/3-rep
-methodology would close that gap cheaply if needed.
+Finding: **CUDA already overtakes Fortran at C32** under this exact
+methodology (superseding Prompt 33's "narrows then reverses between C32 and
+C64" reading, which used a mismatched C32 baseline). The CUDA/Fortran ratio
+is flat C32->C64 (~0.96) then improves further at C128 (0.89) — CUDA's
+margin widens with resolution rather than emerging partway through it.
+Best GPU competitiveness measured: **C128 (0.89x)**. Rep-to-rep agreement
+<2% at every config. Numerical source unchanged for this reconciliation —
+timing-only. Detail: `prompt_34_c32_perf_reconciliation.md`.
 
 ## 9. Known Limitations / Unvalidated Envelope
 
@@ -444,22 +441,21 @@ already-validated production first-run subset (`hord_*=±6`, `grid_type=0`,
 **HS track (`experiment/held-suarez-e2e`) — Prompt 33 closed Stages C/D/E**
 of the multi-day/high-resolution ladder: C128 short-gate PASS, C128 10-day
 PASS (bitwise NetCDF), and a C32->C64->C128 performance scaling table
-showing CUDA overtakes Fortran at higher resolution under MPS+fusion (§8a).
-Prompts 31 (integration smoke test) and 32 (scientific validation,
-NetCDF-mechanism confirmation) are prerequisite context — see
-`prompt_31_held_suarez_e2e.md` / `prompt_32_held_suarez_scientific_validation.md`.
+showing CUDA overtaking Fortran (§8a). **Prompt 34 reconciled the C32 point
+onto the exact C64/C128 methodology**: CUDA already overtakes Fortran at
+C32 (0.96x), not just from C64 up; margin widens further at C128 (0.89x —
+best measured GPU competitiveness). Prompts 31 (integration smoke test) and
+32 (scientific validation, NetCDF-mechanism confirmation) are prerequisite
+context — see `prompt_31_held_suarez_e2e.md` /
+`prompt_32_held_suarez_scientific_validation.md`.
 
 Open HS-track follow-ons (confirm scope before starting):
 1. **Climatology-scale run** (30-100+ day, C32 or higher) — the natural
-   next step now that 10-day/C128 is validated; not started (out of Prompt
-   33 scope).
+   next step now that 10-day/C128 is validated; not started.
 2. **Higher resolution** (C256+) — unmeasured; would need its own
    stability/timestep search per the C128 lesson in §9.
 3. **Restart-continuation exercise** — validate `COLDSTART: 0` with HS+CUDA
    (source-confirmed available, never operationally tested; §9).
-4. **Stage E methodology reconciliation** — re-measure C32 under the exact
-   30-call/3-rep warmup-included methodology used for C64/C128 in §8a, to
-   make the scaling table fully apples-to-apples with §8.
 
 ## 12. Detailed Handoff References
 
@@ -519,6 +515,8 @@ only when the current task requires that level of detail (per
 - `prompt_33_hs_multiday_highres_performance.md` — HS ladder extended to
   C64/C128 and 10-day duration; C32->C64->C128 performance scaling table
   (§8a/§9a of this file).
+- `prompt_34_c32_perf_reconciliation.md` — C32 dyn_core perf re-measured
+  under the exact C64/C128 methodology, reconciling §8a's scaling table.
 
 ---
 
