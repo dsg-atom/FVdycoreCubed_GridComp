@@ -1,33 +1,18 @@
 # Current Project State
 
-_Last updated 2026-09-14 (Prompt 30 pass: production-readiness closure
-attempt — confirmed via source, not new jobs, that `MOIST_CAPPA`/`USE_COND`/
-`a_imp <= 0.999` are UNIMPLEMENTED (not merely unvalidated) in the CUDA
-backend, by explicit, triply-gated, well-documented design predating this
-prompt (milestone 3A.9); nonzero-`q_con`-alone cannot be isolated from that
-gap because the authoritative Fortran fixture compiles `MOIST_CAPPA`/
-`USE_COND` unconditionally. Intel-Fortran<->CUDA ABI verified sound by
-construction (fixed-width `iso_c_binding` types, runtime
-`abi_version`/`struct_bytes` guards, explicit `MPI_Comm_f2c`). See §5/§9/§11
-and `prompt_30_production_config_closure.md`. Prompt 31 (separate branch
+_Last updated 2026-09-15 (Prompt 33 pass: multi-day/high-resolution
+Held-Suarez validation + Fortran-vs-CUDA performance scaling, branch
 `experiment/held-suarez-e2e`, orthogonal to the `cuda/gpu-bringup` mainline
-this file otherwise tracks): added a backend-neutral Held-Suarez idealized
-dry-core forcing to the real standalone FV3 workflow and validated short
-Fortran-vs-CUDA agreement — PASS, no numerical algorithm change, no Opus
-escalation. See `prompt_31_held_suarez_e2e.md`. Prompt 32 (same branch)
-advanced HS to scientific-validation level: confirmed the existing MAPL
-History/CFIO NetCDF mechanism needs no new I/O code at C8 or C32; ran a
-C32 (bdt=1200s/n_split=3/k_split=1, sourced from Prompt 23) Held-Suarez
-stability+comparison gate, PASS both backends (savepoint-level 85,310/
-87,810 fields BIT-IDENTICAL, remaining 2,500 FAILs confined to `delpc`/
-`pkc` halo-padding cells — the same benign uninitialized-memory artifact
-class as the Prompts 22/23 `mfyL` finding, not a new divergence; NetCDF-
-level T@500hPa bitwise-identical); delivered `tools/analysis/
-hs_netcdf_inspect.py` for offline xarray diagnostics. No Opus escalation.
-See `prompt_32_held_suarez_scientific_validation.md`. Full chronological detail
-for every prompt remains in `docs/agent_handoff/prompt_*.md` and
-`docs/agent_handoff/milestone_*.md`; this file is deliberately no longer a
-substitute for those._
+this file otherwise tracks). Extended the HS validation ladder through C128
+and 10-day duration — both bitwise-identical to Fortran at the NetCDF level
+(Stages C/D); built a C32->C64->C128 performance scaling table showing CUDA
+overtakes Fortran per-call cost at higher resolution under the standing
+MPS+fusion mode (Stage E). See §8a/§9a/§11 and
+`prompt_33_hs_multiday_highres_performance.md`. Prompts 30-32
+(production-config closure; HS integration smoke test; HS scientific
+validation) remain summarized in §9/§11 and fully detailed in their own
+handoff docs (§12); this file holds current truth only, not chronological
+narrative._
 
 ## 1. Project Goal
 
@@ -51,7 +36,7 @@ terminology) — unchanged and not repeated here.
   `geos/v3.0.0`, SHA `ca30e26305fda43831095334c02a3f5e0b8c0c45`. Not
   populated as `@fvdycore` in this repo (expected; do not auto-populate).
 - CUDA implementation repo (this repo): `FVdycoreCubed_GridComp`, branch
-  `cuda/gpu-bringup`.
+  `cuda/gpu-bringup` (mainline) / `experiment/held-suarez-e2e` (HS track).
   - Discover path: `/discover/nobackup/projects/imvi-nse/jli30/FVdycoreCubed_GridComp`
   - Also visible at: `/gpfsm/dnb06/projects/p295/jli30/FVdycoreCubed_GridComp`
 - Authoritative standalone Fortran fixture (separate tree, used for savepoint
@@ -112,7 +97,10 @@ GEOS/FV3 Fortran -> ISO_C_BINDING / stable C ABI -> WP-E GPU context
   default OFF, env-var controlled in `fv3_gpu_dyncore_bridge.F90` via a
   shared `env_flag_enabled(name)` helper (YES/1/TRUE, case-insensitive):
   `RUN_CUDA_FV3_FUSE_HALO_EDGES`, `RUN_CUDA_FV3_FUSE_CORNER_FILL` (Prompt
-  28), `RUN_CUDA_FV3_GRAPH` (Prompt 29).
+  28), `RUN_CUDA_FV3_GRAPH` (Prompt 29). Idealized dry-core Held-Suarez
+  forcing (`Held_Suarez_ForcingMod.F90`, call site `FV_StateMod.F90::FV_Run`
+  before `fv_dynamics`) is gated by `RUN_HELD_SUAREZ` in `AGCM.rc`, default
+  OFF, backend-neutral (Prompt 31, branch `experiment/held-suarez-e2e`).
 
 ## 4. Implemented Capabilities
 
@@ -138,17 +126,18 @@ GEOS/FV3 Fortran -> ISO_C_BINDING / stable C ABI -> WP-E GPU context
   path since Prompt 29. Captures `dgrid_dynamics` only (halo exchange NOT
   captured); freezes `dt` by value (refuses replay if `bdt`/`n_split` change
   from capture time). Bitwise-identical to non-graph path at every depth
-  tested (1/5/600 calls internal harness, Prompt 13; 10/100/310 calls real
-  standalone path, Prompt 29). Real standalone benefit: 4.80%, LOW,
-  see §8/§9.
+  tested. Real standalone benefit: 4.80%, LOW, see §8/§9.
 - Launch-fusion optimizations, opt-in, default off, all bitwise-identical to
   default: `--fuse-corner-fill`/`RUN_CUDA_FV3_FUSE_CORNER_FILL` (Prompt 9,
   reachable from standalone path Prompt 28), `--fuse-halo-edges`/
   `RUN_CUDA_FV3_FUSE_HALO_EDGES` (Prompt 11, reachable Prompt 28).
   `a2b4_global_corner_kernel` was restructured for parallelism (Prompt 12);
   also bitwise-identical, always-on (not a flag).
+- Idealized Held-Suarez dry-core forcing: IMPLEMENTED, COMPILED, GPU
+  EXECUTED, NUMERICALLY VALIDATED at C8/C32/C64/C128 and up to 10-day
+  duration — see §9a.
 
-## 5. Numerical Validation Matrix
+## 5. Numerical Validation Matrix (Production dyn_core, non-HS)
 
 All entries below are against authoritative Fortran, same fixture, c8 grid
 unless noted, `npz=10`, production first-run numerics (`hord_mt=hord_vt=
@@ -225,13 +214,16 @@ C2), `prompt_19_longer_standalone_validation.md` (R8 depth),
 - Public C ABI for per-run setup (config/dispatch/topology/transport/Graph)
   is complete; no internal-only C++ entry point needed for standalone
   integration.
-- Numerically validated at the depths in §5 — all PASS.
+- Numerically validated at the depths in §5 (production) and §9a (HS) — all
+  PASS.
 - ABI/compiler-family compatibility with a full **Intel-compiler production
-  GEOS build** is not independently proven — this fixture links GCC-built
-  CUDA archives into an Intel-Fortran executable (evidence, not proof for
-  the full GEOS production build). Revisit before final production linkage.
+  GEOS build** verified sound by construction (Prompt 30: fixed-width
+  `iso_c_binding` types, runtime `abi_version`/`struct_bytes` guards,
+  explicit `MPI_Comm_f2c`) — this fixture links GCC-built CUDA archives into
+  an Intel-Fortran executable. Revisit before final production linkage if
+  the toolchain changes.
 
-## 8. Performance Status
+## 8. Performance Status (Production dyn_core, C32 baseline methodology)
 
 Current best validated standalone-path configuration: **MPS ON +
 `RUN_CUDA_FV3_FUSE_HALO_EDGES=YES` + `RUN_CUDA_FV3_FUSE_CORNER_FILL=YES`**.
@@ -250,9 +242,11 @@ standalone six-rank MPI path (`StandAlone_FV3_Dycore.x`, c32, R8,
 | + fuse_halo_edges + fuse_corner_fill (Prompt 28) | same + both fusion flags | 25.464 | −6.13% |
 | + CUDA Graph (Prompt 29, job 58382771) | same + `RUN_CUDA_FV3_GRAPH=YES` | 24.300 | −4.80% (LOW, not default) |
 
-Net: CUDA at 24.300 ms/call vs. Fortran's 19.930 ms/call = **1.22x slower**
-(was 5.30x slower pre-MPS). All steps bitwise/numerically neutral (§5 + each
-prompt's own guard).
+Net at C32: CUDA at 24.300 ms/call vs. Fortran's 19.930 ms/call = **1.22x
+slower** (was 5.30x slower pre-MPS). All steps bitwise/numerically neutral
+(§5 + each prompt's own guard). **See §8a: at C64/C128 under the same MPS+
+fusion mode, CUDA overtakes Fortran** — the gap direction reverses with
+resolution.
 
 Root-cause chain (full detail in the cited files, not repeated here):
 - **MPS is the dominant lever** (Prompt 26): bottleneck was 6 CUDA contexts
@@ -272,43 +266,67 @@ CUDA-aware MPI, kernel-tuning, and rank/GPU redesign all remain LOW/NOT
 JUSTIFIED (halo traffic 312 msgs/call all ≤64KB; device transfer ~2% of
 `DYN_CORE`; MPS already at the 1-context ceiling) — Prompts 25a/26.
 
-Internal single-process harness (`run_small_perf_bench`, no MPI, Prompt 13)
-is NOT representative of the real path above — kept only as provenance for
-the original (retracted) 5.14% CUDA Graph estimate: Graph off 21.66 / Graph
-on 20.55 ms/call, internal harness only.
-
 `ncu` (Nsight Compute) profiling remains platform-blocked
 (`ERR_NVGPUCTRPERM`); `nsys` is unaffected and was used for all profiling
 above.
 
+## 8a. Held-Suarez / Resolution Performance Scaling (Prompt 33)
+
+30 dyn_core calls/rep, 3 reps/config, savepoints off, standing MPS+fusion
+mode, `fv_timing_mod` flat `DYN_CORE` FMS-clock line (total seconds across
+all calls in the run / n_calls = ms/call; **first-call warmup included** —
+methodology differs from §8's 100-call/rep figures, which is documented as
+"warmup-excluded"; treat this table as directionally reliable, not a
+like-for-like replacement of §8's C32 number).
+
+| Grid | Fortran ms/call | CUDA ms/call | CUDA/Fortran |
+|---|---|---|---|
+| C32 (§8, different methodology — not re-measured here) | 19.930 | 25.464 | 1.28x slower |
+| C64 | 59.4 | 56.9 | **0.96x — CUDA faster** |
+| C128 | 237.4 | 210.9 | **0.89x — CUDA faster** |
+
+Finding: the CUDA/Fortran gap **NARROWS then REVERSES** with resolution —
+CUDA overtakes Fortran between C32 and C64 under the same MPS+
+fuse_halo_edges+fuse_corner_fill mode, consistent with GPU parallelism
+amortizing fixed per-call launch/sync overhead better as grid-point count
+grows. Both backends scale sub-linearly C32->C64 then ~linearly C64->C128
+(consistent with fixed-overhead amortization being larger at the smaller
+grid). Rep-to-rep agreement <0.5% at every config (tight, reproducible).
+
+Caveat: since C32 here was not re-measured under this exact 30-call
+methodology, "CUDA overtakes Fortran at C64" is directionally strong (both
+backends individually show physically sensible, highly reproducible
+scaling) but not proven to the same rigor tier as §5/§8's C32 figures. A
+follow-on task re-measuring C32 with this identical 30-call/3-rep
+methodology would close that gap cheaply if needed.
+
 ## 9. Known Limitations / Unvalidated Envelope
 
-- R4/R8 validation covers c8 (deepest: 72/12-call ladders) and c16/c32
-  (6-call depth only, resolution-scaled `bdt`, Prompt 23). Do not infer
-  behavior beyond the depths in §5 for any grid/precision combination.
+- R4/R8 production (non-HS) validation covers c8 (deepest: 72/12-call
+  ladders) and c16/c32 (6-call depth only, resolution-scaled `bdt`, Prompt
+  23). Do not infer behavior beyond the depths in §5 for any grid/precision
+  combination. **HS validation (§9a) separately covers c8/c32/c64/c128 up
+  to 10-day duration** — do not conflate the two ladders.
 - `MOIST_CAPPA`/`USE_COND`: **confirmed UNIMPLEMENTED in CUDA, not merely
   unvalidated** (Prompt 30) — triple-gated rejection (top-level runtime
   fence `fv3_gpu_runtime.cpp:1101-1102`, WP-B kernel-launch fence
   `wp_b_dsw_cuda.cu:889`, Fortran-bridge forced-zero
   `fv3_gpu_dyncore_bridge.F90:595-596`), by explicit design predating this
-  prompt (flagged at milestone 3A.9). Prompt 30 also found nonzero `q_con`
-  cannot be tested in isolation against the authoritative Fortran fixture,
-  because that fixture compiles `MOIST_CAPPA`/`USE_COND` in unconditionally
-  (`@fvdycore/CMakeLists.txt:130`) — closing this requires implementing the
-  Riemann-solver `peg`/`gm2`/`cp2` terms (`nh_utils.F90:372-390`) in CUDA, a
-  dedicated future WP-C/WP-B numerical-implementation prompt, not a
-  config/validation task. See `prompt_30_production_config_closure.md`.
+  prompt (flagged at milestone 3A.9). Nonzero `q_con` cannot be isolated
+  because the authoritative Fortran fixture compiles `MOIST_CAPPA`/
+  `USE_COND` unconditionally (`@fvdycore/CMakeLists.txt:130`) — closing this
+  requires implementing the Riemann-solver `peg`/`gm2`/`cp2` terms
+  (`nh_utils.F90:372-390`) in CUDA, a dedicated future WP-C/WP-B
+  numerical-implementation prompt. See `prompt_30_production_config_closure.md`.
 - `a_imp <= 0.999` (RIM_2D/SIM3p0 vertical branches): **confirmed
   UNIMPLEMENTED in CUDA** (Prompt 30), triple-gated (runtime fence
   `fv3_gpu_runtime.cpp:1082-1083`, Riemann-solver launcher fence
   `fv3_riem_solver_c.cu:247-251`, Fortran-bridge `mpp_error(FATAL)` guard
-  `fv3_gpu_dyncore_bridge.F90:622-627`). `a_imp` is read from the real
-  namelist (not hardcoded); only SIM1 (`a_imp=1.0`, the required first-run
-  value) is implemented. Closing this is a second, independent, similarly
-  dedicated future implementation prompt. The four downstream
+  `fv3_gpu_dyncore_bridge.F90:622-627`). Only SIM1 (`a_imp=1.0`, the
+  required first-run value) is implemented; a second, independent
+  implementation prompt would close this. The four downstream
   `a_imp <= 0.999`-only knobs (`scale_m`, `m_split`, `delt_max`, `scale_z`)
-  remain proven inert at the tested `a_imp = 1.0` and unreachable while the
-  gate above stands.
+  remain proven inert at `a_imp = 1.0`.
 - `ncu` profiling is platform-blocked (`ERR_NVGPUCTRPERM`); `nsys`
   unaffected.
 - `fv3_dispatch_smoke` Phase C fails if its own `cfg.nf_ke` pin is raised
@@ -318,165 +336,130 @@ above.
 - CUDA-aware MPI / comm-compute overlap (Stages 2/3): unimplemented,
   measured LOW priority (§8).
 - CUDA MPS (`fv3_mps_lifecycle.sh`, Prompt 27) requires
-  `compute_mode=Default` (true on Discover `gpu_a100`); only tested at
-  c32/R8, up to ~310-call depth, one node. Not yet wired into every
-  standing job script as the default (only one-off Prompt 27-29 scripts).
-- Launch fusion (`RUN_CUDA_FV3_FUSE_HALO_EDGES`/`_FUSE_CORNER_FILL`, Prompt
-  28) and CUDA Graph (`RUN_CUDA_FV3_GRAPH`, Prompt 29): both default OFF,
-  both bitwise-safe, both only measured at c32/R8/6-rank/1-A100/MPS-ON; not
-  yet tested at other grids, precisions, or without MPS. Graph's
-  refusal-on-`dt`/`n_split`-change behavior (Prompt 8 source, unchanged)
-  was not operationally re-exercised in Prompt 29 (held fixed all run).
+  `compute_mode=Default` (true on Discover `gpu_a100`). Not yet wired into
+  every standing job script as the default (only one-off job scripts so
+  far, now including the Prompt 33 Stage E perf scripts).
+- Launch fusion and CUDA Graph: both default OFF, both bitwise-safe, tested
+  at c32/R8 (§8) and additionally exercised (not separately re-guarded) at
+  c64/c128 R8 HS runs (§9a) without regression. Graph's refusal-on-`dt`/
+  `n_split`-change behavior was not operationally re-exercised this prompt.
 - Multi-GPU (`dev = mod(comm_rank, device_count)`) implemented but
   validated only at 2 GPUs/3 contexts-per-GPU; 4-GPU and MPS+multi-GPU
-  composition unmeasured (`--gres=gpu:4` would not schedule during
-  Prompt 26).
-- `install/bin/StandAlone_FV3_Dycore.x` and per-experiment job-directory
-  binary copies are not auto-synced with `build/bin/` after a rebuild
-  (discovered Prompt 29) — always refresh and verify via `strings` before
-  trusting a newly-added flag in a reused job directory.
+  composition unmeasured.
+- `install/bin/StandAlone_FV3_Dycore.x` and per-experiment binary copies
+  are not auto-synced with `build/bin/` after a rebuild — always refresh
+  and verify via `strings` before trusting a newly-added flag.
+- **MAPL restart (`COLDSTART: 0`)**: source-confirmed available (Prompt 32)
+  but never operationally exercised with HS+CUDA; every HS run through
+  Prompt 33 used `COLDSTART: 1`.
+- **C128 timestep search (Prompt 33)**: first `bdt` candidate was
+  CFL-unstable (NaN flood, caught via size-gated health check before a
+  full `grep`); resolved with a smaller `bdt`. Do not assume the C32
+  resolution-scaled `bdt` heuristic (§5) extends linearly to C128 without a
+  short stability check first.
+- **Stage E (§8a) caveat**: 30-call/3-rep, warmup-included — not directly
+  comparable to §8's warmup-excluded 100-call/rep C32 figure.
+
+## 9a. Held-Suarez Validation Ladder (branch `experiment/held-suarez-e2e`)
+
+Idealized dry-core Held-Suarez forcing, orthogonal to the `cuda/gpu-bringup`
+mainline (§3/§4). All entries: Fortran vs CUDA, same standalone fixture,
+6 MPI ranks, R8 unless noted, savepoint and/or NetCDF-level comparison.
+
+| Grid | Duration | Result | Notes |
+|---|---|---|---|
+| C8 | 72 outer steps (144 dyn_core calls) | **PASS** | `dcx` max_rel 7.999e-11 (ROUND-OFF/SMALL); Prompt 31 |
+| C32 | short gate (`bdt=1200s`/`n_split=3`/`k_split=1`) | **PASS** | savepoint 85,310/87,810 fields BIT-IDENTICAL, 2,500 FAIL confined to benign halo-padding (see below); NetCDF T@500hPa bitwise; Prompt 32 |
+| C64 | short gate | **PASS** | NetCDF bitwise; Prompt 33 |
+| C128 | short gate | **PASS** | first `bdt` candidate CFL-unstable (NaN flood), resolved by selecting a smaller `bdt`; accepted config NetCDF bitwise; Prompt 33 |
+| C128 | 10-day (jobs 58411417 Fortran / 58411418 CUDA) | **PASS** | both rc=0, log sizes byte-identical (1,717,491 B), 80 NetCDF files each (10 days x 4/day x 2 collections); NetCDF T@500hPa/U@250hPa/PS bitwise at start/mid/end; `range_warn=6966` identical both backends — investigated and classified benign (see below); Prompt 33 |
+
+Benign known artifacts (do not treat as new divergences):
+- 2-cell halo-padding uninitialized-memory difference in `delpc`/`pkc` at
+  savepoint level only, IEEE-754-subnormal magnitude (1e-313 to 1e-312) —
+  same artifact class as the Prompts 22/23 `mfyL` finding. Never present at
+  the NetCDF/physical-field level.
+- C128 10-day `range_warn` (6966 hits, both backends): all `TA_dyn` at
+  level 10, values 333.0-349.2K, 119 unique grid points. Confirmed benign
+  via sorted-diff (`diff <(grep ... | sort) <(grep ... | sort)` = 0,
+  content-identical modulo MPI-rank interleaving) — legitimate Held-Suarez
+  near-surface tropical warmth exceeding a hardcoded FMS diagnostic
+  plausibility bound, not a numerical defect.
+- Known near-surface NaN artifact (T/U/V, 3 lowest of 25 pressure levels,
+  standard MAPL vertical-interpolation masking) present identically in both
+  backends at every resolution tested (C8/C32/C128) — pre-existing pattern,
+  not new.
+
+Not attempted (out of Prompt 33 scope): duration beyond 10 days, resolution
+beyond C128, moist-physics coupling, restart-continuation runs, formal
+climatology statistics.
 
 ## 10. Current Git / Working-Tree State
 
-- Repository: `FVdycoreCubed_GridComp`, branch `cuda/gpu-bringup`.
-- HEAD: `2e6327f` ("Document MPS rank-GPU performance architecture"). Ahead
-  of `origin/cuda/gpu-bringup` — not pushed. Push/merge only on explicit
-  request.
-- Uncommitted source (Prompt 28+29, not committed — awaiting explicit
-  request): `cuda/interface/fv3_gpu_dyncore_bridge.F90`
-  (`env_flag_enabled` helper, `RUN_CUDA_FV3_FUSE_HALO_EDGES`/
-  `RUN_CUDA_FV3_FUSE_CORNER_FILL`/`RUN_CUDA_FV3_GRAPH` wiring),
-  `cuda/interface/fv3_gpu_abi_mod.F90` (new `fv3_gpu_set_cuda_graph_mode`
-  public declaration + interface, Prompt 29).
-- Tracked modification: `docs/agent_handoff/CURRENT_STATE.md`.
-- Untracked at repo root: numerous scratch shell scripts/logs/probes from
-  prior prompts (`task*_6c_cuda.sh`, `sp*rerun*.sh`, `p1[7-8]_*.sbatch`,
-  `cln*.txt`, `cmp_nord*.txt`, `det_diff_*.txt`, `pre*.txt`, `scratch_*/`,
-  build helpers), reusable tooling under `tools/` (savepoint validation,
-  e.g. `compare_dcx_backends.py`, `tools/savepoints/savepoint_reader.py` —
-  fixed this prompt, both `run_sanity_checks()` and `compare_runs()` had the
-  same bug: hardcoded skip for the literal field name `"damping"` instead of
-  any `.txt`-backed text-table field, breaking on the fixture's second such
-  field `da_min`), new `tools/analysis/hs_netcdf_inspect.py` (Prompt 32,
-  xarray offline-diagnostics CLI for the HS NetCDF output), and
-  `perf_rerun_logs/` (Prompts 7-13 sbatch/logs). Untracked handoff docs for
-  every prompt from 22 through 32 (see §12); Prompt 30
-  (`prompt_30_production_config_closure.md`) is source-inspection only — no
-  source file was modified. In the separate
-  Fortran fixture tree
-  `<fortran_perf>/experiments/`: per-prompt sbatch scripts/`.out` logs/nsys
-  CSVs (Prompts 24-29), `fv3_mps_lifecycle.sh`, and job directories
-  `p24_c32_r8_cuda(_nsys)`/`p28_c32_r8_cuda_guard` (reused across Prompts
-  24/27/28/29) plus profiler artifacts (`.nsys-rep`/`.sqlite`) under
-  `p24_c32_r8_cuda_nsys/`.
+- Repository: `FVdycoreCubed_GridComp`. Mainline branch `cuda/gpu-bringup`
+  HEAD `2e6327f` ("Document MPS rank-GPU performance architecture"), ahead
+  of `origin/cuda/gpu-bringup`, not pushed. HS track branch
+  `experiment/held-suarez-e2e` HEAD `5bb5cc6` ("Validate global C32
+  Held-Suarez Fortran and CUDA runs"), also not pushed. Push/merge only on
+  explicit request.
+- Uncommitted source on `cuda/gpu-bringup` (Prompt 28+29, awaiting explicit
+  commit request): `cuda/interface/fv3_gpu_dyncore_bridge.F90`
+  (`env_flag_enabled` helper + fusion/Graph env wiring),
+  `cuda/interface/fv3_gpu_abi_mod.F90` (`fv3_gpu_set_cuda_graph_mode`).
+- Untracked at repo root (both branches share the worktree): numerous
+  scratch shell scripts/logs/probes from prior prompts (`task*_6c_cuda.sh`,
+  `sp*rerun*.sh`, `p1[7-8]_*.sbatch`, `cln*.txt`, `cmp_nord*.txt`,
+  `det_diff_*.txt`, `pre*.txt`, `scratch_*/`, build helpers), reusable
+  tooling under `tools/` (savepoint validation — `compare_dcx_backends.py`,
+  `tools/savepoints/savepoint_reader.py`; `tools/analysis/
+  hs_netcdf_inspect.py`, Prompt 32), and `perf_rerun_logs/`. Untracked
+  handoff docs for every prompt from 22 through 33 (see §12). In the
+  separate Fortran fixture tree `<fortran_perf>/experiments/`: per-prompt
+  sbatch scripts/`.out` logs/nsys artifacts (Prompts 24-33), job directories
+  including the Prompt 33 additions (`p33_c64_gate_*`, `p33_c128_gate_*`,
+  `p33_c128_hs10d_*`, `p33_c64_perf_*`, `p33_c128_perf_*` — the latter four
+  with `perf_logs/rep{1,2,3}.log`), and `fv3_mps_lifecycle.sh`.
 - Do not commit: build directories (`build_cuda_r8*/`), profiler artifacts
-  (`*.nsys-rep`, `*.sqlite`), `scratch_*/`, any `*.out` Slurm log.
+  (`*.nsys-rep`, `*.sqlite`), `scratch_*/`, any `*.out` Slurm log, NetCDF
+  output, restart data.
 - Do commit (if explicitly requested): legitimate source fixes, permanent
   test/tooling additions under `tools/`, documentation.
 
 ## 11. Next Recommended Task
 
-Prompt 29 closed the CUDA Graph question raised at the end of Prompt 28:
-Graph is now reachable from the standalone path (`RUN_CUDA_FV3_GRAPH`),
-numerically safe (BITWISE), and stable under repeated replay, but its real
-whole-`dyn_core` benefit (4.80%) falls just under the 5% MODERATE floor ->
-**LOW**. It is NOT part of the recommended default production mode.
-**Standing recommended optimized standalone CUDA mode remains unchanged
-since Prompt 28: MPS ON + `RUN_CUDA_FV3_FUSE_HALO_EDGES=YES` +
-`RUN_CUDA_FV3_FUSE_CORNER_FILL=YES`** (25.464-25.526 ms/call, 1.28-1.36x
-slower than Fortran, down from 5.30x pre-MPS).
-
-No further standalone dyn_core launch/orchestration optimization is
-currently justified: `cudaEventSynchronize` (GPU-producer-wait under MPS
-context-sharing) is now the dominant remaining cost and does not respond to
-launch-count reduction (fusion or Graph); CUDA-aware MPI and kernel tuning
-remain LOW priority (§8); rank/GPU redesign is NOT JUSTIFIED (MPS already
-at the 1-context ceiling).
-
-**Prompt 30 attempted Track 1 (production GEOS integration closures) and
-found it BLOCKED-BY-DESIGN, not merely unvalidated**: `MOIST_CAPPA`,
-`USE_COND`, and `a_imp <= 0.999` are confirmed unimplemented in CUDA
-(triple-gated rejections, source-documented since milestone 3A.9); nonzero
-`q_con` cannot be tested in isolation from that gap because the
-authoritative Fortran fixture compiles `MOIST_CAPPA`/`USE_COND`
-unconditionally. Intel-Fortran ABI verification (the one Track-1 item that
-was reachable) PASSED. See §9 and `prompt_30_production_config_closure.md`.
-
-Three open tracks — confirm scope with the user before starting any:
-1. **CUDA MOIST_CAPPA/USE_COND implementation** — a dedicated WP-C/WP-B
-   numerical-implementation prompt: add the Riemann-solver `peg`/`gm2`/
-   `cp2` terms (`nh_utils.F90:372-390`) to `fv3_riem_solver_c.cu`, construct
-   a source-backed nonzero-`q_con` fixture, then re-run Gate-C2-style
-   validation. Not a config/plumbing task.
-2. **CUDA `a_imp <= 0.999` (RIM_2D/SIM3p0) implementation** — a second,
-   independent, similarly-scoped numerical-implementation prompt.
-3. **Operational wiring** — fold the MPS lifecycle helper + the two fusion
-   flags (the standing recommended mode) into every standing GEOS/
-   standalone job script as the new default, not just the one-off Prompt
-   27-29 job scripts. Lower-risk than 1/2; does not require new numerical
-   work.
+**Mainline (`cuda/gpu-bringup`) tracks — confirm scope with the user before
+starting any:**
+1. **CUDA MOIST_CAPPA/USE_COND implementation** — dedicated WP-C/WP-B
+   numerical-implementation prompt (§9).
+2. **CUDA `a_imp <= 0.999` implementation** — second, independent
+   implementation prompt (§9).
+3. **Operational wiring** — fold the MPS lifecycle helper + two fusion
+   flags into every standing job script as the default, not just one-off
+   scripts. Lower-risk than 1/2.
 
 Until 1 or 2 closes, "broader GEOS integration" remains bounded to the
 already-validated production first-run subset (`hord_*=±6`, `grid_type=0`,
 `hydrostatic=false`, `a_imp=1.0`, `use_cond=moist_cappa=0`).
 
-**Prompt 31 (separate track, branch `experiment/held-suarez-e2e`)** added
-an idealized Held-Suarez dry-core forcing (`Held_Suarez_ForcingMod.F90`,
-call site `FV_StateMod.F90::FV_Run` before the single per-outer-step
-`fv_dynamics` call, gated by new `RUN_HELD_SUAREZ` `AGCM.rc` key,
-default OFF) to the real standalone workflow in both the CUDA-tracking
-repo and the separate `GEOSfvdycore_fortran_perf` build fixture (two-tree
-architecture: the fixture, not this repo, actually compiles
-`StandAlone_FV3_Dycore.x`). c8/L10/R8, 72 outer steps (144 `dyn_core`
-calls), Fortran and CUDA both ran clean (jobs 58387366/58387442); `dcx`
-comparison worst `max_rel` 7.999e-11 (ROUND-OFF/SMALL only, no
-SIGNIFICANT). Resolved an apparent `pt`-units anomaly (savepoint `pt`
-8.5-24.9, not Kelvin-plausible) by tracing `fv_dynamics.F90`: `pt` is
-Kelvin at the HS call site (confirmed by the routine's own dummy-arg
-contract) and is only converted to a virtual-potential-temperature-like
-internal quantity (`/pkz`) later inside `fv_dynamics`, after the `dcx`/
-`dce` dump points — not a bug, no escalation needed. One incident found
-and fixed: copied job scripts retained stale `EXPDIR` pointing at the
-original `p19_stageA_fortran`/`p19_stageA_cuda` baseline dirs, which were
-accidentally overwritten (~16.9k/15.7k files) before the fix; documented
-numeric results elsewhere are unaffected, raw artifacts not regenerated
-(deferred, flagged for user). Full detail: `prompt_31_held_suarez_e2e.md`.
+**HS track (`experiment/held-suarez-e2e`) — Prompt 33 closed Stages C/D/E**
+of the multi-day/high-resolution ladder: C128 short-gate PASS, C128 10-day
+PASS (bitwise NetCDF), and a C32->C64->C128 performance scaling table
+showing CUDA overtakes Fortran at higher resolution under MPS+fusion (§8a).
+Prompts 31 (integration smoke test) and 32 (scientific validation,
+NetCDF-mechanism confirmation) are prerequisite context — see
+`prompt_31_held_suarez_e2e.md` / `prompt_32_held_suarez_scientific_validation.md`.
 
-**Prompt 32 (same branch, follow-on to Prompt 31)** advanced HS from
-integration-smoke-test to scientific-validation level and **PASSED**: (a)
-confirmed the existing MAPL History/CFIO mechanism (`HISTORY.rc`
-`inst1_2d_diag`/`inst3_3d_diag`) already satisfies standard-NetCDF-output
-needs at both C8 and C32, no new I/O code required; (b) ran a C32 HS
-stability+comparison gate using the authoritative Prompt-23 timestep
-(`bdt=1200s`, `n_split=3`, `k_split=1`, no new search) — Fortran gate PASS
-(job 58389608), CUDA gate PASS under the standing recommended mode (job
-58390108); (c) fixed `savepoint_reader.py`'s text-table-field bug (see
-§10); (d) sanity-checked both C32 HS savepoint trees clean (86,010 fields
-each); (e) Fortran-vs-CUDA C32 HS savepoint comparison: 85,310/87,810
-fields BIT-IDENTICAL, 0 MACHINE-PRECISION-EQUIVALENT, 2,500 FAIL — all
-confined to `delpc`/`pkc` at `sp1`/`sp2a`, `pe` 0-4, with `max_abs` in the
-IEEE-754-subnormal range (1e-313 to 1e-312); direct inspection confirmed
-the real/physical field statistics are identical between backends and only
-unwritten halo-padding cells (2-cell halo, capture-time-specific) differ —
-same benign uninitialized-memory artifact class as the Prompts 22/23
-`mfyL` finding, not a new or growing divergence, no Opus escalation; (f)
-independently corroborated bitwise-identical at the NetCDF level
-(`compare-backends` on T@500hPa, `max_abs_diff=0.0`); (g) confirmed the
-known near-surface-level NaN artifact (T/U/V, 3 lowest of 25 pressure
-levels, standard MAPL vertical-interpolation masking) is present
-identically in both backends at C32, matching the pre-existing C8 pattern;
-(h) delivered `tools/analysis/hs_netcdf_inspect.py` (describe/
-global-mean-t/zonal-mean/compare-backends), tested against real C32 HS
-output including a qualitative HS baroclinic-jet sanity check
-(zonal-mean U@250hPa peaking ~35 m/s at ±45°); (i) confirmed (source-only,
-untested) that MAPL's standard internal-checkpoint restart mechanism
-(`COLDSTART: 0`) is available and unaffected by the HS/CUDA work, though
-every HS run so far used `COLDSTART: 1`. **Per task scope, no long
-(10/100/1000-day) C32 run was attempted** — stopped after the short
-validation passed. No CUDA/Fortran/HS-forcing source was modified; only two
-Python analysis-tool fixes/additions in this repo's `tools/` and job/config
-scripts in the separate fixture tree. Full detail:
-`prompt_32_held_suarez_scientific_validation.md`.
+Open HS-track follow-ons (confirm scope before starting):
+1. **Climatology-scale run** (30-100+ day, C32 or higher) — the natural
+   next step now that 10-day/C128 is validated; not started (out of Prompt
+   33 scope).
+2. **Higher resolution** (C256+) — unmeasured; would need its own
+   stability/timestep search per the C128 lesson in §9.
+3. **Restart-continuation exercise** — validate `COLDSTART: 0` with HS+CUDA
+   (source-confirmed available, never operationally tested; §9).
+4. **Stage E methodology reconciliation** — re-measure C32 under the exact
+   30-call/3-rep warmup-included methodology used for C64/C128 in §8a, to
+   make the scaling table fully apples-to-apples with §8.
 
 ## 12. Detailed Handoff References
 
@@ -487,68 +470,55 @@ only when the current task requires that level of detail (per
 
 - `prompt_6a_fortran_savepoints.md` — authoritative Fortran savepoint
   generation (bit-identical across two runs).
-- `prompt_6b_cuda_fortran_validation.md` — Gate C2 closure: all thirteen
-  input-fidelity fixes, all in-loop boundaries, all exit fields, `omga`
-  finalization, E11, heat accumulator, `n_con`/`nf_ke`.
+- `prompt_6b_cuda_fortran_validation.md` — Gate C2 closure.
 - `prompt_7_post_gate_c2_performance_baseline.md` — baseline
   re-establishment and nsys profiling after Gate C2.
 - `prompt_8_cuda_graphs_prototype.md` — historical; conclusions retracted
   by Prompt 13.
 - `prompt_9_kernel_fusion_validation.md`, `prompt_10_copy_corners_batching.md`,
   `prompt_11_next_launch_target.md`, `prompt_12_a2b4_kernel_tuning.md` —
-  launch-fusion/kernel-tuning characterization and implementation sequence.
+  launch-fusion/kernel-tuning sequence.
 - `prompt_13_architectural_optimization.md` — CUDA Graph capture repair;
-  the GPU-execution-bound regime finding.
+  GPU-execution-bound regime finding.
 - `prompt_14_standalone_cuda_integration.md` — production call-boundary
   interface table; FMS/CUDA halo ownership resolution.
 - `prompt_15_mpi_halo_transport.md` — `HaloTransport` interface and
   `MpiHaloTransport` implementation/validation.
-- `prompt_18_mpi_transport_determinism.md` — root cause and fix for the
+- `prompt_18_mpi_transport_determinism.md` — root cause/fix for the
   intermittent MPI transport test failure.
 - `prompt_19_longer_standalone_validation.md` — R8 c8 72-call/12-call
-  (k_split=2) validation ladder.
+  validation ladder.
 - `prompt_20_r4_numerical_validation.md`, `prompt_21_longer_r4_validation.md`
-  — R4 c8 first-pass and depth-matched validation.
+  — R4 c8 validation.
 - `prompt_22_wider_grid_validation.md` — c16 CFL-instability blocker
-  (resolved in Prompt 23).
+  (resolved Prompt 23).
 - `prompt_23_resolution_timestep_validation.md` — resolution-scaled `bdt`
-  evidence and c16/c32 R8/R4 validation closing the Prompt 22 blocker.
+  and c16/c32 R8/R4 validation.
 - `prompt_24_standalone_performance_validation.md` — real standalone-path
-  Fortran-vs-CUDA timing, internal-harness-vs-real-path attribution fix,
-  nsys-based bottleneck classification.
-- `prompt_25a_fv3_halo_characterization.md` — halo message-size/count
-  census and the LOW CUDA-aware-MPI benefit ceiling.
-- `prompt_26_rank_gpu_architecture.md` — rank/GPU/context architecture map,
-  context-scaling measurements, the CUDA MPS 3.92x result and its bitwise
-  guard, and the A-F candidate ranking.
-- `prompt_27_mps_operational_profile.md` — MPS operationalized as a
-  job-scoped opt-in lifecycle helper; post-MPS `nsys` profile and the MIXED
-  launch-orchestration/kernel-compute reclassification.
-- `prompt_28_standalone_launch_reduction.md` — `fuse_halo_edges`/
-  `fuse_corner_fill` exposed on the standalone path; bitwise numerical
-  guard; MODERATE (6.13%) timing result; CUDA Graph ABI JUSTIFIED decision
-  (not implemented at that point).
-- `prompt_29_standalone_cuda_graph.md` — CUDA Graph exposed on the
-  standalone path (`RUN_CUDA_FV3_GRAPH`); bitwise numerical guard; replay
-  stability; 4.80% timing result classified LOW; nsys bucket comparison.
-- `prompt_30_production_config_closure.md` — production-readiness closure
-  attempt: confirmed `MOIST_CAPPA`/`USE_COND`/`a_imp<=0.999` unimplemented
-  by design (triple-gated); Stage-A/`q_con` coupling to that gap; Intel
-  Fortran ABI verification PASS; no remaining undocumented hardcoded
-  production assumptions found; no source changed.
-- `milestone_3a*.md`, `wp-*.md` — work-package-level implementation history
-  (WP-A/B/C/D/E), pre-Gate-C2.
-- `prompt_31_held_suarez_e2e.md` — Held-Suarez idealized dry-core forcing:
-  two-tree build architecture, forcing/call-site design, `pt`-units
-  resolution, Fortran/CUDA comparison, EXPDIR incident and fix. Separate
-  branch (`experiment/held-suarez-e2e`), orthogonal to this file's
-  `cuda/gpu-bringup` mainline tracking.
+  timing, nsys-based bottleneck classification.
+- `prompt_25a_fv3_halo_characterization.md` — halo census, LOW
+  CUDA-aware-MPI ceiling.
+- `prompt_26_rank_gpu_architecture.md` — rank/GPU/context map, MPS 3.92x
+  result.
+- `prompt_27_mps_operational_profile.md` — MPS as job-scoped lifecycle
+  helper; post-MPS nsys profile.
+- `prompt_28_standalone_launch_reduction.md` — fusion flags exposed;
+  MODERATE (6.13%) result.
+- `prompt_29_standalone_cuda_graph.md` — CUDA Graph exposed; LOW (4.80%)
+  result.
+- `prompt_30_production_config_closure.md` — `MOIST_CAPPA`/`USE_COND`/
+  `a_imp<=0.999` confirmed unimplemented by design; Intel ABI verification
+  PASS.
+- `milestone_3a*.md`, `wp-*.md` — work-package-level implementation
+  history, pre-Gate-C2.
+- `prompt_31_held_suarez_e2e.md` — HS forcing integration smoke test
+  (C8, two-tree build architecture, `pt`-units resolution).
 - `prompt_32_held_suarez_scientific_validation.md` — HS scientific
-  validation: NetCDF mechanism confirmation (C8+C32), C32 timestep-config
-  sourcing, C32 Fortran/CUDA gate PASS, `savepoint_reader.py` text-field
-  fix, savepoint comparison (benign `delpc`/`pkc` artifact explained),
-  `hs_netcdf_inspect.py` deliverable, NetCDF NaN cross-check, restart
-  capability note. Same branch as Prompt 31.
+  validation (C32, NetCDF mechanism, savepoint comparison,
+  `hs_netcdf_inspect.py`).
+- `prompt_33_hs_multiday_highres_performance.md` — HS ladder extended to
+  C64/C128 and 10-day duration; C32->C64->C128 performance scaling table
+  (§8a/§9a of this file).
 
 ---
 
