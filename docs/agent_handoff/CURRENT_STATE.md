@@ -1,13 +1,13 @@
 # Current Project State
 
-_Last updated 2026-09-15 (Prompt 34: C32 dyn_core perf re-measured onto the
-exact C64/C128 timing methodology, branch `experiment/held-suarez-e2e`,
-orthogonal to the `cuda/gpu-bringup` mainline. Supersedes Prompt 33's
-mismatched-baseline C32 figure — CUDA already overtakes Fortran at C32, not
-just from C64 up. See §8a/§9a/§11 and `prompt_34_c32_perf_reconciliation.md`.
-Prompts 30-33 remain summarized in §8a/§9/§11 and fully detailed in their
-own handoff docs (§12); this file holds current truth only, not
-chronological narrative._
+_Last updated 2026-09-17 (Prompt 35: Held-Suarez 100-day matched Fortran/
+CUDA climatology run, branch `experiment/held-suarez-e2e`. Bitwise backend
+agreement confirmed out to 100 days at C128; restart-continuation
+(`COLDSTART: 0`) confirmed BROKEN for this HS/nonhydrostatic config
+(standing negative result, not fixed). See §9/§9a/§11 and
+`prompt_35_hs_climatology.md`. Prompts 30-34 remain summarized in §8a/§9/§11
+and fully detailed in their own handoff docs (§12); this file holds current
+truth only, not chronological narrative._
 
 ## 1. Project Goal
 
@@ -346,9 +346,14 @@ timing-only. Detail: `prompt_34_c32_perf_reconciliation.md`.
 - `install/bin/StandAlone_FV3_Dycore.x` and per-experiment binary copies
   are not auto-synced with `build/bin/` after a rebuild — always refresh
   and verify via `strings` before trusting a newly-added flag.
-- **MAPL restart (`COLDSTART: 0`)**: source-confirmed available (Prompt 32)
-  but never operationally exercised with HS+CUDA; every HS run through
-  Prompt 33 used `COLDSTART: 1`.
+- **MAPL restart (`COLDSTART: 0`)**: **confirmed BROKEN** for this HS/
+  nonhydrostatic standalone configuration (Prompt 35, Fortran backend,
+  Opus-escalation root cause: a genuine source-level gap in the
+  nonhydrostatic warm-restart path, not a CUDA issue or config mistake).
+  CUDA restart was correctly skipped once Fortran's own restart failed.
+  Do not use warm restart for HS production runs; use fresh
+  `COLDSTART: 1` runs of the desired total length instead. Every HS run
+  through Prompt 35 uses `COLDSTART: 1`.
 - **C128 timestep search (Prompt 33)**: first `bdt` candidate was
   CFL-unstable (NaN flood, caught via size-gated health check before a
   full `grep`); resolved with a smaller `bdt`. Do not assume the C32
@@ -370,6 +375,8 @@ mainline (§3/§4). All entries: Fortran vs CUDA, same standalone fixture,
 | C64 | short gate | **PASS** | NetCDF bitwise; Prompt 33 |
 | C128 | short gate | **PASS** | first `bdt` candidate CFL-unstable (NaN flood), resolved by selecting a smaller `bdt`; accepted config NetCDF bitwise; Prompt 33 |
 | C128 | 10-day (jobs 58411417 Fortran / 58411418 CUDA) | **PASS** | both rc=0, log sizes byte-identical (1,717,491 B), 80 NetCDF files each (10 days x 4/day x 2 collections); NetCDF T@500hPa/U@250hPa/PS bitwise at start/mid/end; `range_warn=6966` identical both backends — investigated and classified benign (see below); Prompt 33 |
+| C128 | 30-day (jobs 58421485 Fortran / 58421486 CUDA) | **PASS** | both rc=0, 1h49m/1h42m elapsed, 240 nc4 files each; bitwise T@500hPa/U@250hPa/PS at day 1/5/10/20/30; day 30 classified as active spin-up (KE-proxy still rising, pronounced NH/SH jet asymmetry); Prompt 35 |
+| C128 | 100-day (jobs 58424578 Fortran / 58424579 CUDA, after 3 job-config fixes — see §12) | **PASS** | both rc=0, `ALL DONE`, 6h00m/5h38m elapsed, 800 nc4 files each, log sizes byte-identical (14,275,392 B), 0 NaN/error, `range_warn=33543` identical both backends; bitwise T@500hPa/U@250hPa/PS at day 1/5/10/20/30/50/75/100; jet NH/SH symmetrized (59.06/-59.06 vs day-30's 53.44/-75.94) and KE-proxy/global-mean-T trends flattened ~5-10x vs day 30, but not yet fully equilibrated (HS literature: ~200+ days from cold start); Prompt 35 |
 
 Benign known artifacts (do not treat as new divergences):
 - 2-cell halo-padding uninitialized-memory difference in `delpc`/`pkc` at
@@ -387,18 +394,20 @@ Benign known artifacts (do not treat as new divergences):
   backends at every resolution tested (C8/C32/C128) — pre-existing pattern,
   not new.
 
-Not attempted (out of Prompt 33 scope): duration beyond 10 days, resolution
-beyond C128, moist-physics coupling, restart-continuation runs, formal
-climatology statistics.
+Not attempted (out of Prompt 35 scope): duration beyond 100 days, resolution
+beyond C128, moist-physics coupling, warm-restart-continuation runs (see §9,
+confirmed broken), formal (multi-decade) climatology statistics.
 
 ## 10. Current Git / Working-Tree State
 
 - Repository: `FVdycoreCubed_GridComp`. Mainline branch `cuda/gpu-bringup`
   HEAD `2e6327f` ("Document MPS rank-GPU performance architecture"), ahead
   of `origin/cuda/gpu-bringup`, not pushed. HS track branch
-  `experiment/held-suarez-e2e` HEAD `5bb5cc6` ("Validate global C32
-  Held-Suarez Fortran and CUDA runs"), also not pushed. Push/merge only on
-  explicit request.
+  `experiment/held-suarez-e2e` HEAD `a76b429` ("Document Held-Suarez
+  performance scaling"), also not pushed. Push/merge only on explicit
+  request. Prompt 35's `docs/agent_handoff/prompt_35_hs_climatology.md` and
+  `CURRENT_STATE.md` updates are uncommitted on this branch, awaiting
+  explicit commit request.
 - Uncommitted source on `cuda/gpu-bringup` (Prompt 28+29, awaiting explicit
   commit request): `cuda/interface/fv3_gpu_dyncore_bridge.F90`
   (`env_flag_enabled` helper + fusion/Graph env wiring),
@@ -438,24 +447,25 @@ Until 1 or 2 closes, "broader GEOS integration" remains bounded to the
 already-validated production first-run subset (`hord_*=±6`, `grid_type=0`,
 `hydrostatic=false`, `a_imp=1.0`, `use_cond=moist_cappa=0`).
 
-**HS track (`experiment/held-suarez-e2e`) — Prompt 33 closed Stages C/D/E**
-of the multi-day/high-resolution ladder: C128 short-gate PASS, C128 10-day
-PASS (bitwise NetCDF), and a C32->C64->C128 performance scaling table
-showing CUDA overtaking Fortran (§8a). **Prompt 34 reconciled the C32 point
-onto the exact C64/C128 methodology**: CUDA already overtakes Fortran at
-C32 (0.96x), not just from C64 up; margin widens further at C128 (0.89x —
-best measured GPU competitiveness). Prompts 31 (integration smoke test) and
-32 (scientific validation, NetCDF-mechanism confirmation) are prerequisite
-context — see `prompt_31_held_suarez_e2e.md` /
-`prompt_32_held_suarez_scientific_validation.md`.
+**HS track (`experiment/held-suarez-e2e`) — Prompt 35 closed the
+climatology-scale run** that Prompt 33/34 flagged as the natural next step:
+30-day and 100-day matched Fortran/CUDA C128 runs, both bitwise-identical
+at every sampled checkpoint out to 100 days (§9a). Also **confirmed
+restart-continuation (`COLDSTART: 0`) is BROKEN** for this HS/NH config
+(standing negative result, §9) — from-scratch runs are the only validated
+path for extending duration. Prompts 31-34 (integration smoke test,
+scientific validation, multi-day/high-res ladder, C32 perf reconciliation)
+are prerequisite context — see §12.
 
 Open HS-track follow-ons (confirm scope before starting):
-1. **Climatology-scale run** (30-100+ day, C32 or higher) — the natural
-   next step now that 10-day/C128 is validated; not started.
-2. **Higher resolution** (C256+) — unmeasured; would need its own
+1. **Further duration** toward the ~200+ day HS-literature equilibration
+   estimate — day 100 is markedly closer to equilibrium than day 30 but
+   not yet flat (§9a); not started.
+2. **Warm-restart fix** — dedicated future prompt to close the confirmed
+   nonhydrostatic warm-restart gap (§9), which would let duration extension
+   proceed via restart-chaining instead of ever-longer cold-start jobs.
+3. **Higher resolution** (C256+) — unmeasured; would need its own
    stability/timestep search per the C128 lesson in §9.
-3. **Restart-continuation exercise** — validate `COLDSTART: 0` with HS+CUDA
-   (source-confirmed available, never operationally tested; §9).
 
 ## 12. Detailed Handoff References
 
@@ -517,6 +527,13 @@ only when the current task requires that level of detail (per
   (§8a/§9a of this file).
 - `prompt_34_c32_perf_reconciliation.md` — C32 dyn_core perf re-measured
   under the exact C64/C128 methodology, reconciling §8a's scaling table.
+- `prompt_35_hs_climatology.md` — warm-restart confirmed broken
+  (Opus-escalated root cause); 30-day and 100-day matched Fortran/CUDA
+  C128 climatology runs, bitwise agreement to 100 days; three
+  job-configuration bugs found/fixed (`EXPDIR` staleness, `JOB_SGMT`
+  digit-packing cap, `DUR_DD` hard-fail); spin-up/equilibration
+  diagnostics (`eke-proxy`, `jet-metrics` additions to
+  `hs_netcdf_inspect.py`).
 
 ---
 
