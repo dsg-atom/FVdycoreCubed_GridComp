@@ -1,17 +1,17 @@
 # Current Project State
 
-_Last updated 2026-09-17 (Prompt 38: C512 comm-regression root-cause,
-branch `experiment/held-suarez-e2e`, diagnostic-only — 0 new
-instrumentation/nsys/GPU jobs, static geometry + existing FMS-clock logs
-only. C512's CUDA/Fortran=1.270 regression (Prompt 37) attributed to halo
-message size crossing the small-message regime (C256 ~67.8KB already >
-the ~64KB LOW-priority anchor; C512 ~135.4KB) causing disproportionate
-(19.5x) growth in `COMM_DSW`'s CUDA-Fortran delta, plus every
-halo-adjacent compute block flipping from a CUDA win at C256 to a loss at
-C512. CUDA-aware-MPI priority LOW->MODERATE (contingent). One mechanism
-ambiguity remains (MPI protocol vs. generic device-staging cost); one
-discriminator experiment recommended, not yet run. See §8a/§9/§11 and
-`prompt_38_c512_comm_root_cause.md`. This file holds current truth only._
+_Last updated 2026-09-17 (Prompt 39: C512 PeerHalo-vs-MPI discriminator,
+branch `experiment/held-suarez-e2e`, diagnostic-only — 1 new GPU job,
+existing `fv3_gpu_perf_bench` harness, no source changes. Result: the
+in-process `PeerHaloTransport` path scales C256->C512 at 3.69x (below
+even the Fortran path's 5.72x), while the six-rank `MpiHaloTransport`
+path collapses at 8.32x — isolating Prompt 37/38's C512 CUDA/Fortran=
+1.270 regression to the MPI transport/protocol layer specifically, not
+the shared device-side halo pack/unpack/staging code. CUDA-aware-MPI
+priority MODERATE(contingent)->HIGH CANDIDATE. One next experiment
+recommended (OpenMPI eager/rendezvous MCA threshold sweep at C512), not
+yet run. See §6/§8a/§9/§11 and `prompt_39_c512_peerhalo_discriminator.md`.
+This file holds current truth only._
 
 ## 1. Project Goal
 
@@ -175,8 +175,13 @@ Full field-by-field tables: `prompt_6b_cuda_fortran_validation.md`,
   branch skips `i_pack(1)`/`i_pack(8)`, keeps `i_pack(10)` (tracer).
   Default Fortran path unchanged.
 - CUDA-aware MPI (Stage 2) and comm/compute overlap (Stage 3): unimplemented
-  future work. Priority was LOW at C32-C128 (§8); **raised to MODERATE
-  (contingent) at C256/C512** — see §8a/§9.
+  future work. Priority was LOW at C32-C128 (§8), MODERATE (contingent) at
+  C256/C512 after Prompt 38, and **raised to HIGH CANDIDATE after Prompt
+  39's discriminator isolated the C512 regression to the MPI transport
+  layer specifically** (in-process `PeerHaloTransport` scales normally at
+  C512; six-rank `MpiHaloTransport` does not) — see §8a/§9. Still not
+  implemented; one MCA-threshold discriminator recommended before any
+  implementation begins.
 
 ## 7. Standalone Integration Status
 
@@ -271,15 +276,20 @@ measurement) and ruled out — two orders of magnitude below the observed
 growth. MPS/6-context contention (Prompt 26) is resolution-independent —
 ruled out as the resolution-specific driver.
 
-**Remaining ambiguity**: whether the dominant sub-mechanism is MPI
-transport/protocol cost (e.g. an eager/rendezvous threshold crossover) or
-generic device-side pack/unpack/staging cost — not separable at existing
-FMS-clock granularity. **CUDA-aware-MPI priority raised LOW->MODERATE
-(contingent)** — pure copy bandwidth is not the fix by itself even if
-adopted. 4 ranked, unimplemented remediation options and 1 recommended
-discriminator experiment (`fv3_gpu_perf_bench`'s `PeerHaloTransport`
-harness at C512 dimensions, vs. the 9089.05 ms/call MPI-transport
-measurement) in `prompt_38_c512_comm_root_cause.md`. No optimization
+**Mechanism isolated (Prompt 39)**: the existing `fv3_gpu_perf_bench`
+harness's in-process `PeerHaloTransport` path (which shares all topology/
+pack/unpack code with `MpiHaloTransport`) was run at C256 and C512
+(`--mode resident`, fusion flags on, Graph off, job 58445168, rc=0, 0
+FAIL/NaN/Inf). Its C256->C512 growth factor is **3.69x** — below the
+Fortran path's own 5.72x growth, and far below the six-rank
+`MpiHaloTransport` path's **8.32x** growth. PeerHalo stays healthy at
+C512 while MpiHaloTransport collapses, isolating the regression to the
+**MPI transport/protocol layer specifically**, not the shared device-side
+pack/unpack/staging mechanism. **CUDA-aware-MPI priority raised
+MODERATE(contingent)->HIGH CANDIDATE.** One next experiment recommended
+(OpenMPI eager/rendezvous MCA-threshold sweep at C512 vs. the 9089.05
+ms/call baseline), not yet run — see `prompt_39_c512_peerhalo_
+discriminator.md`. No optimization/CUDA-aware-MPI implementation
 attempted; numerical source unchanged; correctness (§9a) BITWISE,
 unaffected.
 
@@ -291,13 +301,14 @@ unaffected.
   (24h gate) and C512 (6h gate)** — do not conflate the two ladders.
   C256/C512 each have only a short bitwise gate, not a multi-day run.
 - **C512 CUDA performance regression**: CUDA ~27% SLOWER than Fortran at
-  C512 (§8a), first reversal in the C32->C512 ladder. **Root-caused at the
-  communication-family level (Prompt 38)**: disproportionate halo-transport
-  cost growth once message size exceeds the small-message regime;
-  `COMM_DSW` = 97.6% of the `DYN_CORE` delta. One mechanism-level ambiguity
-  remains (MPI protocol vs. generic device staging); one discriminator
-  experiment recommended, not yet run (§8a/§11). No fix attempted. Do not
-  assume CUDA competitive above C256 without remeasuring.
+  C512 (§8a), first reversal in the C32->C512 ladder. **Isolated to the
+  MPI transport/protocol layer (Prompt 39)**: `COMM_DSW` = 97.6% of the
+  `DYN_CORE` delta (Prompt 38), and the in-process `PeerHaloTransport`
+  path — which shares all device-side pack/unpack code with
+  `MpiHaloTransport` — scales normally at C512 (3.69x) while the six-rank
+  MPI path collapses (8.32x). One MCA-threshold discriminator recommended
+  before any CUDA-aware-MPI implementation (§8a/§11). No fix attempted.
+  Do not assume CUDA competitive above C256 without remeasuring.
 - `MOIST_CAPPA`/`USE_COND`: **confirmed UNIMPLEMENTED in CUDA** (Prompt 30)
   — triple-gated rejection, by design predating this prompt (milestone
   3A.9). Closing needs the Riemann-solver `peg`/`gm2`/`cp2` terms
@@ -385,10 +396,11 @@ not fixed).
   performance scaling"), also not pushed. Push/merge only on explicit
   request. Prompts 35-38's `docs/agent_handoff/*.md` and this
   `CURRENT_STATE.md` update are uncommitted, awaiting explicit commit
-  request. No source files changed in Prompt 37 or 38 (38 was
+  request. No source files changed in Prompt 37, 38, or 39 (38 was
   diagnostic-only: static derivation + reads of existing logs, no job
-  submitted, no file under `cuda/`/`include/` or the Fortran fixture tree
-  touched).
+  submitted; 39 ran one new GPU job against the existing, unmodified
+  `fv3_gpu_perf_bench` binary — no file under `cuda/`/`include/` or the
+  Fortran fixture tree touched in either).
 - Uncommitted source on `cuda/gpu-bringup` (Prompt 28+29, awaiting explicit
   commit request): `cuda/interface/fv3_gpu_dyncore_bridge.F90`
   (`env_flag_enabled` helper + fusion/Graph env wiring),
@@ -425,21 +437,21 @@ Until 1 or 2 closes, "broader GEOS integration" remains bounded to the
 already-validated production first-run subset (`hord_*=±6`, `grid_type=0`,
 `hydrostatic=false`, `a_imp=1.0`, `use_cond=moist_cappa=0`).
 
-**HS track — Prompt 38 root-caused (at the communication-family level) the
-C512 performance regression** Prompt 37 identified and correctly reported
-unresolved. C512 correctness remains BITWISE (§9a, unaffected). Highest-
-priority open HS-track item, now narrowed to one specific next experiment.
+**HS track — Prompt 39 isolated the C512 performance regression (§8a/§9)
+to the MPI transport/protocol layer specifically**, via the PeerHalo-vs-
+MPI discriminator. C512 correctness remains BITWISE (§9a, unaffected).
+Highest-priority open HS-track item, now narrowed to one specific MCA-
+level next experiment (below), ahead of any CUDA-aware-MPI implementation.
 
 Open HS-track follow-ons (confirm scope before starting):
-1. **Run the recommended discriminator experiment**: existing
-   `fv3_gpu_perf_bench` single-process `PeerHaloTransport` harness at C512
-   grid dimensions, vs. the six-rank `MpiHaloTransport` C512 measurement
-   (9089.05 ms/call, Prompt 37) — determines whether the remaining
-   ambiguity (MPI protocol/eager-threshold cost vs. generic device
-   pack/unpack/staging cost) is MPI-specific or generic, selecting between
-   the 4 ranked remediation options in `prompt_38_c512_comm_root_cause.md`
-   (MCA tuning / halo batching / CUDA-aware MPI / pack-unpack kernel
-   optimization — none implemented).
+1. **Run the recommended MCA-threshold discriminator**: rerun the
+   existing six-rank `MpiHaloTransport` C512 job (Prompt 37) under an
+   alternative OpenMPI eager/rendezvous-limit MCA setting (raised above
+   C512's ~135.4KB ordinary message size) and compare `COMM_DSW`/
+   `DYN_CORE` timing against the 9089.05 ms/call baseline — pure runtime
+   config, no source change. Confirms or refutes the eager/rendezvous
+   crossover before CUDA-aware MPI (now HIGH CANDIDATE) is implemented.
+   See `prompt_39_c512_peerhalo_discriminator.md`.
 2. **C256/C512 climatology / longer duration** — only short gates have run
    at either (§9a); no multi-day run attempted.
 3. **Further duration at C128** toward the ~200+ day HS-literature
@@ -499,6 +511,14 @@ only when the current task requires that level of detail (per
   CUDA-aware-MPI priority LOW->MODERATE (contingent); 4 ranked
   unimplemented remediation options; 1 recommended discriminator
   experiment (PeerHaloTransport at C512).
+- `prompt_39_c512_peerhalo_discriminator.md` — 1 GPU job (58445168),
+  existing `fv3_gpu_perf_bench` harness, C256+C512 `PeerHaloTransport`
+  runs (`--mode resident`, fusion on, Graph off); PeerHalo growth 3.69x
+  vs. Fortran 5.72x vs. six-rank MpiHaloTransport 8.32x; isolates the
+  C512 regression to the MPI transport/protocol layer; CUDA-aware-MPI
+  priority MODERATE->HIGH CANDIDATE; halo sub-timers NOT AVAILABLE in
+  harness; 1 recommended MCA-threshold-sweep next experiment, not
+  implemented.
 
 ---
 
