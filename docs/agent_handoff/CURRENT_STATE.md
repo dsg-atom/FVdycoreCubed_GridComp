@@ -1,17 +1,21 @@
 # Current Project State
 
-_Last updated 2026-09-18 (Prompt 41: C512 CUDA-aware MPI A/B test,
-branch `experiment/held-suarez-e2e` — BLOCKED at Stage 0. The validated
-Discover OpenMPI 4.1.6/GCC-12.3.0 module is confirmed NOT built with CUDA
-GPU buffer support (`opal_built_with_cuda_support=false`; no `--with-cuda`
-in its configure line) — a compile-time library property, not a runtime
-tunable. 0 source changes, 0 GPU jobs. A CUDA-aware build
-(`nvidia/nvhpc-hpcx-cuda12/24.7`, HPC-X OpenMPI 4.1.7a1,
-`cuda_support=true`) is confirmed already installed on Discover but was
-NOT adopted (toolchain/ABI-compatibility decision, out of this prompt's
-scope). Preferred C512 transport remains HOST-STAGED. See §7/§11 and
-`prompt_41_c512_cuda_aware_mpi_ab.md`. This file holds current truth
-only._
+_Last updated 2026-09-18 (Prompt 42: CUDA-aware MPI environment gate,
+branch `experiment/held-suarez-e2e` — **redirected mid-investigation from
+HPC-X to Intel MPI 2021.13** after discovering the actual C512 six-rank
+production/perf job (Prompts 36-40) runs entirely under Intel MPI 2021.13,
+not the OpenMPI 4.1.6 stack Prompts 39-41 characterized (confirmed from
+the real job log: `esma_mpirun: mpi_type = intel`). User explicitly
+approved the redirect. Result: **CUDA-aware MPI ENVIRONMENT PASS for
+Intel MPI 2021.13** — device-buffer `MPI_Send`/`MPI_Recv` verified
+correct at 4KB/135KB (exact C512 halo size)/256KB on a real A100 (job
+58450084) when `I_MPI_OFFLOAD=1` is set (SIGSEGV without it). This is
+already the same MPI linked into the production `build_cuda_r8_intelmpi`/
+`StandAlone_FV3_Dycore.x` path — no toolchain migration needed. 0
+production source changes, 1 GPU job. See §2/§7/§11 and
+`prompt_42_hpcx_cuda_aware_environment.md` (filename retained from
+original HPC-X scope; content documents the redirect). This file holds
+current truth only._
 
 ## 1. Project Goal
 
@@ -48,6 +52,18 @@ terminology) — unchanged and not repeated here.
     `strings <bin> | grep <new-env-var>` after any rebuild.
   - Its nested `@fvdycore/model/{dyn_core.F90,fv_dynamics.F90}` carry
     uncommitted savepoint instrumentation only (no numerical change).
+  - **MPI implementation used by every C256/C512 job to date (Prompts
+    36-40) is Intel MPI 2021.13** (`comp/intel/2024.2.0` +
+    `mpi/impi/2021.13`, confirmed from job logs' `esma_mpirun: mpi_type =
+    intel`) — NOT the "validated" GCC+OpenMPI 4.1.6 dev stack in
+    `discover_platform.md` (that stack is used for standalone CUDA-only
+    dev/PeerHalo work, e.g. `build_cuda_r8_mpi`). The CUDA build matched
+    to this MPI is `build_cuda_r8_intelmpi`/`build_cuda_r4_intelmpi`
+    (`MPI_CXX_COMPILER=.../impi/2021.13/bin/mpigxx`, `CMAKE_CXX_COMPILER=
+    g++` — GCC host compiler, Intel MPI runtime). Do not assume an
+    OpenMPI-only finding (MCA/BTL tuning, `ompi_info` build flags) applies
+    to the production C512 path without checking which stack that specific
+    job actually loaded.
 - CUDA source: `cuda/dyn_core/` (implementation), `cuda/interface/`
   (Fortran ISO_C_BINDING bridge). Do not modify `geos-gtfv3` (historical
   GEOS PACE/GT4Py/DaCe implementation; reference only).
@@ -223,21 +239,38 @@ Full tables/reconciliation: `prompt_34_c32_perf_reconciliation.md`,
   `ompi_info` query (login node, static build-info, no GPU needed) that
   the validated `mpi/openmpi/4.1.6/gcc-12.3.0` module's OpenMPI build has
   **`opal_built_with_cuda_support=false`** and no `--with-cuda` in its
-  configure line — CUDA-aware/device-pointer MPI is unsupported at the
-  library level, a compile-time property no MCA/runtime setting can
-  change. Classification: **CUDA-AWARE MPI BLOCKED BY MPI BUILD** — Hard
-  Stop triggered before any A/B implementation/test. Confirmed (but did
-  not adopt) that a CUDA-aware build already exists on Discover:
-  `nvidia/nvhpc-hpcx-cuda12/24.7` (HPC-X OpenMPI 4.1.7a1,
-  `cuda_support=true`) — adopting it is a toolchain/ABI decision requiring
-  its own scoped evaluation (host-compiler family, Intel-production-ABI
-  impact per Prompt 30), not a same-prompt drop-in. See
-  `prompt_41_c512_cuda_aware_mpi_ab.md`.
+  configure line. Confirmed (but did not adopt) that a CUDA-aware build
+  already exists on Discover: `nvidia/nvhpc-hpcx-cuda12/24.7` (HPC-X
+  OpenMPI 4.1.7a1, `cuda_support=true`). **Superseded by Prompt 42 below**
+  — this finding is correct for OpenMPI 4.1.6 but that library is not the
+  one used by the actual C512 job.
+- **Prompt 42 correction + redirect (1 GPU job, job 58450084, 0 production
+  source changes)**: discovered (via `CMakeCache.txt`/`ldd`/`g5_modules`/
+  the actual p37 job log) that the real C256/C512 six-rank job runs under
+  **Intel MPI 2021.13**, not OpenMPI — so Prompt 40's MCA eager-limit sweep
+  was inert (`OMPI_MCA_*` vars are not read by Intel MPI; its ±1.4-1.6%
+  deltas were noise, not a real threshold test) and Prompt 41's "CUDA-aware
+  MPI blocked" finding, while true for OpenMPI 4.1.6, was answering the
+  wrong question — Intel MPI was never evaluated. User approved redirecting
+  Prompt 42 to Intel MPI in place of the originally-planned HPC-X
+  evaluation. New standalone 2-rank device-buffer `MPI_Send`/`MPI_Recv`
+  test (`scratch_p42/intelmpi_cuda_aware_test.cu`) run on a real A100
+  (job 58450084, `warpa003`, rc=0): **PASS** at 4KB, 135KB (exact C512
+  ordinary-group halo message size), and 256KB when `I_MPI_OFFLOAD=1` is
+  set (`MPIX_Query_cuda_support()==1`, `libfabric provider: mlx`); **SIGSEGV**
+  without it. Because this is already the same Intel MPI 2021.13 linked
+  into `build_cuda_r8_intelmpi`/the production `StandAlone_FV3_Dycore.x`
+  (§2), no toolchain migration, no new build, no ABI risk.
+  **Classification: CUDA-AWARE MPI ENVIRONMENT PASS (Intel MPI 2021.13).**
+  Prompt 39's PeerHalo-vs-MPI discriminator (root cause = MPI transport/
+  protocol layer, not generic GPU halo work) is unaffected by this
+  correction. See `prompt_42_hpcx_cuda_aware_environment.md`.
 
-Numerical correctness (§5) unaffected by any of Prompts 38-41 — no source
-changed, C512 remains BITWISE PASS. **Preferred C512 transport: HOST-
-STAGED** (unchanged — the only transport usable on the validated
-toolchain).
+Numerical correctness (§5) unaffected by any of Prompts 38-42 — no
+production source changed, C512 remains BITWISE PASS. **Preferred C512
+transport remains HOST-STAGED for now** — a CUDA-aware `MpiHaloTransport`
+variant is environment-confirmed viable (Prompt 42) but not yet
+implemented or A/B-tested (§11, Prompt 43 candidate).
 
 ## 8. Standalone Integration Status
 
@@ -294,12 +327,15 @@ toolchain).
   explicit commit request): `cuda/interface/fv3_gpu_dyncore_bridge.F90`
   (`env_flag_enabled` helper + fusion/Graph env wiring),
   `cuda/interface/fv3_gpu_abi_mod.F90` (`fv3_gpu_set_cuda_graph_mode`).
-- No source files changed by Prompts 37-41 (38/41 diagnostic-only, no GPU
-  job; 39/40 each ran one GPU job against existing unmodified binaries/
-  harnesses; 40 changed only a runtime `OMPI_MCA_btl_vader_eager_limit`
-  env var; 41 was a login-node-only `ompi_info`/`module avail` build-
-  support check). New untracked file from Prompt 41:
-  `docs/agent_handoff/prompt_41_c512_cuda_aware_mpi_ab.md`.
+- No production source files changed by Prompts 37-42 (38/41 diagnostic-
+  only, no GPU job; 39/40 each ran one GPU job against existing unmodified
+  binaries/harnesses; 40 changed only a runtime `OMPI_MCA_btl_vader_eager_
+  limit` env var; 41 was a login-node-only `ompi_info`/`module avail`
+  build-support check; 42 ran one GPU job against a new, tiny, standalone
+  test file, no `cuda/`/`include/` file touched). New untracked from
+  Prompt 42: `docs/agent_handoff/prompt_42_hpcx_cuda_aware_environment.md`,
+  `scratch_p42/` (`intelmpi_cuda_aware_test.cu`, its sbatch script, job
+  output, and a login-node `cuda_query.c` probe).
 - Untracked at repo root (both branches share the worktree): numerous
   scratch shell scripts/logs/probes from prior prompts, reusable tooling
   under `tools/` (savepoint validation — `compare_dcx_backends.py`,
@@ -316,23 +352,29 @@ toolchain).
 
 ## 11. Next Recommended Task
 
-**Active next task: CUDA-aware MPI environment/toolchain viability
-investigation** (successor to Prompt 41, which was blocked before any
-A/B test — §7). Determine whether adopting an already-installed
-CUDA-aware MPI build on Discover (`nvidia/nvhpc-hpcx-cuda12/24.7`,
-confirmed `cuda_support=true`, or another available CUDA-aware build) is
-viable for this project: host-compiler-family compatibility, link
-compatibility with the existing CUDA `dyn_core` build, and whether
-adopting it would jeopardize the Intel-compiler production-ABI
-compatibility established in Prompt 30. Do not rebuild/reconfigure
-OpenMPI. **Only after that investigation confirms a viable, ABI-
-compatible CUDA-aware MPI** should a CUDA-aware `HaloTransport`
-implementation and the originally-planned C512 A/B test (host-staged vs.
-CUDA-aware, same-node/same-allocation paired runs per §6's node-variance
-requirement) be attempted.
+**Active next task: Prompt 43 — implement + A/B a CUDA-aware
+`MpiHaloTransport` variant at C512.** Prompt 42 confirmed the environment
+question is resolved: Intel MPI 2021.13 (the MPI already linked into
+production `build_cuda_r8_intelmpi`/`StandAlone_FV3_Dycore.x`) supports
+correct device-buffer MPI transport under `I_MPI_OFFLOAD=1`, at the exact
+C512 halo message size, with zero toolchain-migration/ABI risk. Remaining
+work is implementation, not environment evaluation:
+1. Add a `cuda_aware`/device-pointer variant behind the existing
+   `HaloTransport` interface (`include/fv3_gpu_halo_transport.hpp`) —
+   `MpiHaloTransport::transfer()` currently stages through pinned host
+   buffers; a CUDA-aware path would pass the existing device buffers
+   directly to `MPI_Isend`/`MPI_Irecv`, gated by `I_MPI_OFFLOAD=1` being
+   set (never assume it's on — verified unsafe without it, §7).
+2. Correctness-validate the new variant against host-staged (bitwise, same
+   methodology as the existing `PeerHaloTransport`-vs-`MpiHaloTransport`
+   validation, §3/§4) before any perf comparison.
+3. Then run the originally-planned C512 A/B (host-staged vs. CUDA-aware,
+   same-node/same-allocation paired runs per §6's node-variance
+   requirement) to determine whether it recovers the C256-favorable trend.
 
-See `prompt_41_c512_cuda_aware_mpi_ab.md` for the build-support evidence
-and exact next-step framing.
+See `prompt_42_hpcx_cuda_aware_environment.md` for the environment-gate
+evidence (filename retained from original HPC-X scope; content covers the
+Intel MPI redirect).
 
 **Mainline (`cuda/gpu-bringup`) tracks — confirm scope with the user before
 starting any:**
@@ -385,8 +427,14 @@ when the current task requires that level of detail.
 - `prompt_38_c512_comm_root_cause.md`,
   `prompt_39_c512_peerhalo_discriminator.md`,
   `prompt_40_c512_mpi_protocol_ab.md`,
-  `prompt_41_c512_cuda_aware_mpi_ab.md` — C512 root-cause chain, ending in
-  Prompt 41's CUDA-aware-MPI-build-support Hard Stop (§7).
+  `prompt_41_c512_cuda_aware_mpi_ab.md` — C512 root-cause chain; Prompt
+  41's OpenMPI CUDA-aware-build Hard Stop, later corrected by Prompt 42
+  (wrong MPI implementation characterized; §7).
+- `prompt_42_hpcx_cuda_aware_environment.md` — redirect from HPC-X to
+  Intel MPI 2021.13 (the actual production MPI); Intel MPI CUDA-aware
+  device-buffer transport confirmed PASS at the C512 halo message size
+  (job 58450084); environment gate closed, implementation (Prompt 43)
+  next (§7/§11).
 
 ---
 
