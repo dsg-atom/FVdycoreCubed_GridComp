@@ -1,14 +1,15 @@
 # Current Project State
 
-_Last updated 2026-09-17 (Prompt 36: C256 Held-Suarez correctness +
-performance scaling, branch `experiment/held-suarez-e2e`. C256 stable on
-the first `bdt=75s` candidate; 24h Fortran/CUDA gate runs bitwise-identical
-(T/U/V/PS, 4 checkpoints, 0 NaN); C256 perf point extends the scaling table
-— CUDA/Fortran ratio continues to WIDEN (0.874 at C256 vs 0.89 at C128). See
-§8a/§9a/§11 and `prompt_36_c256_correctness_performance.md`. Prompt 35
-(100-day climatology, restart-BROKEN finding) remains summarized in §9/§9a
-and detailed in `prompt_35_hs_climatology.md`; this file holds current
-truth only, not chronological narrative._
+_Last updated 2026-09-17 (Prompt 37: C512 Held-Suarez correctness +
+performance scaling, branch `experiment/held-suarez-e2e`. C512 stable on
+the first `bdt=36s` candidate (after a `RUN_DT`/`JOB_SGMT` divisibility fix,
+37s->36s, §12); 6h Fortran/CUDA gate runs BITWISE-identical (T/U/V/PS, 3
+checkpoints, 0 NaN). C512 perf BREAKS the prior widening trend: CUDA is now
+SLOWER than Fortran (CUDA/Fortran 1.270 vs 0.874 at C256) — classified
+REGRESSES. A lightweight FMS-clock attribution (no nsys/ncu) points to
+communication (`COMM_DSW`/`COMM_TOTAL`), not compute kernels, as the
+driver. See §8a/§9a/§11 and `prompt_37_c512_correctness_performance.md`.
+This file holds current truth only, not chronological narrative._
 
 ## 1. Project Goal
 
@@ -118,17 +119,15 @@ GEOS/FV3 Fortran -> ISO_C_BINDING / stable C ABI -> WP-E GPU context
   `grid_lonlat` store order, `cv_air`, `n_con`, corner service, `nf_ke`) were
   found/fixed during Gate C2 closure — same reference.
 - CUDA Graph capture mode: FUNCTIONAL, IMPLEMENTED (Prompt 8, repaired
-  Prompt 13), Fortran-reachable via `RUN_CUDA_FV3_GRAPH` on the standalone
-  path since Prompt 29. Captures `dgrid_dynamics` only (halo exchange NOT
-  captured); freezes `dt` by value (refuses replay if `bdt`/`n_split` change
-  from capture time). Bitwise-identical to non-graph path at every depth
-  tested. Real standalone benefit: 4.80%, LOW, see §8/§9.
-- Launch-fusion optimizations, opt-in, default off, all bitwise-identical to
+  Prompt 13), Fortran-reachable via `RUN_CUDA_FV3_GRAPH` since Prompt 29.
+  Captures `dgrid_dynamics` only (halo NOT captured); freezes `dt` by value
+  (refuses replay if `bdt`/`n_split` change). Bitwise-identical to non-graph
+  path at every depth tested. Real benefit: 4.80%, LOW, see §8/§9.
+- Launch-fusion optimizations, opt-in/default-off, bitwise-identical to
   default: `--fuse-corner-fill`/`RUN_CUDA_FV3_FUSE_CORNER_FILL` (Prompt 9,
-  reachable from standalone path Prompt 28), `--fuse-halo-edges`/
-  `RUN_CUDA_FV3_FUSE_HALO_EDGES` (Prompt 11, reachable Prompt 28).
-  `a2b4_global_corner_kernel` was restructured for parallelism (Prompt 12);
-  also bitwise-identical, always-on (not a flag).
+  reachable Prompt 28), `--fuse-halo-edges`/`RUN_CUDA_FV3_FUSE_HALO_EDGES`
+  (Prompt 11, reachable Prompt 28). `a2b4_global_corner_kernel` restructured
+  for parallelism (Prompt 12); also bitwise-identical, always-on.
 - Idealized Held-Suarez dry-core forcing: IMPLEMENTED, COMPILED, GPU
   EXECUTED, NUMERICALLY VALIDATED at C8/C32/C64/C128 and up to 10-day
   duration — see §9a.
@@ -159,19 +158,15 @@ SMALL NUMERICAL DIFFERENCE (R8 ≤1e-8, R4 ≤1e-2) / SIGNIFICANT (above those).
 R4 thresholds derived from the measured R4/R8 max_rel ratio (≈4-6e8,
 matching the float32/float64 epsilon ratio), not assumed.
 
-Notes carried forward (not re-derivable from the table):
-- `omga`'s R4 bulk-metric growth (Stage A, 72 calls) is driven by the
-  field's own magnitude shrinking, not the absolute discrepancy growing —
-  that plateaus after call ≈43.
-- `pe`'s single Fortran halo ring is reproduced host-side via
-  `fv3_gpu_interface_pe_halo` (bit-for-bit from the resident `delp` ring) —
-  a real downstream consumer (`Lagrangian_to_Eulerian`) needed it.
-- Zero NaN/Inf across all PASS rows; `delp` stays positive at every
-  checkpoint in every PASS row.
-- c16/c32 rows (Prompt 23): resolution-scaled `bdt` (1800s/1200s) came from
-  pre-existing clean Fortran-only baselines, not a new search;
-  `n_split=3`/`k_split=1` held fixed at every resolution.
-- Numerical algorithm changed: **NO**, for every fix/flag behind every row.
+Notes carried forward (not re-derivable from the table): `omga`'s R4
+bulk-metric growth (Stage A, 72 calls) is driven by the field's own
+magnitude shrinking, not the absolute discrepancy growing (plateaus after
+call ≈43); `pe`'s single Fortran halo ring is reproduced host-side via
+`fv3_gpu_interface_pe_halo` (bit-for-bit from the resident `delp` ring) for
+`Lagrangian_to_Eulerian`; zero NaN/Inf and `delp` stays positive across all
+PASS rows; c16/c32 `bdt` (1800s/1200s) came from pre-existing clean
+Fortran-only baselines, not a new search, `n_split=3`/`k_split=1` fixed at
+every resolution; numerical algorithm changed **NO** for every row.
 
 Full field-by-field tables: `prompt_6b_cuda_fortran_validation.md` (Gate
 C2), `prompt_19_longer_standalone_validation.md` (R8 depth),
@@ -183,10 +178,9 @@ C2), `prompt_19_longer_standalone_validation.md` (R8 depth),
 ## 6. MPI / Communication Status
 
 - Cross-process six-rank halo transport (`MpiHaloTransport`): IMPLEMENTED,
-  COMPILED, GPU EXECUTED across six MPI processes. Validated
-  bitwise-identical to in-process `PeerHaloTransport` (78/78 fields at 1/5
-  calls) plus a dedicated six-rank provenance test (16,692 checks/0
-  failures).
+  COMPILED, GPU EXECUTED. Validated bitwise-identical to in-process
+  `PeerHaloTransport` (78/78 fields, 1/5 calls) plus a six-rank provenance
+  test (16,692 checks/0 failures).
 - Rank<->tile mapping is identity (rank r <-> tile r+1), verified at runtime.
 - **MPI transport determinism: RESOLVED** (Prompt 18) — root cause was a
   CUDA stream-ordering defect in the *test harness*, not the transport;
@@ -194,6 +188,7 @@ C2), `prompt_19_longer_standalone_validation.md` (R8 depth),
   attach-time). Deterministic at 24/24 OpenMPI + 5/5 Intel MPI runs.
   **Standing constraint**: any buffer setup a non-blocking stream will read
   must be enqueued on that stream, not the legacy stream.
+
 - **FMS/CUDA halo ownership ambiguity: RESOLVED** (Prompt 14/15) — CUDA
   branch skips `i_pack(1)`/`i_pack(8)` (duplicates of CUDA's own
   pre-consumer exchanges), keeps `i_pack(10)` (tracer). Default Fortran
@@ -215,9 +210,8 @@ C2), `prompt_19_longer_standalone_validation.md` (R8 depth),
 - ABI/compiler-family compatibility with a full **Intel-compiler production
   GEOS build** verified sound by construction (Prompt 30: fixed-width
   `iso_c_binding` types, runtime `abi_version`/`struct_bytes` guards,
-  explicit `MPI_Comm_f2c`) — this fixture links GCC-built CUDA archives into
-  an Intel-Fortran executable. Revisit before final production linkage if
-  the toolchain changes.
+  explicit `MPI_Comm_f2c`) — links GCC-built CUDA archives into an
+  Intel-Fortran executable. Revisit if the toolchain changes.
 
 ## 8. Performance Status (Production dyn_core, C32 baseline methodology)
 
@@ -245,18 +239,16 @@ fusion mode, CUDA overtakes Fortran** — the gap direction reverses with
 resolution.
 
 Root-cause chain (full detail in the cited files, not repeated here):
-- **MPS is the dominant lever** (Prompt 26): bottleneck was 6 CUDA contexts
-  time-slicing one A100, not MPI/kernel-compute/H2D-D2H.
-- **Post-MPS profile is MIXED/diffuse** (Prompt 27): largest bucket is
-  `cudaLaunchKernel` (~51% of traced `DYN_CORE`), no single kernel >5.6%.
-- **Launch fusion cut launches 2955->2637/call (−10.76%)**, but
-  `cudaEventSynchronize` stayed flat (~28-30%) — sync is GPU-producer-wait
-  under MPS context-sharing, not host slack; doesn't respond to launch cuts.
-- **CUDA Graph (Prompt 29) cut launches further** (2637->1805/call,
-  −31.6%), but whole-call improvement was only 4.80% (<5% floor -> **LOW**)
-  because `cudaEventSynchronize` rose (9.98->12.27 ms/call) instead. BITWISE
-  numerical guard; replay-stable over 310 calls/930 substeps, 0 errors; real
-  and safe but **not the recommended default** per the <5% threshold.
+MPS is the dominant lever (Prompt 26: bottleneck was 6 CUDA contexts
+time-slicing one A100, not MPI/kernel-compute/H2D-D2H); post-MPS profile is
+MIXED/diffuse (Prompt 27: largest bucket `cudaLaunchKernel` ~51% of traced
+`DYN_CORE`, no single kernel >5.6%); launch fusion cut launches 2955->2637/
+call (−10.76%) but `cudaEventSynchronize` stayed flat (sync is
+GPU-producer-wait under MPS, not host slack); CUDA Graph (Prompt 29) cut
+launches further (2637->1805/call, −31.6%) but whole-call gain was only
+4.80% (<5% floor -> LOW) because `cudaEventSynchronize` rose instead —
+BITWISE, replay-stable over 310 calls/930 substeps, real and safe but not
+the recommended default.
 
 CUDA-aware MPI, kernel-tuning, and rank/GPU redesign all remain LOW/NOT
 JUSTIFIED (halo traffic 312 msgs/call all ≤64KB; device transfer ~2% of
@@ -284,25 +276,34 @@ Prompt 33.
 | C32 | 20.72 | 19.88 | 1.04 | **0.96 — CUDA faster** |
 | C64 | 59.4 | 56.9 | 1.04 | **0.96 — CUDA faster** |
 | C128 | 237.4 | 210.9 | 1.13 | **0.89 — CUDA faster** |
-| C256 | 1250.75 | 1092.44 | 1.145 | **0.874 — CUDA faster** |
+| C256 | 1250.75 | 1092.44 | 1.145 | **0.874 — CUDA faster (best)** |
+| C512 | 7155.63 | 9089.05 | 0.787 | **1.270 — CUDA SLOWER (REGRESSES)** |
 
-C32 reps: Fortran total_s 0.6237/0.6210/0.6216 (median 0.6216 -> 20.72
-ms/call); CUDA total_s 0.6215/0.5945/0.5963 (median 0.5963 -> 19.88 ms/call).
-C256 reps (Prompt 36, jobs 58437887 Fortran / 58438138 CUDA, `RUN_DT=75`,
-`JOB_SGMT='00000000 003730'` = 30 calls/rep): Fortran median 37.5224s
-(reps 37.5260/37.5224/37.4780) -> 1250.75 ms/call; CUDA median 32.7732s
-(reps 32.7963/32.6019/32.7732) -> 1092.44 ms/call. All 12 C32+C256 reps:
-rc=0, 0 NaN/Inf/Range_Warn/error hits.
+C32/C256 rep-level totals: see `prompt_34_c32_perf_reconciliation.md` /
+`prompt_36_c256_correctness_performance.md`. C512 reps (Prompt 37, jobs
+58444510 Fortran / 58444655 CUDA, `RUN_DT=36` post divisibility-fix,
+`JOB_SGMT='00000000 001800'` = 30 calls/rep): Fortran total_s
+214.2111/214.9613/214.6688 (median 214.6688 -> 7155.63 ms/call); CUDA
+total_s 272.6715/275.1728/266.4293 (median 272.6715 -> 9089.05 ms/call).
+All 6 reps: rc=0, 0 NaN/Inf/Range_Warn/error hits, cycle-count=30 confirmed
+each rep.
 
-Finding: **CUDA already overtakes Fortran at C32** under this exact
-methodology (superseding Prompt 33's mismatched-baseline reading). The
-CUDA/Fortran ratio is flat C32->C64 (~0.96), improves at C128 (0.89), and
-**improves further at C256 (0.874, Prompt 36)** — CUDA's margin widens
-monotonically across all four measured points. Best GPU competitiveness:
-**C256 (0.874x)**. Rep-to-rep agreement <2% at every config. Numerical
-source unchanged for every row — timing-only. Detail:
-`prompt_34_c32_perf_reconciliation.md`,
-`prompt_36_c256_correctness_performance.md`.
+Finding: the CUDA/Fortran ratio widened favorably and monotonically from
+C32 (0.96) through C256 (0.874, best measured GPU competitiveness), then
+**reverses sharply at C512 to 1.270 — CUDA ~27% SLOWER**, the first such
+reversal in the ladder. A lightweight FMS-clock block-timer attribution
+(existing `fv_timing_mod` data only, no nsys/ncu, per Prompt 37's task
+exception) shows every `COMM_*` block 3-5x larger under CUDA (`COMM_DSW`
++57.04s of the ~58s `DYN_CORE` delta is the single largest contributor;
+`COMM_TOTAL` +94.27s), while compute-bound blocks (`RIEM_SOLVER`,
+`UPDATE_DZ_C`) are unchanged — pointing to communication/halo overhead,
+not kernel compute, as the driver. Consistent with §8's earlier finding
+that CUDA-aware MPI was LOW priority at C32 because halo messages stayed
+<=64KB; at C512 the halo ring is ~16x larger per edge and likely crosses
+the point where host-staged MPI pack/copy overhead stops amortizing. Not
+root-caused further — attribution only, no optimization attempted.
+Numerical source unchanged; correctness (§9a) is unaffected and remains
+BITWISE. Detail: `prompt_37_c512_correctness_performance.md`.
 
 ## 9. Known Limitations / Unvalidated Envelope
 
@@ -310,28 +311,26 @@ source unchanged for every row — timing-only. Detail:
   ladders) and c16/c32 (6-call depth only, resolution-scaled `bdt`, Prompt
   23). Do not infer behavior beyond the depths in §5 for any grid/precision
   combination. **HS validation (§9a) separately covers c8/c32/c64/c128 up
-  to 10-day duration, plus a C256 24h gate (Prompt 36)** — do not conflate
-  the two ladders. C256 has only a 24h bitwise gate, not a multi-day run.
-- `MOIST_CAPPA`/`USE_COND`: **confirmed UNIMPLEMENTED in CUDA, not merely
-  unvalidated** (Prompt 30) — triple-gated rejection (top-level runtime
-  fence `fv3_gpu_runtime.cpp:1101-1102`, WP-B kernel-launch fence
-  `wp_b_dsw_cuda.cu:889`, Fortran-bridge forced-zero
-  `fv3_gpu_dyncore_bridge.F90:595-596`), by explicit design predating this
-  prompt (flagged at milestone 3A.9). Nonzero `q_con` cannot be isolated
-  because the authoritative Fortran fixture compiles `MOIST_CAPPA`/
-  `USE_COND` unconditionally (`@fvdycore/CMakeLists.txt:130`) — closing this
-  requires implementing the Riemann-solver `peg`/`gm2`/`cp2` terms
-  (`nh_utils.F90:372-390`) in CUDA, a dedicated future WP-C/WP-B
-  numerical-implementation prompt. See `prompt_30_production_config_closure.md`.
+  to 10-day duration, plus C256 (24h gate) and C512 (6h gate) (Prompts
+  36/37)** — do not conflate the two ladders. C256/C512 each have only a
+  short bitwise gate, not a multi-day run.
+- **C512 CUDA performance regression (Prompt 37, confirmed, not yet
+  root-caused)**: CUDA is ~27% SLOWER than Fortran at C512 (§8a), the first
+  such reversal in the C32->C512 ladder. Lightweight attribution points to
+  communication (`COMM_DSW`/`COMM_TOTAL`), not compute; no fix attempted.
+  Do not assume CUDA remains competitive above C256 without remeasuring.
+- `MOIST_CAPPA`/`USE_COND`: **confirmed UNIMPLEMENTED in CUDA** (Prompt 30)
+  — triple-gated rejection (`fv3_gpu_runtime.cpp`, `wp_b_dsw_cuda.cu`,
+  `fv3_gpu_dyncore_bridge.F90`), by design predating this prompt (milestone
+  3A.9). Closing this needs the Riemann-solver `peg`/`gm2`/`cp2` terms
+  (`nh_utils.F90`) implemented in CUDA, a dedicated future WP-C/WP-B prompt.
+  See `prompt_30_production_config_closure.md`.
 - `a_imp <= 0.999` (RIM_2D/SIM3p0 vertical branches): **confirmed
-  UNIMPLEMENTED in CUDA** (Prompt 30), triple-gated (runtime fence
-  `fv3_gpu_runtime.cpp:1082-1083`, Riemann-solver launcher fence
-  `fv3_riem_solver_c.cu:247-251`, Fortran-bridge `mpp_error(FATAL)` guard
-  `fv3_gpu_dyncore_bridge.F90:622-627`). Only SIM1 (`a_imp=1.0`, the
-  required first-run value) is implemented; a second, independent
-  implementation prompt would close this. The four downstream
-  `a_imp <= 0.999`-only knobs (`scale_m`, `m_split`, `delt_max`, `scale_z`)
-  remain proven inert at `a_imp = 1.0`.
+  UNIMPLEMENTED in CUDA** (Prompt 30), triple-gated (`fv3_gpu_runtime.cpp`,
+  `fv3_riem_solver_c.cu`, `fv3_gpu_dyncore_bridge.F90`). Only SIM1
+  (`a_imp=1.0`) is implemented; a second, independent prompt would close
+  this. The four downstream-only knobs (`scale_m`, `m_split`, `delt_max`,
+  `scale_z`) remain proven inert at `a_imp = 1.0`.
 - `ncu` profiling is platform-blocked (`ERR_NVGPUCTRPERM`); `nsys`
   unaffected.
 - `fv3_dispatch_smoke` Phase C fails if its own `cfg.nf_ke` pin is raised
@@ -365,10 +364,12 @@ source unchanged for every row — timing-only. Detail:
 - **C128 timestep search (Prompt 33)**: first `bdt` candidate was
   CFL-unstable (NaN flood, caught via size-gated health check before a
   full `grep`); resolved with a smaller `bdt`. Do not assume the C32
-  resolution-scaled `bdt` heuristic (§5) extends linearly to C128 without a
-  short stability check first.
-- **Stage E (§8a) caveat**: 30-call/3-rep, warmup-included — not directly
-  comparable to §8's warmup-excluded 100-call/rep C32 figure.
+  resolution-scaled `bdt` heuristic (§5) extends linearly to higher
+  resolutions without a short stability check first (C128/C256/C512 each
+  needed their own search, though C256/C512 stabilized on their first
+  candidate — do not assume that pattern holds at C1024+ either).
+- **§8a caveat**: 30-call/3-rep, warmup-included — not directly comparable
+  to §8's warmup-excluded 100-call/rep C32 figure.
 
 ## 9a. Held-Suarez Validation Ladder (branch `experiment/held-suarez-e2e`)
 
@@ -386,6 +387,7 @@ mainline (§3/§4). All entries: Fortran vs CUDA, same standalone fixture,
 | C128 | 30-day (jobs 58421485 Fortran / 58421486 CUDA) | **PASS** | both rc=0, 1h49m/1h42m elapsed, 240 nc4 files each; bitwise T@500hPa/U@250hPa/PS at day 1/5/10/20/30; day 30 classified as active spin-up (KE-proxy still rising, pronounced NH/SH jet asymmetry); Prompt 35 |
 | C128 | 100-day (jobs 58424578 Fortran / 58424579 CUDA, after 3 job-config fixes — see §12) | **PASS** | both rc=0, `ALL DONE`, 6h00m/5h38m elapsed, 800 nc4 files each, log sizes byte-identical (14,275,392 B), 0 NaN/error, `range_warn=33543` identical both backends; bitwise T@500hPa/U@250hPa/PS at day 1/5/10/20/30/50/75/100; jet NH/SH symmetrized (59.06/-59.06 vs day-30's 53.44/-75.94) and KE-proxy/global-mean-T trends flattened ~5-10x vs day 30, but not yet fully equilibrated (HS literature: ~200+ days from cold start); Prompt 35 |
 | C256 | dt-search (1 candidate) + 24h gate (jobs 58436126/58436426/58437185) | **PASS** | `bdt=75s` stable on 1st candidate (unlike C64->C128's 4x reduction); both 24h/1152-step gates rc=0, byte-identical logs (259,813 B), 0 NaN/Range_Warn/Error, 8/8 nc4 each; T@500/U@250/V@250/PS at 4 checkpoints **BITWISE** (0.0 diff, 0/33024 NaN); Prompt 36 |
+| C512 | dt-search (1 candidate) + 6h gate (jobs 58440164 Fortran / 58443160 CUDA) | **PASS** | `bdt=37s` first candidate stable but silently dropped its final checkpoint (`RUN_DT`=37 doesn't divide the 6h/2h windows evenly, §12) — fixed to `bdt=36s` (fix #1/3, config/divisibility only); both 6h/600-step gates rc=0, byte-identical logs (147,573 B), 0 NaN/Range_Warn/Error, 6/6 nc4 each; T@500/U@250/V@250/PS at 3 checkpoints (2h/4h/6h) **BITWISE** (0.0 diff, 0/131584 NaN); Prompt 37 |
 
 Benign known artifacts (do not treat as new divergences):
 - 2-cell halo-padding uninitialized-memory difference in `delpc`/`pkc` at
@@ -403,10 +405,12 @@ Benign known artifacts (do not treat as new divergences):
   backends at every resolution tested (C8/C32/C128) — pre-existing pattern,
   not new.
 
-Not attempted (out of Prompt 35/36 scope): duration beyond 100 days at
-C128, C256 duration beyond the 24h gate (no C256 climatology run), resolution
-beyond C256, moist-physics coupling, warm-restart-continuation runs (see §9,
-confirmed broken), formal (multi-decade) climatology statistics.
+Not attempted (out of Prompt 35/36/37 scope): duration beyond 100 days at
+C128, C256/C512 duration beyond their short gates (no climatology run at
+either), resolution beyond C512, moist-physics coupling,
+warm-restart-continuation runs (see §9, confirmed broken), formal
+(multi-decade) climatology statistics, and root-causing/fixing the C512
+CUDA communication-overhead regression (§8a — attribution only).
 
 ## 10. Current Git / Working-Tree State
 
@@ -415,28 +419,24 @@ confirmed broken), formal (multi-decade) climatology statistics.
   of `origin/cuda/gpu-bringup`, not pushed. HS track branch
   `experiment/held-suarez-e2e` HEAD `a76b429` ("Document Held-Suarez
   performance scaling"), also not pushed. Push/merge only on explicit
-  request. Prompt 35's and Prompt 36's `docs/agent_handoff/*.md` and this
+  request. Prompt 35/36/37's `docs/agent_handoff/*.md` and this
   `CURRENT_STATE.md` update are uncommitted on this branch, awaiting
-  explicit commit request.
+  explicit commit request. No source files changed in Prompt 37 (the
+  `RUN_DT` fix was job-script config, in the separate Fortran fixture
+  tree, not this repo).
 - Uncommitted source on `cuda/gpu-bringup` (Prompt 28+29, awaiting explicit
   commit request): `cuda/interface/fv3_gpu_dyncore_bridge.F90`
   (`env_flag_enabled` helper + fusion/Graph env wiring),
   `cuda/interface/fv3_gpu_abi_mod.F90` (`fv3_gpu_set_cuda_graph_mode`).
 - Untracked at repo root (both branches share the worktree): numerous
-  scratch shell scripts/logs/probes from prior prompts (`task*_6c_cuda.sh`,
-  `sp*rerun*.sh`, `p1[7-8]_*.sbatch`, `cln*.txt`, `cmp_nord*.txt`,
-  `det_diff_*.txt`, `pre*.txt`, `scratch_*/`, build helpers), reusable
-  tooling under `tools/` (savepoint validation — `compare_dcx_backends.py`,
+  scratch shell scripts/logs/probes from prior prompts, reusable tooling
+  under `tools/` (savepoint validation — `compare_dcx_backends.py`,
   `tools/savepoints/savepoint_reader.py`; `tools/analysis/
   hs_netcdf_inspect.py`, Prompt 32), and `perf_rerun_logs/`. Untracked
-  handoff docs for every prompt from 22 through 33 (see §12). In the
+  handoff docs for every prompt from 22 through 37 (see §12). In the
   separate Fortran fixture tree `<fortran_perf>/experiments/`: per-prompt
-  sbatch scripts/`.out` logs/nsys artifacts (Prompts 24-33), job directories
-  including the Prompt 33 additions (`p33_c64_gate_*`, `p33_c128_gate_*`,
-  `p33_c128_hs10d_*`, `p33_c64_perf_*`, `p33_c128_perf_*` — the latter four
-  with `perf_logs/rep{1,2,3}.log`), the Prompt 36 additions (`p36_c256_
-  dt1_fortran*`, `p36_c256_gate_{fortran,cuda}*`, `p36_c256_perf_{fortran,
-  cuda}*` — the perf pair with `perf_logs/rep{1,2,3}.log`), and
+  sbatch scripts/`.out` logs/job directories for every prompt 24-37 (each
+  perf job pair keeps `perf_logs/rep{1,2,3}.log`), and
   `fv3_mps_lifecycle.sh`.
 - Do not commit: build directories (`build_cuda_r8*/`), profiler artifacts
   (`*.nsys-rep`, `*.sqlite`), `scratch_*/`, any `*.out` Slurm log, NetCDF
@@ -460,29 +460,33 @@ Until 1 or 2 closes, "broader GEOS integration" remains bounded to the
 already-validated production first-run subset (`hord_*=±6`, `grid_type=0`,
 `hydrostatic=false`, `a_imp=1.0`, `use_cond=moist_cappa=0`).
 
-**HS track (`experiment/held-suarez-e2e`) — Prompt 36 closed C256
-correctness+performance**, the higher-resolution follow-on Prompt 35
-flagged as open: C256 stable on the first `bdt=75s` candidate, 24h
-Fortran/CUDA gate BITWISE-identical (T/U/V/PS, §9a), and the scaling table
-extended with a fourth point showing CUDA's advantage continues to widen
-(0.874 at C256, best measured GPU competitiveness). Prompt 35's 100-day
-C128 climatology and confirmed-BROKEN restart-continuation (§9) remain the
-prerequisite context for duration-track work — see §12.
+**HS track (`experiment/held-suarez-e2e`) — Prompt 37 closed C512
+correctness+performance**, the higher-resolution follow-on Prompt 36
+flagged as open: C512 stable on the first `bdt=37s` candidate (corrected to
+36s for a divisibility artifact, §12), 6h Fortran/CUDA gate
+BITWISE-identical (T/U/V/PS, §9a). Unlike C256, the perf point **breaks**
+the prior widening trend — CUDA is 1.270x SLOWER than Fortran at C512
+(§8a), attributed (lightweight check only) to communication overhead, not
+compute. This is now the highest-priority open HS-track item.
 
 Open HS-track follow-ons (confirm scope before starting):
-1. **C256 climatology / longer duration** — only a 24h gate has been run at
-   C256 (§9a); a multi-day/100-day C256 run analogous to Prompt 35's C128
-   ladder has not been attempted.
-2. **Further duration at C128** toward the ~200+ day HS-literature
-   equilibration estimate — day 100 is markedly closer to equilibrium than
-   day 30 but not yet flat (§9a); not started.
-3. **Warm-restart fix** — dedicated future prompt to close the confirmed
-   nonhydrostatic warm-restart gap (§9), which would let duration extension
-   proceed via restart-chaining instead of ever-longer cold-start jobs.
-4. **Higher resolution than C256** (C512+) — unmeasured; would need its own
-   stability/timestep search per the C64->C128 lesson in §9 (note: C128->
-   C256 needed only 1 of 3 allowed candidates, so do not assume C256->C512
-   will also need a search — check first).
+1. **Root-cause/fix the C512 CUDA communication regression** — Prompt 37
+   only performed lightweight attribution (`COMM_DSW`/`COMM_TOTAL` 3-5x
+   larger under CUDA, §8a); no root cause below "communication, not
+   compute" and no fix attempted. Natural next step given CUDA-aware MPI
+   was previously LOW priority only because halo messages stayed small.
+2. **C256/C512 climatology / longer duration** — only short gates have run
+   at either (§9a); multi-day runs analogous to Prompt 35's C128 ladder
+   have not been attempted at either resolution.
+3. **Further duration at C128** toward the ~200+ day HS-literature
+   equilibration estimate — day 100 is closer to equilibrium than day 30
+   but not yet flat (§9a); not started.
+4. **Warm-restart fix** — dedicated future prompt to close the confirmed
+   nonhydrostatic warm-restart gap (§9), enabling restart-chaining instead
+   of ever-longer cold-start jobs.
+5. **Higher resolution than C512** (C1024+) — unmeasured; needs its own
+   stability/timestep search (§9); the C512 regression means CUDA
+   competitiveness cannot be assumed either way without remeasuring.
 
 ## 12. Detailed Handoff References
 
@@ -493,55 +497,42 @@ only when the current task requires that level of detail (per
 
 - `prompt_6a_fortran_savepoints.md`/`prompt_6b_cuda_fortran_validation.md`
   — authoritative Fortran savepoints, Gate C2 closure.
-- `prompt_7_post_gate_c2_performance_baseline.md` — post-Gate-C2 baseline/
-  nsys profiling. `prompt_8_cuda_graphs_prototype.md` — historical,
-  retracted by Prompt 13.
-- `prompt_9_kernel_fusion_validation.md`/`prompt_10_copy_corners_batching.md`/
-  `prompt_11_next_launch_target.md`/`prompt_12_a2b4_kernel_tuning.md` —
-  launch-fusion/kernel-tuning sequence. `prompt_13_architectural_
-  optimization.md` — CUDA Graph capture repair; GPU-execution-bound finding.
-- `prompt_14_standalone_cuda_integration.md` — call-boundary interface
-  table, FMS/CUDA halo resolution. `prompt_15_mpi_halo_transport.md` —
-  `HaloTransport`/`MpiHaloTransport`. `prompt_18_mpi_transport_
-  determinism.md` — intermittent MPI test-failure root cause/fix.
-- `prompt_19_longer_standalone_validation.md` — R8 c8 72/12-call ladder.
-  `prompt_20_r4_numerical_validation.md`/`prompt_21_longer_r4_validation.md`
-  — R4 c8 validation.
-- `prompt_22_wider_grid_validation.md` — c16 CFL blocker (resolved P23).
-  `prompt_23_resolution_timestep_validation.md` — resolution-scaled `bdt`,
-  c16/c32 R8/R4 validation.
-- `prompt_24_standalone_performance_validation.md` — real-path timing,
-  nsys bottleneck classification. `prompt_25a_fv3_halo_characterization.md`
-  — halo census, LOW CUDA-aware-MPI ceiling.
-- `prompt_26_rank_gpu_architecture.md` — rank/GPU/context map, MPS 3.92x.
-  `prompt_27_mps_operational_profile.md` — MPS lifecycle helper, post-MPS
-  profile.
-- `prompt_28_standalone_launch_reduction.md` — fusion flags, MODERATE
-  (6.13%). `prompt_29_standalone_cuda_graph.md` — Graph, LOW (4.80%).
-- `prompt_30_production_config_closure.md` — `MOIST_CAPPA`/`USE_COND`/
-  `a_imp<=0.999` unimplemented by design; Intel ABI verification PASS.
-- `milestone_3a*.md`, `wp-*.md` — work-package implementation history,
-  pre-Gate-C2.
-- `prompt_31_held_suarez_e2e.md` — HS forcing integration smoke test
-  (C8, two-tree build architecture, `pt`-units resolution).
-- `prompt_32_held_suarez_scientific_validation.md` — HS scientific
-  validation (C32, NetCDF mechanism, savepoint comparison,
-  `hs_netcdf_inspect.py`).
+- `prompt_7_post_gate_c2_performance_baseline.md` — post-Gate-C2 nsys
+  baseline. `prompt_8_cuda_graphs_prototype.md` — historical, retracted by
+  Prompt 13. `prompt_9`-`prompt_12` — launch-fusion/kernel-tuning sequence.
+  `prompt_13_architectural_optimization.md` — CUDA Graph capture repair.
+- `prompt_14_standalone_cuda_integration.md` — FMS/CUDA halo resolution.
+  `prompt_15_mpi_halo_transport.md` — `HaloTransport`/`MpiHaloTransport`.
+  `prompt_18_mpi_transport_determinism.md` — MPI test-flake root cause/fix.
+- `prompt_19`-`prompt_21` — R8/R4 c8 depth validation (72/12-call ladders).
+  `prompt_22`/`prompt_23` — c16/c32 CFL blocker + resolution-scaled `bdt`
+  resolution-timestep validation.
+- `prompt_24_standalone_performance_validation.md` — real-path nsys
+  bottleneck classification. `prompt_25a_fv3_halo_characterization.md` —
+  halo census, LOW CUDA-aware-MPI ceiling.
+- `prompt_26_rank_gpu_architecture.md` — MPS 3.92x. `prompt_27_mps_
+  operational_profile.md` — MPS lifecycle helper, post-MPS profile.
+- `prompt_28` — fusion flags, MODERATE (6.13%). `prompt_29` — CUDA Graph,
+  LOW (4.80%). `prompt_30_production_config_closure.md` —
+  `MOIST_CAPPA`/`USE_COND`/`a_imp<=0.999` unimplemented by design; Intel
+  ABI verification PASS. `milestone_3a*.md`/`wp-*.md` — pre-Gate-C2
+  work-package history.
+- `prompt_31_held_suarez_e2e.md` — HS forcing smoke test (C8). `prompt_32_
+  held_suarez_scientific_validation.md` — C32 NetCDF/savepoint validation,
+  `hs_netcdf_inspect.py`.
 - `prompt_33_hs_multiday_highres_performance.md` — HS ladder to C64/C128,
-  10-day duration; C32->C64->C128 scaling table (§8a/§9a).
-- `prompt_34_c32_perf_reconciliation.md` — C32 perf re-measured under the
-  C64/C128 methodology, reconciling §8a.
+  10-day duration, C32-C128 scaling table. `prompt_34_c32_perf_
+  reconciliation.md` — C32 perf re-measured under Prompt 33's methodology.
 - `prompt_35_hs_climatology.md` — warm-restart confirmed broken
-  (Opus-escalated root cause); 30-day and 100-day matched Fortran/CUDA
-  C128 climatology runs, bitwise agreement to 100 days; three
-  job-configuration bugs found/fixed (`EXPDIR` staleness, `JOB_SGMT`
-  digit-packing cap, `DUR_DD` hard-fail); spin-up/equilibration
-  diagnostics (`eke-proxy`, `jet-metrics` additions to
-  `hs_netcdf_inspect.py`).
-- `prompt_36_c256_correctness_performance.md` — C256 timestep-stability
-  search (1 candidate), 24h Fortran/CUDA gate (BITWISE T/U/V/PS), and the
-  C256 perf point extending the C32/C64/C128 scaling table to a fourth
-  resolution (CUDA/Fortran ratio 0.874, widening trend confirmed).
+  (Opus-escalated); 30/100-day matched C128 climatology runs, bitwise to
+  100 days; 3 job-config bugs fixed; `eke-proxy`/`jet-metrics` diagnostics.
+- `prompt_36_c256_correctness_performance.md` — C256 dt-search (1
+  candidate), 24h BITWISE gate, perf point (0.874, widening trend).
+- `prompt_37_c512_correctness_performance.md` — C512 dt-search (1
+  candidate, `bdt=37s`); `RUN_DT`/`JOB_SGMT` divisibility defect dropping
+  the gate's final checkpoint, fixed to `bdt=36s` (fix #1/3); 6h BITWISE
+  gate; perf point reversing the trend (1.270, REGRESSES), lightweight
+  COMM_*-block attribution.
 
 ---
 
