@@ -278,6 +278,12 @@ static bool g_fuse_corner_fill = false;
 static bool g_mpi_halo = false;
 static int g_mpi_rank = 0;   // valid only when g_mpi_halo
 static int g_mpi_tile = 1;   // == g_mpi_rank + 1
+// Prompt 43: which MPI halo transport --mpi-halo attaches. Default unchanged
+// (host-staged); --mpi-halo-transport=cuda_aware opts into the device-pointer
+// path for the same-node A/B this flag exists to support. No silent fallback --
+// fv3_gpu_attach_mpi_halo_transport fails clearly if cuda_aware is requested and
+// the MPI runtime lacks CUDA-buffer support.
+static int32_t g_mpi_transport_kind = FV3_GPU_HALO_TRANSPORT_MPI_HOST_STAGED;
 
 // Prompt 11: fuse pack_edge_kernel/unpack_edge_kernel's per-edge loop (4
 // launches/field) into one launch/field covering all four TileEdge values --
@@ -2936,18 +2942,18 @@ bool setup(Member &m, int tile, HaloPeerGroup &pg, bool perturb_this_tile) {
     // The communicator crosses the C ABI as its Fortran INTEGER handle; see
     // fv3_gpu_communication.h for why MPI_Comm itself cannot.
     const int rc_mpi = fv3_gpu_attach_mpi_halo_transport(
-        m.ctx, MPI_Comm_c2f(MPI_COMM_WORLD), tile, &err);
+        m.ctx, MPI_Comm_c2f(MPI_COMM_WORLD), tile, g_mpi_transport_kind, &err);
     if (rc_mpi != FV3_GPU_SUCCESS) {
       printf("  FAIL: tile %d fv3_gpu_attach_mpi_halo_transport returned %d: %s\n",
              tile, rc_mpi, err.message);
       return false;
     }
-    if (fv3_gpu_halo_transport_kind_of(m.ctx) !=
-        FV3_GPU_HALO_TRANSPORT_MPI_HOST_STAGED) {
-      // Verified, not assumed: a silent fallback to the in-process transport
-      // would make a six-process run report success while exchanging nothing.
-      printf("  FAIL: tile %d asked for the MPI halo transport but the context "
-             "reports kind %d\n", tile, fv3_gpu_halo_transport_kind_of(m.ctx));
+    if (fv3_gpu_halo_transport_kind_of(m.ctx) != g_mpi_transport_kind) {
+      // Verified, not assumed: a silent fallback to a different transport would
+      // make a six-process run report success while testing the wrong path.
+      printf("  FAIL: tile %d asked for MPI halo transport kind %d but the "
+             "context reports kind %d\n", tile, g_mpi_transport_kind,
+             fv3_gpu_halo_transport_kind_of(m.ctx));
       return false;
     }
   } else
@@ -3506,7 +3512,16 @@ void usage() {
         "through the host-staged MPI transport instead of the in-process "
         "HaloPeerGroup. This is the real production decomposition (FV_NX=1, "
         "FV_NY=6). Requires a build with -DFV3_DYN_CORE_ENABLE_MPI_HALO=ON and "
-        "exactly 6 ranks; default off)\n");
+        "exactly 6 ranks; default off)\n"
+        "[--mpi-halo-transport host_staged|cuda_aware]  (Prompt 43: which MPI "
+        "halo transport --mpi-halo attaches. host_staged (default) stages "
+        "payloads through pinned host buffers (D2H/H2D around MPI_Isend/"
+        "MPI_Irecv). cuda_aware issues MPI_Isend/MPI_Irecv directly on the "
+        "packed device send/recv buffers -- no D2H/H2D staging -- and "
+        "requires a CUDA-aware MPI runtime (Intel MPI 2021.13 with "
+        "I_MPI_OFFLOAD=1, confirmed in Prompt 42); the attach call fails "
+        "clearly, with no silent fallback, if that capability is not "
+        "present. Ignored unless --mpi-halo is also given.)\n");
 }
 
 } // namespace
@@ -3542,6 +3557,13 @@ int main(int argc, char **argv) {
     else if (a == "--fuse-corner-fill") g_fuse_corner_fill = true;
     else if (a == "--fuse-halo-edges") g_fuse_halo_edges = true;
     else if (a == "--mpi-halo") g_mpi_halo = true;
+    else if (a == "--mpi-halo-transport") {
+      const std::string v = next(i);
+      if (v == "cuda_aware") g_mpi_transport_kind = FV3_GPU_HALO_TRANSPORT_MPI_CUDA_AWARE;
+      else if (v == "host_staged") g_mpi_transport_kind = FV3_GPU_HALO_TRANSPORT_MPI_HOST_STAGED;
+      else { printf("unknown --mpi-halo-transport value: %s (want host_staged or "
+                     "cuda_aware)\n", v.c_str()); usage(); return 2; }
+    }
     else if (a == "--help") { usage(); return 0; }
     else { printf("unknown argument: %s\n", a.c_str()); usage(); return 2; }
   }
@@ -3631,7 +3653,10 @@ int main(int argc, char **argv) {
 
   if (g_mpi_halo)
     printf("=== Milestone 3A.15: SIX-MPI-PROCESS run, rank %d owns tile %d, "
-           "halo transport = host-staged MPI ===\n", g_mpi_rank, g_mpi_tile);
+           "halo transport = %s MPI ===\n", g_mpi_rank, g_mpi_tile,
+           g_mpi_transport_kind == FV3_GPU_HALO_TRANSPORT_MPI_CUDA_AWARE
+               ? "cuda-aware"
+               : "host-staged");
   printf("=== Milestone 3A.11 CUDA perf benchmark ===\n");
   printf("PRE-VALIDATION PERFORMANCE CHARACTERIZATION -- not numerical validation\n");
   printf("grid=%lldx%lld npz=%lld n_split=%d precision=%s warmup=%d iters=%d "

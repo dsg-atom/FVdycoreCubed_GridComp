@@ -121,6 +121,7 @@ contains
       type(fv3_gpu_error)            :: err
       integer(c_int64_t)             :: ev
       integer(c_int32_t)             :: rank_of_tile(6)
+      integer(c_int32_t)             :: mpi_transport_kind
       integer :: crc, ierr, comm_rank, comm_size, dev
       integer :: fail_fid, fail_aux
       character(len=256) :: msg
@@ -256,16 +257,32 @@ contains
 
       ! ---- halo transport ----------------------------------------------------
       ! The communicator crosses as its Fortran INTEGER handle; the transport
-      ! converts back with MPI_Comm_f2c. This is the Prompt 15 host-staged MPI
-      ! backend, validated bitwise against the in-process peer transport.
+      ! converts back with MPI_Comm_f2c. Prompt 15's host-staged MPI backend
+      ! remains the default; Prompt 43 adds an opt-in cuda_aware backend
+      ! (device send/recv buffers passed directly to MPI, no D2H/H2D staging),
+      ! selected via RUN_CUDA_FV3_MPI_TRANSPORT (host_staged|cuda_aware,
+      ! default host_staged -- unset/unrecognized values are host_staged).
+      mpi_transport_kind = mpi_transport_kind_from_env()
       crc = fv3_gpu_attach_mpi_halo_transport(ctx, int(comm, c_int), &
-                                              int(bridge_tile, c_int32_t), err)
+                                              int(bridge_tile, c_int32_t), &
+                                              mpi_transport_kind, err)
       call check(crc, err, 'fv3_gpu_attach_mpi_halo_transport')
 
-      if (fv3_gpu_halo_transport_kind_of(ctx) /= FV3_GPU_HALO_TRANSPORT_MPI_HOST_STAGED) then
-         call mpp_error(FATAL, 'fv3_gpu_bridge_init: the host-staged MPI halo '// &
+      if (fv3_gpu_halo_transport_kind_of(ctx) /= mpi_transport_kind) then
+         call mpp_error(FATAL, 'fv3_gpu_bridge_init: the requested MPI halo '// &
               'transport did not attach')
       endif
+
+      ! Verified, not assumed: a silent fallback would invalidate any A/B
+      ! between the two transports. Printed once per rank, not per message.
+      if (mpi_transport_kind == FV3_GPU_HALO_TRANSPORT_MPI_CUDA_AWARE) then
+         write(msg,'(a,i0,a)') 'fv3_gpu_bridge_init: rank ', comm_rank, &
+              ' halo transport = cuda_aware'
+      else
+         write(msg,'(a,i0,a)') 'fv3_gpu_bridge_init: rank ', comm_rank, &
+              ' halo transport = host_staged'
+      endif
+      call mpp_error(NOTE, trim(msg))
 
       bridge_ready = .true.
       model_step   = 0
@@ -646,6 +663,27 @@ contains
          end select
       endif
    end function env_flag_enabled
+
+   ! Prompt 43: MPI halo transport selector. RUN_CUDA_FV3_MPI_TRANSPORT=cuda_aware
+   ! (case-insensitive) opts into the device-pointer transport; unset or any other
+   ! value (including "host_staged") keeps the default host-staged behavior
+   ! identical to every prior run. A string selector, not env_flag_enabled's
+   ! boolean, because there are two named backends to choose between, not an
+   ! on/off switch.
+   function mpi_transport_kind_from_env() result(kind)
+      integer(c_int32_t) :: kind
+      character(len=16) :: val
+      integer :: vlen, istat
+      call get_environment_variable('RUN_CUDA_FV3_MPI_TRANSPORT', value=val, &
+           length=vlen, status=istat)
+      kind = FV3_GPU_HALO_TRANSPORT_MPI_HOST_STAGED
+      if (istat == 0 .and. vlen > 0) then
+         select case (trim(adjustl(val)))
+         case ('cuda_aware','CUDA_AWARE','Cuda_Aware')
+            kind = FV3_GPU_HALO_TRANSPORT_MPI_CUDA_AWARE
+         end select
+      endif
+   end function mpi_transport_kind_from_env
 
    subroutine check(crc, err, api)
       integer,             intent(in) :: crc

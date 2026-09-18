@@ -30,11 +30,24 @@ typedef enum fv3_gpu_halo_transport_kind {
   /* One tile per MPI rank: D2H of the packed send buffer, MPI point-to-point,
    * H2D into the recv buffer. This is what the real GEOS/FV3 production
    * decomposition (FV_NX=1, FV_NY=6, six separate ranks) requires. */
-  FV3_GPU_HALO_TRANSPORT_MPI_HOST_STAGED = 2
+  FV3_GPU_HALO_TRANSPORT_MPI_HOST_STAGED = 2,
+  /* Prompt 43 (Stage 2 of the Communication Evolution model): one tile per MPI
+   * rank, same as MPI_HOST_STAGED, but MPI_Isend/MPI_Irecv are issued directly
+   * on the packed DEVICE send/recv buffers -- no D2H/H2D payload staging.
+   * Requires a CUDA-aware MPI runtime (Intel MPI 2021.13 with I_MPI_OFFLOAD=1,
+   * confirmed in Prompt 42); the attach call fails clearly if that capability
+   * is not present rather than silently falling back. */
+  FV3_GPU_HALO_TRANSPORT_MPI_CUDA_AWARE = 3
 } fv3_gpu_halo_transport_kind;
 
-/* Attach the host-staged MPI halo transport to `context` for 1-based cubed-sphere
- * `tile`, which must equal the installed TopologyView::tile.
+/* Attach an MPI halo transport to `context` for 1-based cubed-sphere `tile`,
+ * which must equal the installed TopologyView::tile.
+ *
+ * `transport_kind` selects the backend and must be either
+ * FV3_GPU_HALO_TRANSPORT_MPI_HOST_STAGED (the default, pinned-host-staged D2H/
+ * H2D path) or FV3_GPU_HALO_TRANSPORT_MPI_CUDA_AWARE (Prompt 43: device
+ * pointers passed directly to MPI, requires a CUDA-aware MPI runtime). Any
+ * other value returns FV3_GPU_INVALID_ARGUMENT.
  *
  * THE COMMUNICATOR IS PASSED AS ITS FORTRAN INTEGER HANDLE, deliberately. MPI_Comm
  * is `int` in one MPI implementation and an opaque pointer in another, so it cannot
@@ -47,11 +60,14 @@ typedef enum fv3_gpu_halo_transport_kind {
  * MPI_Init, and detaching does not call MPI_Finalize.
  *
  * Returns FV3_GPU_UNSUPPORTED_CONFIGURATION if this build was configured without
- * FV3_DYN_CORE_ENABLE_MPI_HALO, so a caller gets a diagnosable refusal rather than
- * a link error. */
+ * FV3_DYN_CORE_ENABLE_MPI_HALO, or if FV3_GPU_HALO_TRANSPORT_MPI_CUDA_AWARE was
+ * requested and the linked MPI runtime does not report CUDA-buffer support, so a
+ * caller gets a diagnosable refusal rather than a link error or a silent
+ * fallback. */
 int fv3_gpu_attach_mpi_halo_transport(fv3_gpu_context *context,
                                       int communicator_fortran_handle,
-                                      int32_t tile, fv3_gpu_error *error);
+                                      int32_t tile, int32_t transport_kind,
+                                      fv3_gpu_error *error);
 
 /* Detach whichever transport is attached and release the halo buffers. Safe to
  * call when none is attached. Every participant must be past its last exchange

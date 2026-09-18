@@ -1628,22 +1628,33 @@ extern "C" int fv3_gpu_set_numerical_config(fv3_gpu_context *c,const fv3_gpu_num
  * missing build option in fv3_gpu_error::message. */
 extern "C" int fv3_gpu_attach_mpi_halo_transport(fv3_gpu_context *c,
                                                  int communicator_fortran_handle,
-                                                 int32_t tile, fv3_gpu_error *e){
+                                                 int32_t tile, int32_t transport_kind,
+                                                 fv3_gpu_error *e){
   using namespace fv3::gpu; clear_error(e);
   if(!c)return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"null context");
 #if !defined(FV3_DYN_CORE_ENABLE_MPI_HALO) || !defined(FV3_GPU_ENABLE_CUDA)
-  (void)communicator_fortran_handle; (void)tile;
+  (void)communicator_fortran_handle; (void)tile; (void)transport_kind;
   return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,
               "this build has no MPI halo transport; configure with "
               "-DFV3_DYN_CORE_ENABLE_MPI_HALO=ON (and a CUDA build) to enable it");
 #else
+  halo::TransportMode mode;
+  if (transport_kind == FV3_GPU_HALO_TRANSPORT_MPI_HOST_STAGED) {
+    mode = halo::TransportMode::host_staged;
+  } else if (transport_kind == FV3_GPU_HALO_TRANSPORT_MPI_CUDA_AWARE) {
+    mode = halo::TransportMode::cuda_aware;
+  } else {
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,
+                "transport_kind must be FV3_GPU_HALO_TRANSPORT_MPI_HOST_STAGED or "
+                "FV3_GPU_HALO_TRANSPORT_MPI_CUDA_AWARE");
+  }
   std::string why;
-  halo::HaloTransport *tr = halo::create_mpi_host_staged_transport(
-      communicator_fortran_handle, tile, &why);
+  halo::HaloTransport *tr = halo::create_mpi_transport(
+      communicator_fortran_handle, tile, mode, &why);
   if(!tr) return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,why);
   const int rc = attach_halo_transport(
       c, tr, tile, /*owned=*/true,
-      static_cast<uint8_t>(FV3_GPU_HALO_TRANSPORT_MPI_HOST_STAGED), e, __func__);
+      static_cast<uint8_t>(transport_kind), e, __func__);
   if(rc != FV3_GPU_SUCCESS){ halo::destroy_mpi_host_staged_transport(tr); return rc; }
   return FV3_GPU_SUCCESS;
 #endif

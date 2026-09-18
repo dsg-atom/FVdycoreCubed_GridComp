@@ -69,6 +69,10 @@ module fv3_gpu_abi_mod
    integer, parameter, public :: FV3_GPU_HALO_TRANSPORT_NONE            = 0
    integer, parameter, public :: FV3_GPU_HALO_TRANSPORT_IN_PROCESS_PEER = 1
    integer, parameter, public :: FV3_GPU_HALO_TRANSPORT_MPI_HOST_STAGED = 2
+   ! Prompt 43: device send/recv buffers passed directly to MPI, no D2H/H2D
+   ! staging. Requires a CUDA-aware MPI runtime (Intel MPI 2021.13 with
+   ! I_MPI_OFFLOAD=1, confirmed Prompt 42); attach fails clearly if absent.
+   integer, parameter, public :: FV3_GPU_HALO_TRANSPORT_MPI_CUDA_AWARE  = 3
 
    ! ---- structs ---------------------------------------------------------------
 
@@ -443,12 +447,18 @@ module fv3_gpu_abi_mod
       ! communicator handle; the backend converts it with MPI_Comm_f2c. The
       ! communicator must have exactly 6 ranks with one tile per rank -- the
       ! backend verifies the rank<->tile map at attach and refuses otherwise.
-      integer(c_int) function fv3_gpu_attach_mpi_halo_transport(ctx, comm_f, tile, err) &
+      ! Prompt 43: transport_kind selects FV3_GPU_HALO_TRANSPORT_MPI_HOST_STAGED
+      ! (default) or FV3_GPU_HALO_TRANSPORT_MPI_CUDA_AWARE; the latter fails
+      ! clearly rather than silently falling back if the MPI runtime lacks
+      ! CUDA-buffer support.
+      integer(c_int) function fv3_gpu_attach_mpi_halo_transport(ctx, comm_f, tile, &
+                                                               transport_kind, err) &
                               bind(C, name="fv3_gpu_attach_mpi_halo_transport")
          import :: c_int, c_int32_t, c_ptr, fv3_gpu_error
          type(c_ptr), value                 :: ctx
          integer(c_int), value              :: comm_f
          integer(c_int32_t), value          :: tile
+         integer(c_int32_t), value          :: transport_kind
          type(fv3_gpu_error), intent(inout) :: err
       end function fv3_gpu_attach_mpi_halo_transport
 

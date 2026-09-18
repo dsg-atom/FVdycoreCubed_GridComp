@@ -57,6 +57,14 @@
 
 #include <cuda_runtime.h>
 #include <mpi.h>
+/* MPIX_Query_cuda_support() (Prompt 43's cuda_aware capability check) is
+ * declared directly in Intel MPI's mpi.h (confirmed against mpi/impi/2021.13),
+ * but Open MPI declares it only in the mpi-ext.h extension header -- OPEN_MPI
+ * is the macro Open MPI's own mpi.h defines to 1, so this only pulls in the
+ * extra header for that implementation and is a no-op for Intel MPI/MPICH. */
+#if defined(OPEN_MPI) && OPEN_MPI
+#include <mpi-ext.h>
+#endif
 
 #include <array>
 #include <cstring>
@@ -87,14 +95,17 @@ inline MPI_Datatype fv_real_datatype() noexcept {
 class MpiHaloTransport final : public HaloTransport {
  public:
   MpiHaloTransport(MPI_Comm comm, int32_t tile, int rank,
-                   const std::array<int32_t, cubed_sphere_tiles> &tile_of_rank) noexcept
-      : comm_(comm), tile_(tile), rank_(rank), tile_of_rank_(tile_of_rank) {
+                   const std::array<int32_t, cubed_sphere_tiles> &tile_of_rank,
+                   TransportMode mode) noexcept
+      : comm_(comm), tile_(tile), rank_(rank), tile_of_rank_(tile_of_rank), mode_(mode) {
     layout_.fill(-1);
   }
 
   ~MpiHaloTransport() override { release_host_buffers(); }
 
-  const char *name() const noexcept override { return "mpi_host_staged"; }
+  const char *name() const noexcept override {
+    return mode_ == TransportMode::cuda_aware ? "mpi_cuda_aware" : "mpi_host_staged";
+  }
 
   bool attach(int32_t tile, const HaloMemberResources &r) noexcept override {
     if (attached_) {
@@ -113,29 +124,37 @@ class MpiHaloTransport final : public HaloTransport {
                     "transfer stream";
       return false;
     }
-    /* Sized ONCE here, for the largest live group, exactly as the device buffers
-     * are -- the transport contract forbids allocating inside an exchange, and a
-     * cudaHostAlloc in the acoustic loop would serialize the device just as a
-     * cudaMalloc would. Pinned rather than ordinary host memory so both bulk copies
-     * are asynchronous DMA rather than a staged pageable copy. */
-    const size_t bytes = static_cast<size_t>(r.buffer_elements) * sizeof(fv_real);
-    if (cudaHostAlloc(reinterpret_cast<void **>(&h_send_), bytes, cudaHostAllocDefault) !=
-            cudaSuccess ||
-        cudaHostAlloc(reinterpret_cast<void **>(&h_recv_), bytes, cudaHostAllocDefault) !=
-            cudaSuccess) {
-      release_host_buffers();
-      attach_why_ = "could not allocate pinned host staging buffers for the MPI halo "
-                    "transport";
-      return false;
+    /* cuda_aware mode passes the DEVICE send/recv buffers straight to MPI and never
+     * stages through host memory, so it allocates no pinned buffers here -- Prompt
+     * 43's whole point is removing this D2H/H2D pair from the critical path. */
+    if (mode_ == TransportMode::host_staged) {
+      /* Sized ONCE here, for the largest live group, exactly as the device buffers
+       * are -- the transport contract forbids allocating inside an exchange, and a
+       * cudaHostAlloc in the acoustic loop would serialize the device just as a
+       * cudaMalloc would. Pinned rather than ordinary host memory so both bulk copies
+       * are asynchronous DMA rather than a staged pageable copy. */
+      const size_t bytes = static_cast<size_t>(r.buffer_elements) * sizeof(fv_real);
+      if (cudaHostAlloc(reinterpret_cast<void **>(&h_send_), bytes, cudaHostAllocDefault) !=
+              cudaSuccess ||
+          cudaHostAlloc(reinterpret_cast<void **>(&h_recv_), bytes, cudaHostAllocDefault) !=
+              cudaSuccess) {
+        release_host_buffers();
+        attach_why_ = "could not allocate pinned host staging buffers for the MPI halo "
+                      "transport";
+        return false;
+      }
+      /* Zeroed for the same reason the device buffers are (milestone 3A.10 §20): a
+       * group whose field_count is below max_halo_group_fields leaves a slot tail that
+       * is copied but never read, and initcheck is right to call an uninitialized
+       * copy source a defect even when the value is never consumed. Across MPI that
+       * tail is also literally sent, so leaving it undefined would put uninitialized
+       * host memory on the wire. */
+      std::memset(h_send_, 0, bytes);
+      std::memset(h_recv_, 0, bytes);
     }
-    /* Zeroed for the same reason the device buffers are (milestone 3A.10 §20): a
-     * group whose field_count is below max_halo_group_fields leaves a slot tail that
-     * is copied but never read, and initcheck is right to call an uninitialized
-     * copy source a defect even when the value is never consumed. Across MPI that
-     * tail is also literally sent, so leaving it undefined would put uninitialized
-     * host memory on the wire. */
-    std::memset(h_send_, 0, bytes);
-    std::memset(h_recv_, 0, bytes);
+    /* Reused in cuda_aware mode as the "pack is complete" event -- the same
+     * narrower-than-a-stream-synchronize wait the host-staged path already relies
+     * on, just waited on before MPI_Isend instead of before an H2D. */
     if (cudaEventCreateWithFlags(&ev_d2h_, cudaEventDisableTiming) != cudaSuccess) {
       release_host_buffers();
       attach_why_ = "could not create the staging-copy completion event for the MPI "
@@ -202,22 +221,37 @@ class MpiHaloTransport final : public HaloTransport {
 
     auto *cs = static_cast<cudaStream_t>(stream);
     const size_t used_bytes = static_cast<size_t>(used) * sizeof(fv_real);
+    const bool cuda_aware = (mode_ == TransportMode::cuda_aware);
 
-    /* 1. D2H, stream-ordered behind the pack the caller already enqueued. */
-    cudaError_t cr = cudaMemcpyAsync(h_send_, send, used_bytes, cudaMemcpyDeviceToHost, cs);
-    if (cr != cudaSuccess)
-      return fail(e, FV3_GPU_CUDA_ERROR, api, cudaGetErrorString(cr), (int)cr);
-    /* 2. Wait for exactly that copy. cudaEventSynchronize on this transport's own
-     *    event is strictly narrower than a stream synchronize and is not a device
-     *    synchronize; unrelated work on the compute stream keeps running. */
-    cr = cudaEventRecord(ev_d2h_, cs);
+    /* 1. host_staged: D2H, stream-ordered behind the pack the caller already
+     *    enqueued. cuda_aware: no payload copy -- MPI will read `send` directly. */
+    if (!cuda_aware) {
+      cudaError_t cr = cudaMemcpyAsync(h_send_, send, used_bytes, cudaMemcpyDeviceToHost, cs);
+      if (cr != cudaSuccess)
+        return fail(e, FV3_GPU_CUDA_ERROR, api, cudaGetErrorString(cr), (int)cr);
+    }
+    /* 2. Wait for the pack (cuda_aware) or the D2H (host_staged) to complete on
+     *    THIS transport's own event -- strictly narrower than a stream synchronize
+     *    and not a device synchronize; unrelated work on the compute stream keeps
+     *    running. This is the point at which `send` becomes safe for MPI to read,
+     *    whether MPI reads it via a host copy or, in cuda_aware mode, directly:
+     *    the wait is on ordinary host-observable stream-order completion, not on
+     *    anything MPI-specific, so it is sufficient before either kind of read. */
+    cudaError_t cr = cudaEventRecord(ev_d2h_, cs);
     if (cr != cudaSuccess)
       return fail(e, FV3_GPU_CUDA_ERROR, api, cudaGetErrorString(cr), (int)cr);
     cr = cudaEventSynchronize(ev_d2h_);
     if (cr != cudaSuccess)
       return fail(e, FV3_GPU_CUDA_ERROR, api, cudaGetErrorString(cr), (int)cr);
 
-    /* 3. Point-to-point. Receives first. */
+    /* 3. Point-to-point. Receives first. host_staged addresses h_send_/h_recv_
+     *    (pinned host); cuda_aware addresses `send`/`recv` (device) directly --
+     *    same tags, same message count, same peer mapping, same slot_base()
+     *    offsets, only the pointer family differs. Requires I_MPI_OFFLOAD=1 (or
+     *    equivalent) to be set by the caller; verified unsafe without it
+     *    (Prompt 42, SIGSEGV). */
+    fv_real *const recv_base = cuda_aware ? recv : h_recv_;
+    const fv_real *const send_base = cuda_aware ? send : h_send_;
     const MPI_Datatype dt = fv_real_datatype();
     std::array<MPI_Request, 2 * 4 * max_halo_group_fields> req{};
     int nreq = 0;
@@ -246,7 +280,7 @@ class MpiHaloTransport final : public HaloTransport {
                         "vector field's seam partner is not a member of its own halo "
                         "group");
         }
-        if (MPI_Irecv(h_recv_ + slot_base(geom, width, n, mine),
+        if (MPI_Irecv(recv_base + slot_base(geom, width, n, mine),
                       static_cast<int>(slot), dt, nb.rank,
                       message_tag(eff.group, nb.edge, sn), comm_,
                       &req[nreq++]) != MPI_SUCCESS)
@@ -258,7 +292,7 @@ class MpiHaloTransport final : public HaloTransport {
       const TileEdge mine = static_cast<TileEdge>(q);
       const EdgeNeighbor &nb = topo.neighbors[q];
       for (int n = 0; n < eff.field_count; ++n) {
-        if (MPI_Isend(h_send_ + slot_base(geom, width, n, mine),
+        if (MPI_Isend(const_cast<fv_real *>(send_base) + slot_base(geom, width, n, mine),
                       static_cast<int>(slot), dt, nb.rank,
                       message_tag(eff.group, mine, n), comm_,
                       &req[nreq++]) != MPI_SUCCESS)
@@ -270,17 +304,27 @@ class MpiHaloTransport final : public HaloTransport {
       return fail(e, FV3_GPU_MPI_ERROR, api,
                   "MPI_Waitall failed while completing a halo group exchange");
 
-    /* 4. H2D on the caller's stream, so the unpack enqueued next sees it. */
-    cr = cudaMemcpyAsync(recv, h_recv_, used_bytes, cudaMemcpyHostToDevice, cs);
-    if (cr != cudaSuccess)
-      return fail(e, FV3_GPU_CUDA_ERROR, api, cudaGetErrorString(cr), (int)cr);
+    /* 4. host_staged only: H2D on the caller's stream, so the unpack enqueued
+     *    next sees it. cuda_aware already wrote `recv` directly above -- by the
+     *    time MPI_Waitall returns on the host, the completed MPI receive is
+     *    host-observable, and the unpack kernel is only enqueued on `stream`
+     *    AFTER this function returns to the caller, so ordinary host-issue-order
+     *    stream semantics make it safe without an extra device-side wait. */
+    if (!cuda_aware) {
+      cr = cudaMemcpyAsync(recv, h_recv_, used_bytes, cudaMemcpyHostToDevice, cs);
+      if (cr != cudaSuccess)
+        return fail(e, FV3_GPU_CUDA_ERROR, api, cudaGetErrorString(cr), (int)cr);
+    }
     return FV3_GPU_SUCCESS;
   }
 
-  /* Nothing to do: this tile's send buffer was consumed by a D2H that completed
-   * before transfer() returned, and the MPI sends drew from the HOST copy, so no
-   * reader of the device send buffer survives into the next group's pack. Model B
-   * needs its step-5 barrier only because peers read the device buffer directly. */
+  /* Nothing to do in either mode: transfer() already blocks on MPI_Waitall before
+   * returning (no async overlap in this transport), so every reader of the send
+   * buffer -- the D2H in host_staged mode, or MPI_Isend reading `send` directly in
+   * cuda_aware mode -- has completed by the time this is called. No reader of the
+   * device send buffer survives into the next group's pack. Model B needs its
+   * step-5 barrier only because peers read the device buffer directly and
+   * asynchronously; this transport never does. */
   int release_send(void *, fv3_gpu_error *e, const char *) noexcept override {
     clear_error(e);
     return FV3_GPU_SUCCESS;
@@ -333,6 +377,7 @@ class MpiHaloTransport final : public HaloTransport {
    * size, so this is validated rather than assumed. */
   int size_ = cubed_sphere_tiles;
   std::array<int32_t, cubed_sphere_tiles> tile_of_rank_{};
+  TransportMode mode_ = TransportMode::host_staged;
   std::array<int32_t, kGroups> layout_{};
   fv_real *h_send_ = nullptr;
   fv_real *h_recv_ = nullptr;
@@ -345,8 +390,8 @@ class MpiHaloTransport final : public HaloTransport {
 
 }  // namespace
 
-HaloTransport *create_mpi_host_staged_transport(int comm_fortran_handle, int32_t tile,
-                                               std::string *why) noexcept {
+HaloTransport *create_mpi_transport(int comm_fortran_handle, int32_t tile,
+                                    TransportMode mode, std::string *why) noexcept {
   const auto refuse = [&](const char *m) -> HaloTransport * {
     if (why) *why = m;
     return nullptr;
@@ -373,6 +418,20 @@ HaloTransport *create_mpi_host_staged_transport(int comm_fortran_handle, int32_t
                   "cubed-sphere tile; a different decomposition is not supported by "
                   "this transport");
 
+  /* Prompt 43: cuda_aware construction fails clearly here rather than silently
+   * falling back to host_staged -- a silent fallback would invalidate the A/B
+   * this transport exists to support. MPIX_Query_cuda_support() is the exact
+   * runtime capability probe Prompt 42 validated on a real A100 (PASS with
+   * I_MPI_OFFLOAD=1, SIGSEGV without it) against Intel MPI 2021.13, the MPI
+   * this project's production build links. */
+  if (mode == TransportMode::cuda_aware && !MPIX_Query_cuda_support())
+    return refuse("cuda_aware MPI halo transport requested, but this MPI runtime "
+                  "reports MPIX_Query_cuda_support() == 0; for Intel MPI 2021.13 "
+                  "this means I_MPI_OFFLOAD=1 is not set in the environment "
+                  "(verified required in Prompt 42) or the runtime genuinely lacks "
+                  "CUDA-buffer support -- refusing rather than silently using "
+                  "host_staged");
+
   /* Gather the whole rank->tile map instead of assuming rank r holds tile r+1. The
    * identity mapping IS what the production decomposition produces (§2), but this
    * transport routes by the topology's rank table, so the map it validates against
@@ -391,9 +450,14 @@ HaloTransport *create_mpi_host_staged_transport(int comm_fortran_handle, int32_t
                     "of the six tiles must be held by exactly one rank");
   }
 
-  auto *t = new (std::nothrow) MpiHaloTransport(comm, tile, rank, tiles);
+  auto *t = new (std::nothrow) MpiHaloTransport(comm, tile, rank, tiles, mode);
   if (!t) return refuse("could not allocate the MPI halo transport");
   return t;
+}
+
+HaloTransport *create_mpi_host_staged_transport(int comm_fortran_handle, int32_t tile,
+                                               std::string *why) noexcept {
+  return create_mpi_transport(comm_fortran_handle, tile, TransportMode::host_staged, why);
 }
 
 void destroy_mpi_host_staged_transport(HaloTransport *t) noexcept { delete t; }

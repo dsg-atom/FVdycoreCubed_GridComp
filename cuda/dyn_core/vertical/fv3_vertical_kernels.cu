@@ -127,15 +127,19 @@ int launch_dgrid_height_v2(const ExecutionContext &x,fv3_gpu_error *error) {
 // Complete update_dz_d dispatch
 int launch_update_dz_d(const ExecutionContext &x, const NumericalDispatch &dispatch,
                        fv3_gpu_error *error) {
+  static constexpr const char *api = "launch_update_dz_d";
   // Validate context
   const int context_status = validate_execution_context(x, error);
   if (context_status != FV3_GPU_SUCCESS) return context_status;
-  if (x.submission.stream_id != StreamId::compute) return FV3_GPU_INVALID_ARGUMENT;
+  if (x.submission.stream_id != StreamId::compute)
+    return fail(error, FV3_GPU_INVALID_ARGUMENT, api,
+                "update_dz_d requires the WP-E compute stream");
 
   // Require H_DSCALAR dependency (scalar halos ready)
   fv3_gpu_event ready{};
   if (x.dependencies->require(FV3_GPU_H_DSCALAR, &ready) != FV3_GPU_SUCCESS)
-    return FV3_GPU_STATE_CONFLICT;
+    return fail(error, FV3_GPU_STATE_CONFLICT, api,
+                "H_DSCALAR halo dependency is not satisfied");
 
   // Get required field views
   const auto *v_zh = x.fields->find(FieldId::zh);
@@ -145,20 +149,23 @@ int launch_update_dz_d(const ExecutionContext &x, const NumericalDispatch &dispa
   const auto *v_rarea = x.fields->find(FieldId::rarea);
 
   if (!v_zh || !v_delz || !v_ws || !v_zs || !v_rarea)
-    return FV3_GPU_INVALID_ARGUMENT;
+    return fail(error, FV3_GPU_INVALID_ARGUMENT, api,
+                "update_dz_d is missing a required registered field");
 
   const auto &b = x.immutable->bounds;
   const auto &cfg = x.immutable->config;
   const auto &p = *x.dispatch_params;
 
   if (b.npz < 2 || p.rdt == 0.0)
-    return FV3_GPU_UNSUPPORTED_CONFIGURATION;
+    return fail(error, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                "update_dz_d requires npz >= 2 and a nonzero rdt");
 
   // Verify hord_tm=6 for GEOS production (or at least supported order)
   // WP-B supports hord = 1, 6, 8 and negative variants
   const int32_t mord = cfg.hord_tm > 0 ? cfg.hord_tm : -cfg.hord_tm;
   if (mord != 1 && mord != 6 && mord != 8)
-    return FV3_GPU_UNSUPPORTED_CONFIGURATION;
+    return fail(error, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                "update_dz_d supports only hord_tm = 1, 6, or 8");
 
   // === Step 1: Call WP-B dgrid_height_transport for horizontal advection ===
   // Milestone 3A.4: the WP-B operator now implements the whole authoritative
@@ -173,7 +180,8 @@ int launch_update_dz_d(const ExecutionContext &x, const NumericalDispatch &dispa
   // - the area-weighted height update renormalised by ((ra_x+ra_y)-area)
   if (!dispatch.dgrid_height_transport) {
     // WP-B transport service not wired - integration incomplete
-    return FV3_GPU_UNSUPPORTED_CONFIGURATION;
+    return fail(error, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                "dispatch.dgrid_height_transport is not wired");
   }
 
   int transport_status = dispatch.dgrid_height_transport(x, error);
@@ -193,7 +201,12 @@ int launch_update_dz_d(const ExecutionContext &x, const NumericalDispatch &dispa
       b.is, b.ie, b.js, b.je, static_cast<int>(b.npz),
       fv_real(p.rdt), fv_real(cfg.dz_min), false);
 
-  return cudaGetLastError() == cudaSuccess ? FV3_GPU_SUCCESS : FV3_GPU_CUDA_ERROR;
+  if (cudaError_t err = cudaGetLastError(); err != cudaSuccess)
+    return fail(error, FV3_GPU_CUDA_ERROR, api,
+                std::string("height_boundary_v2_kernel launch failed: ") +
+                    cudaGetErrorString(err),
+                static_cast<int>(err));
+  return FV3_GPU_SUCCESS;
 }
 
 /* ==========================================================================
@@ -442,9 +455,12 @@ __global__ void riem_solver3_kernel(
 
 // Vertical solver dispatch
 int launch_vertical_solver(const ExecutionContext &x, fv3_gpu_error *error) {
+  static constexpr const char *api = "launch_vertical_solver";
   const int context_status = validate_execution_context(x, error);
   if (context_status != FV3_GPU_SUCCESS) return context_status;
-  if (x.submission.stream_id != StreamId::compute) return FV3_GPU_INVALID_ARGUMENT;
+  if (x.submission.stream_id != StreamId::compute)
+    return fail(error, FV3_GPU_INVALID_ARGUMENT, api,
+                "vertical_solver requires the WP-E compute stream");
 
   // Get required fields
   const auto *v_delp = x.fields->find(FieldId::delp);
@@ -464,27 +480,35 @@ int launch_vertical_solver(const ExecutionContext &x, fv3_gpu_error *error) {
 
   if (!v_delp || !v_pt || !v_q_con || !v_cappa || !v_zh || !v_w ||
       !v_zs || !v_ws || !v_delz || !v_pe || !v_peln || !v_pk || !v_pk3 || !v_ppe)
-    return FV3_GPU_INVALID_ARGUMENT;
+    return fail(error, FV3_GPU_INVALID_ARGUMENT, api,
+                "vertical_solver is missing a required registered field");
 
   const auto &b = x.immutable->bounds;
   const auto &cfg = x.immutable->config;
   const auto &p = *x.dispatch_params;
 
-  if (b.npz < 2) return FV3_GPU_UNSUPPORTED_CONFIGURATION;
+  if (b.npz < 2)
+    return fail(error, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                "vertical_solver requires npz >= 2");
   /* gama = 1/(1-akap) below; akap == 1 is a pole, and m_split is the vertical
    * substep count Riem_Solver3 receives at dyn_core.F90:918. Neither may be
    * defaulted. */
   if (cfg.akap <= 0.0 || cfg.akap >= 1.0 || cfg.m_split < 1)
-    return FV3_GPU_UNSUPPORTED_CONFIGURATION;
+    return fail(error, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                "vertical_solver requires 0 < akap < 1 and m_split >= 1");
   /* grav reaches riem3_precompute_column as rgrav = 1/grav (nh_core.F90:100),
    * so a defaulted 0 would divide by zero and silently poison every column.
    * Mirrors the guard at fv3_riem_solver_c.cu:272 for the C-grid twin, which
    * already validated its own grav. Milestone 3A.11V. */
-  if (!(cfg.grav > 0.0)) return FV3_GPU_UNSUPPORTED_CONFIGURATION;
+  if (!(cfg.grav > 0.0))
+    return fail(error, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                "vertical_solver requires grav > 0");
 
   // Get workspace slice
   const auto *ws_slice = workspace_slice(*x.workspace, WorkspaceId::vertical);
-  if (!ws_slice || !ws_slice->data) return FV3_GPU_INVALID_ARGUMENT;
+  if (!ws_slice || !ws_slice->data)
+    return fail(error, FV3_GPU_INVALID_ARGUMENT, api,
+                "vertical_solver workspace slice is absent");
 
   const int km = static_cast<int>(b.npz);
   const auto layout = compute_workspace_layout(km);
@@ -493,7 +517,8 @@ int launch_vertical_solver(const ExecutionContext &x, fv3_gpu_error *error) {
 
   // Verify workspace capacity
   if (ws_slice->bytes < columns * bytes_per_column)
-    return FV3_GPU_UNSUPPORTED_CONFIGURATION;
+    return fail(error, FV3_GPU_UNSUPPORTED_CONFIGURATION, api,
+                "vertical_solver workspace slice is too small for this bounds/npz");
 
   const uint64_t workspace_stride = layout.total_scalars;
 
@@ -534,7 +559,12 @@ int launch_vertical_solver(const ExecutionContext &x, fv3_gpu_error *error) {
       p.last_call != 0, p.fp_out != 0, cfg.use_logp != 0,
       layout);
 
-  return cudaGetLastError() == cudaSuccess ? FV3_GPU_SUCCESS : FV3_GPU_CUDA_ERROR;
+  if (cudaError_t err = cudaGetLastError(); err != cudaSuccess)
+    return fail(error, FV3_GPU_CUDA_ERROR, api,
+                std::string("riem_solver3_kernel launch failed: ") +
+                    cudaGetErrorString(err),
+                static_cast<int>(err));
+  return FV3_GPU_SUCCESS;
 }
 
 /* ==========================================================================

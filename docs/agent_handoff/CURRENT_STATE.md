@@ -1,33 +1,41 @@
 # Current Project State
 
-_Last updated 2026-09-18 (Prompt 44: root-caused and FIXED the C512
-six-rank MAPL/Held-Suarez resource-read startup crash that blocked Prompt
-43's Stage 7. **Root cause**: `FV_StateMod.F90`'s `HELD_SUAREZ` was
-declared `LOGICAL` and read directly via `MAPL_GetResource` against
-`AGCM.rc`'s bare-integer `RUN_HELD_SUAREZ: 1` — deviating from this same
-file's own established INTEGER-proxy convention for numeric-literal `.rc`
-booleans (`INT_ADIABATIC`, `INT_FV_OFF`, etc.). `ESMF_ConfigGetAttribute`'s
-LOGICAL-typed parse of that bare-integer token is unreliable, producing the
-rank-varying (but not actually racing — `state%cf` is per-rank-private)
-`MAPL_Resource_SetValue.h status=39` crash. **Fix** (tree #3,
-`GEOSfvdycore_fortran_perf/src/Components/@FVdycoreCubed_GridComp/
-FV_StateMod.F90` — NOT the CUDA dev repo, Prompt 43's diff untouched):
-added an `INT_HELD_SUAREZ` INTEGER proxy read via `MAPL_GetResource`,
-manually converted to the existing `LOGICAL HELD_SUAREZ`. Confirmed via a
-zero-rebuild `.rc`-format discriminator (`1`->`.TRUE.`, 0/3 crashes vs.
-3/3 before) before committing to the source fix. **C512 host-staged
-acceptance: 10/10 PASS** (job 58452391, 0 `status=39`, all 10 reached
-`dyn_core` with uniform progress). **C32 HS-on/HS-off regression: PASS**
-(job 58452598, clean `rc=0` both modes). **CUDA-aware resume gate**: MAPL
-blocker CONFIRMED CLEARED under `cuda_aware` too (job 58452629 — passed
-`FV_Setup`/MAPL init/`fv3_gpu_bridge_init` cleanly into `fv_dynamics`), but
-surfaced a **separate, pre-existing, Prompt-43-scope** transport-layer
-failure (`fv3_gpu_dyn_core_step failed`, rank 4,
-`fv3_gpu_dyncore_bridge.F90:693`) — this is Prompt 43's previously-flagged,
-unreconciled Stage 6 item, not a MAPL/resource issue, and out of Prompt
-44's scope to fix. Host-staged transport unaffected, available now. See
-§7/§9/§11 and `prompt_44_mapl_resource_race.md`. This file holds current
-truth only._
+_Last updated 2026-09-18 (Prompt 45: root-caused the C512 `cuda_aware`
+`MpiHaloTransport` correctness failure left open by Prompt 44 —
+**DEVICE MEMORY CAPACITY, not a synchronization/pointer/lifetime defect.**
+**Fix (1 file, `cuda/dyn_core/vertical/fv3_vertical_kernels.cu`)**: the
+FATAL error path (`fv3_gpu_dyn_core_step failed`) previously discarded the
+actual failure detail — several early returns in `launch_update_dz_d`/
+`launch_vertical_solver` used bare enum returns instead of the project's
+`fail(error, code, api, message, native_code)` mechanism, and the two
+`cudaGetLastError()` checks discarded the captured error code/string.
+Wrapped all of them with `fail(...)` and embedded `cudaGetErrorString()`
+directly into the message (the Fortran bridge prints `api`+`message`, not
+`native_code`). With the real message visible, the crash reads
+`riem_solver3_kernel launch failed: out of memory`
+(`cudaErrorMemoryAllocation`). **Root cause, confirmed via `nvidia-smi`
+memory polling (job 58453867)**: six C512 ranks on one A100 already use
+**39466/40960 MiB (96.4%)** under the working `host_staged` transport —
+under 1.5GB headroom. `cuda_aware`'s Intel-MPI-runtime GPU-direct/RDMA
+buffer registration (`I_MPI_OFFLOAD=1`) needs device memory on top of that
+already-near-full baseline; the transport's own code
+(`fv3_gpu_halo_mpi.cpp`) makes zero extra `cudaMalloc` calls, so the extra
+consumption is Intel MPI's own runtime pool, external to this project's
+code. Different rank fails each run (PE 4/1/2/1 across 4 observed runs) —
+consistent with a genuine resource-exhaustion race, not rank-specific logic.
+**Transport unit test: 10/10 PASS** (6-rank ctest, both transport modes,
+16692 checks/run, 0 failures) — confirms the transport logic itself is
+correct at small buffer sizes; the failure is specific to C512's
+already-near-full device memory footprint. **C512 smoke (2 simulated
+hours)**: `host_staged` PASSED cleanly (job 58453614 step .0); `cuda_aware`
+FAILED at the very first Riemann-solver kernel launch during
+initialization, every attempt. No numerical comparison possible (cuda_aware
+never reaches a comparable state). **Decision: do NOT resume Prompt 43's
+cuda_aware performance A/B at C512 under the current six-ranks-per-A100
+density** — this is a real device memory ceiling, not a fixable software
+defect within Prompt 43's or Prompt 45's scope; `host_staged` remains the
+only C512-viable transport. See §7/§9/§11 and
+`prompt_45_cuda_aware_correctness.md`. This file holds current truth only._
 
 ## 1. Project Goal
 
@@ -247,15 +255,11 @@ Full tables/reconciliation: `prompt_34_c32_perf_reconciliation.md`,
   **CUDA-aware-MPI priority confirmed HIGH.** See
   `prompt_40_c512_mpi_protocol_ab.md`.
 
-- **Prompt 41 (0 GPU jobs, 0 source changes)**: verified via direct
-  `ompi_info` query (login node, static build-info, no GPU needed) that
-  the validated `mpi/openmpi/4.1.6/gcc-12.3.0` module's OpenMPI build has
-  **`opal_built_with_cuda_support=false`** and no `--with-cuda` in its
-  configure line. Confirmed (but did not adopt) that a CUDA-aware build
-  already exists on Discover: `nvidia/nvhpc-hpcx-cuda12/24.7` (HPC-X
-  OpenMPI 4.1.7a1, `cuda_support=true`). **Superseded by Prompt 42 below**
-  — this finding is correct for OpenMPI 4.1.6 but that library is not the
-  one used by the actual C512 job.
+- **Prompt 41 (0 GPU jobs, 0 source changes, SUPERSEDED by Prompt 42)**:
+  found OpenMPI 4.1.6 (the "validated" dev stack) has no CUDA-aware build
+  (`opal_built_with_cuda_support=false`); true for OpenMPI 4.1.6 but
+  answering the wrong question — that library isn't what the real C512
+  job uses. See `prompt_41_c512_cuda_aware_mpi_ab.md`.
 - **Prompt 42 correction + redirect (1 GPU job, job 58450084, 0 production
   source changes)**: discovered (via `CMakeCache.txt`/`ldd`/`g5_modules`/
   the actual p37 job log) that the real C256/C512 six-rank job runs under
@@ -300,15 +304,29 @@ Full tables/reconciliation: `prompt_34_c32_perf_reconciliation.md`,
   `fv3_gpu_dyncore_bridge.F90:693`, job 58452629) — this is Prompt 43's own
   Stage 6 item, now confirmed reproducible at full C512 scale, not a MAPL
   issue. See `prompt_44_mapl_resource_race.md`.
+- **Prompt 45 (fix + root cause, 1 CUDA dev-repo source file changed —
+  `cuda/dyn_core/vertical/fv3_vertical_kernels.cu`)**: made the transport
+  failure diagnosable (embedded `cudaGetErrorString()` into the FATAL
+  message) and used it to root-cause Prompt 44's remaining transport-layer
+  failure as **device memory capacity, not a code defect** — see header
+  for full detail. Transport unit test 10/10 PASS both modes; C512 smoke:
+  `host_staged` PASS (2 simulated hours), `cuda_aware` FAILS at
+  initialization (`cudaErrorMemoryAllocation` at the Riemann-solver kernel
+  launch, six C512 ranks already at 96.4% of the A100's 40GB under the
+  working transport). **Decision: do not resume Prompt 43's cuda_aware
+  performance A/B at the current 6-ranks-per-A100 density.** See
+  `prompt_45_cuda_aware_correctness.md`.
 
-Numerical correctness (§5) unaffected by any of Prompts 38-44 — no
+Numerical correctness (§5) unaffected by any of Prompts 38-45 — no
 production source changed, C512 remains BITWISE PASS as of that
-validation. **Preferred C512 transport remains HOST-STAGED** — now
-unblocked and correctness-gate-ready (10/10 startup PASS, Prompt 44). The
-`cuda_aware` variant (Prompt 43) is environment-viable (Prompt 42) and no
-longer blocked by MAPL, but has its own unresolved transport-layer
-correctness issue (Stage 6/above) that must be fixed before its C512 gate
-can run.
+validation. **Preferred C512 transport remains HOST-STAGED** — correctness-
+gate-ready (10/10 startup PASS, Prompt 44) and the only C512-viable
+transport. The `cuda_aware` variant (Prompt 43) is environment-viable
+(Prompt 42) and no longer blocked by MAPL, but is now understood to be
+blocked by device memory capacity at C512's current 6-ranks-per-A100
+density (Prompt 45) — not a software defect fixable without changing rank
+density or the transport's MPI memory strategy, both out of scope for
+correctness-only prompts.
 
 ## 8. Standalone Integration Status
 
@@ -358,12 +376,17 @@ can run.
   C512 was, and remains, a useful red flag worth checking logs for even
   post-fix (a healthy run takes the full requested walltime to make
   partial progress, or exits `rc=0` cleanly at a natural end-of-run).
-- **`cuda_aware` MpiHaloTransport correctness gate currently BLOCKED
-  (Prompt 43 Stage 6, confirmed at C512 scale by Prompt 44)**:
-  `fv3_gpu_dyn_core_step failed` on 1 of 6 ranks inside the CUDA-aware
-  transport/dyn_core dispatch path (`fv3_gpu_dyncore_bridge.F90:693`), no
-  further detail string logged. Host-staged transport unaffected. See
-  `prompt_44_mapl_resource_race.md`.
+- **`cuda_aware` MpiHaloTransport BLOCKED by device memory capacity, not a
+  software defect (root-caused Prompt 45)**: six C512 ranks on one A100
+  already run at 96.4% device memory utilization (39466/40960 MiB) under
+  the working `host_staged` transport; `cuda_aware`'s additional Intel-MPI
+  GPU-direct/RDMA buffer registration exceeds the remaining ~1.5GB
+  headroom, crashing with `cudaErrorMemoryAllocation` at the first
+  Riemann-solver kernel launch (different rank each run). A real fix needs
+  either lower rank density (topology change) or a transport redesign that
+  avoids Intel MPI's GPU-direct buffer pool — both out of scope for a
+  correctness-only prompt. Host-staged transport unaffected and remains
+  the only C512-viable transport. See `prompt_45_cuda_aware_correctness.md`.
 
 ## 10. Current Git / Working-Tree State
 
@@ -377,18 +400,26 @@ can run.
   explicit commit request): `cuda/interface/fv3_gpu_dyncore_bridge.F90`
   (`env_flag_enabled` helper + fusion/Graph env wiring),
   `cuda/interface/fv3_gpu_abi_mod.F90` (`fv3_gpu_set_cuda_graph_mode`).
-- Uncommitted source on `experiment/held-suarez-e2e` (Prompt 43, awaiting
-  explicit commit request — 2 substantial logical changes, at budget
-  ceiling): 8 files — 2 Fortran interface files (transport-selection/
-  capability-validation wiring: `cuda/interface/fv3_gpu_dyncore_bridge.F90`,
+- Uncommitted source on `experiment/held-suarez-e2e` (Prompt 43+45,
+  awaiting explicit commit request — 3 substantial logical changes, over
+  the informal per-prompt budget when counted cumulatively, but each
+  prompt's own 2-change ceiling was individually respected): 9 files —
+  2 Fortran interface files (transport-selection/capability-validation
+  wiring: `cuda/interface/fv3_gpu_dyncore_bridge.F90`,
   `fv3_gpu_abi_mod.F90`) + 6 C++/CUDA files (CUDA-aware transport backend:
   `cuda/dyn_core/{runtime/fv3_gpu_halo_mpi.cpp,runtime/fv3_gpu_runtime.cpp,
   include/fv3_gpu_halo_mpi.hpp,include/fv3_gpu_communication.h,
   benchmarks/run_small_perf_bench.cpp,
-  tests/integration/test_halo_mpi_transport.cu}`). Verified via a
+  tests/integration/test_halo_mpi_transport.cu}`, all Prompt 43) + 1 file
+  from Prompt 45 (`cuda/dyn_core/vertical/fv3_vertical_kernels.cu` —
+  `fail()`-wrapped early returns + `cudaGetErrorString()` embedding in
+  `launch_update_dz_d`/`launch_vertical_solver`, diagnostic-visibility
+  only, no numerical semantics changed). Prompt 43's diff verified via a
   `git stash push -u` + full rebuild + `git stash pop` + rebuild cycle
-  (job 58451786) that this diff is NOT the cause of the Stage 7 blocker
-  (§7/§9) — net 0 tracked-tree change from that diagnostic cycle.
+  (job 58451786) that it is NOT the cause of the Stage 7 blocker (§7/§9) —
+  net 0 tracked-tree change from that diagnostic cycle. Prompt 45's diff
+  confirmed via `git status --short`/`git diff --stat` to be the only
+  change made in that prompt; Prompt 43's 8 files confirmed untouched.
 - No production source files changed by Prompts 37-42 (38/41 diagnostic-
   only, no GPU job; 39/40 each ran one GPU job against existing unmodified
   binaries/harnesses; 40 changed only a runtime `OMPI_MCA_btl_vader_eager_
@@ -402,7 +433,14 @@ can run.
   `scratch_p43/` (sbatch scripts/job logs for the discriminator sequence,
   §7/§9), plus new experiment directories under
   `<fortran_perf>/experiments/` (`p43_bincheck_hoststaged/`,
-  `p43_c512_gate_cuda_aware/`, `p43_bincheck_headnodiff/`).
+  `p43_c512_gate_cuda_aware/`, `p43_bincheck_headnodiff/`). New untracked
+  from Prompt 44: `docs/agent_handoff/prompt_44_mapl_resource_race.md`.
+  New untracked from Prompt 45:
+  `docs/agent_handoff/prompt_45_cuda_aware_correctness.md`, `scratch_p45/`
+  (module-mismatch diagnostics, rebuild jobs, Stage 9 smoke/memory-polling
+  scripts and logs), and
+  `<fortran_perf>/experiments/p45_c512_cuda_aware_smoke/` (host_staged_out/,
+  cuda_aware_out/, cuda_aware_out2/, GPU memory-poll CSVs).
 - Untracked at repo root (both branches share the worktree): numerous
   scratch shell scripts/logs/probes from prior prompts, reusable tooling
   under `tools/` (savepoint validation — `compare_dcx_backends.py`,
@@ -419,29 +457,30 @@ can run.
 
 ## 11. Next Recommended Task
 
-**Active next task (Prompt 45 candidate): resume Prompt 43's remaining
-scope now that the MAPL startup blocker is fixed (Prompt 44).** Two
-independent paths, either can proceed now:
+**Active next task (Prompt 46 candidate): run the actual host-staged C512
+correctness gate.** MAPL startup is fixed (Prompt 44) and `cuda_aware` is
+now understood to be blocked by device memory capacity, not a fixable
+defect, at the current rank density (Prompt 45) — so the only remaining
+open C512 HS item is to run the real short correctness gate
+(savepoint/NetCDF T/U/V/PS comparison, not just startup) against
+`host_staged` transport, following §5's established methodology. This was
+not yet done under Prompts 43-45 (those focused on MAPL/transport
+diagnostics, not the gate itself).
 
-1. **Host-staged C512 correctness gate (Stages 7-9, low risk)** — the MAPL
-   blocker is fixed and 10/10-startup-verified; run the actual short C512
-   correctness gate (savepoint/NetCDF comparison, not just startup) against
-   `host_staged` transport, following §5's established methodology.
-2. **CUDA-aware transport fix (Prompt 43 Stage 6, now confirmed at C512
-   scale)**: `fv3_gpu_dyn_core_step failed` on rank 4,
-   `fv3_gpu_dyncore_bridge.F90:693`, no detail string. Needs source-level
-   investigation inside the CUDA-aware `MpiHaloTransport` dispatch path
-   (`cuda/dyn_core/*`, `cuda/interface/fv3_gpu_dyncore_bridge.F90`) —
-   Prompt 43's own uncommitted diff, still untouched/unmodified. Suggested
-   approach: add targeted logging around line 693 (what exactly fails —
-   device malloc, MPI call, kernel launch) rather than assuming Stage 6's
-   earlier 2-rank SIGSEGV and this C512 failure are the same bug without
-   evidence.
+**Deferred, out-of-scope-for-a-correctness-prompt follow-ons on
+`cuda_aware`** (confirm scope explicitly before starting either):
+1. Lower rank density for `cuda_aware` at C512 (e.g. fewer ranks/GPU across
+   multiple GPUs) — an MPI topology/decomposition change.
+2. Investigate Intel MPI GPU-buffer-pool sizing controls
+   (`I_MPI_*` env vars) to reduce `cuda_aware`'s extra device-memory
+   footprint without changing topology — worth a quick environment-only
+   probe before attempting either, but not yet investigated.
 
-See `prompt_44_mapl_resource_race.md` (MAPL fix + resume-gate evidence),
-`prompt_43_intelmpi_cuda_aware_ab.md` (transport implementation, Stage 6
-flag), and `prompt_42_hpcx_cuda_aware_environment.md` (environment-gate
-evidence; filename retained from original HPC-X scope).
+See `prompt_45_cuda_aware_correctness.md` (device-memory root cause),
+`prompt_44_mapl_resource_race.md` (MAPL fix + resume-gate evidence),
+`prompt_43_intelmpi_cuda_aware_ab.md` (transport implementation), and
+`prompt_42_hpcx_cuda_aware_environment.md` (environment-gate evidence;
+filename retained from original HPC-X scope).
 
 **Mainline (`cuda/gpu-bringup`) tracks — confirm scope with the user before
 starting any:**
@@ -513,6 +552,14 @@ when the current task requires that level of detail.
   10/10 C512 host-staged acceptance; C32 regression clean; `cuda_aware`
   resume gate confirms MAPL blocker cleared but surfaces a separate,
   Prompt-43-scope transport-layer failure at C512 scale (§7/§9/§11).
+- `prompt_45_cuda_aware_correctness.md` — made the transport failure
+  diagnosable (`cudaGetErrorString()` embedded in the FATAL message,
+  `fv3_vertical_kernels.cu`); root-caused it to device memory capacity
+  (six C512 ranks already at 96.4% of one A100's 40GB under the working
+  `host_staged` transport, `cuda_aware`'s extra Intel-MPI GPU-direct buffer
+  registration exceeds the ~1.5GB headroom); transport unit test 10/10 PASS
+  both modes; decision: do not resume Prompt 43's cuda_aware performance
+  A/B at the current rank density (§7/§9/§11).
 
 ---
 

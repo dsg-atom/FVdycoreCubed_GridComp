@@ -29,6 +29,14 @@
  * Everything numerical -- which cells, which ring, which rotation, which sign,
  * which donor slot a rotated seam reads -- comes from fv3_gpu_halo_exchange.hpp and
  * is shared verbatim with the in-process backend. See fv3_gpu_halo_transport.hpp.
+ *
+ * Prompt 43 adds "Stage 2": TransportMode::cuda_aware. Same tag scheme, same
+ * message count, same rank<->tile mapping, same slot_base() offsets into the
+ * SAME device send/recv buffers -- the only difference is that MPI_Isend/
+ * MPI_Irecv address those device buffers directly, skipping the D2H/H2D pair.
+ * Requires a CUDA-aware MPI runtime (verified for Intel MPI 2021.13 with
+ * I_MPI_OFFLOAD=1 in Prompt 42); construction fails clearly if the runtime does
+ * not report that capability rather than silently falling back to host-staged.
  * ------------------------------------------------------------------------- */
 
 #include "fv3_gpu_halo_transport.hpp"
@@ -37,22 +45,35 @@
 
 namespace fv3::gpu::halo {
 
-/* Construct the host-staged MPI transport for 1-based cubed-sphere `tile` on the
- * communicator given by its Fortran handle. Returns nullptr on failure, with a
- * caller-facing explanation written to `why` when it is non-null -- the reasons are
- * all configuration errors the caller can act on (MPI not initialized, communicator
- * not of size 6, this rank's tile not matching the rank->tile identity the
- * production decomposition requires).
+/* Prompt 43: which MPI halo transport variant to construct. Both share all
+ * topology/pack/unpack/tag logic; only the payload path differs. */
+enum class TransportMode { host_staged, cuda_aware };
+
+/* Construct an MPI halo transport of the given `mode` for 1-based cubed-sphere
+ * `tile` on the communicator given by its Fortran handle. Returns nullptr on
+ * failure, with a caller-facing explanation written to `why` when it is
+ * non-null. For TransportMode::host_staged the reasons are configuration
+ * errors (MPI not initialized, communicator not of size 6, this rank's tile
+ * not matching the rank->tile identity the production decomposition
+ * requires). For TransportMode::cuda_aware, construction additionally fails
+ * with an explanation if the linked MPI runtime does not report CUDA-buffer
+ * support (queried via MPIX_Query_cuda_support(), the exact discriminator
+ * validated against a real A100 in Prompt 42) -- there is no silent fallback
+ * to host_staged.
  *
  * Does NOT call MPI_Init. The caller owns MPI initialization and finalization.
  *
  * IS COLLECTIVE over `comm`: it queries size/rank and verifies the tile mapping
  * across ranks, so every rank of the communicator must call it. */
+HaloTransport *create_mpi_transport(int comm_fortran_handle, int32_t tile,
+                                    TransportMode mode, std::string *why) noexcept;
+
+/* Backward-compatible wrapper: create_mpi_transport(..., TransportMode::host_staged, ...). */
 HaloTransport *create_mpi_host_staged_transport(int comm_fortran_handle, int32_t tile,
                                                std::string *why) noexcept;
 
-/* Destroy a transport returned above. Does not call MPI_Finalize and does not free
- * the communicator, which the caller still owns. */
+/* Destroy a transport returned by either constructor above. Does not call
+ * MPI_Finalize and does not free the communicator, which the caller still owns. */
 void destroy_mpi_host_staged_transport(HaloTransport *t) noexcept;
 
 }  // namespace fv3::gpu::halo

@@ -344,7 +344,7 @@ void exchange_group(HaloTransport *tr, const TopologyView &topo, uint32_t group,
         "pack succeeded");
 
   const int rc = tr->transfer(spec, geom, topo, send, recv, stream, &err, api);
-  check(rc == FV3_GPU_SUCCESS, "MPI host-staged transfer succeeded");
+  check(rc == FV3_GPU_SUCCESS, "MPI transfer succeeded");
   if (rc != FV3_GPU_SUCCESS) std::printf("  [rank %d] transfer: %s\n", my_rank, err.message);
 
   check(launch_halo_unpack(spec, geom, topo, fields, recv, stream, &err) == FV3_GPU_SUCCESS,
@@ -531,10 +531,31 @@ int main(int argc, char **argv) {
   dbg = std::getenv("FV3_HALO_TEST_DEBUG") != nullptr;
   legacy_setup = std::getenv("FV3_HALO_TEST_LEGACY_SETUP") != nullptr;
 
+  /* Prompt 43 Stage 6: which HaloTransport backend this run exercises. Default
+   * unchanged (host_staged); FV3_HALO_TEST_TRANSPORT=cuda_aware selects the
+   * device-pointer path added for the C512 A/B. Same test, same verification
+   * logic, only the transport under test changes -- create_mpi_transport()
+   * itself refuses (no silent fallback) if cuda_aware is requested and the MPI
+   * runtime lacks CUDA-buffer support (e.g. I_MPI_OFFLOAD=1 not set). */
+  TransportMode transport_mode = TransportMode::host_staged;
+  if (const char *tm = std::getenv("FV3_HALO_TEST_TRANSPORT")) {
+    if (std::string(tm) == "cuda_aware") transport_mode = TransportMode::cuda_aware;
+    else if (std::string(tm) != "host_staged" && std::string(tm) != "") {
+      if (my_rank == 0)
+        std::printf("FAIL: unknown FV3_HALO_TEST_TRANSPORT=%s (want host_staged or "
+                    "cuda_aware)\n", tm);
+      MPI_Finalize();
+      return 1;
+    }
+  }
+
   if (my_rank == 0) {
     std::printf("=== Milestone 3A.15 six-rank MPI halo transport ===\n");
     std::printf("Precision: %s (sizeof(fv_real)=%zu), %d ranks, one tile each\n",
                 sizeof(fv_real) == 8 ? "R8" : "R4", sizeof(fv_real), size);
+    std::printf("Transport requested: %s\n",
+                transport_mode == TransportMode::cuda_aware ? "cuda_aware"
+                                                              : "host_staged");
     std::printf("Diagnostics: debug=%s  device-buffer setup=%s\n", dbg ? "ON" : "off",
                 legacy_setup ? "LEGACY STREAM (3A.18 defect reproduction)"
                              : "stream-ordered on the exchange stream");
@@ -600,13 +621,15 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  /* Collective: the factory queries size/rank and gathers the rank->tile map. */
+  /* Collective: the factory queries size/rank and gathers the rank->tile map.
+   * No silent fallback: if cuda_aware was requested and this MPI runtime lacks
+   * CUDA-buffer support, create_mpi_transport() returns null with `why` set
+   * rather than substituting host_staged. */
   std::string why;
-  HaloTransport *tr = create_mpi_host_staged_transport(
-      MPI_Comm_c2f(MPI_COMM_WORLD), my_tile, &why);
+  HaloTransport *tr = create_mpi_transport(
+      MPI_Comm_c2f(MPI_COMM_WORLD), my_tile, transport_mode, &why);
   if (!tr) {
-    std::printf("  [rank %d] FAIL: create_mpi_host_staged_transport: %s\n", my_rank,
-                why.c_str());
+    std::printf("  [rank %d] FAIL: create_mpi_transport: %s\n", my_rank, why.c_str());
     MPI_Abort(MPI_COMM_WORLD, 1);
     return 1;
   }
@@ -642,9 +665,11 @@ int main(int argc, char **argv) {
     if (global[1]) {
       std::printf("Six-rank MPI halo transport: FAIL\n");
     } else {
-      std::printf("Six-rank MPI halo transport: PASS\n");
+      std::printf("Six-rank MPI halo transport: PASS (%s)\n",
+                  transport_mode == TransportMode::cuda_aware ? "cuda_aware" : "host_staged");
       std::printf("  * GPU EXECUTED across SIX SEPARATE MPI PROCESSES: pack,\n");
-      std::printf("    host-staged MPI transfer and seam-transforming unpack ran on a\n");
+      std::printf("    %s MPI transfer and seam-transforming unpack ran on a\n",
+                  transport_mode == TransportMode::cuda_aware ? "cuda-aware" : "host-staged");
       std::printf("    real device on every rank, and every received value was decoded\n");
       std::printf("    back to its originating tile, index and sign.\n");
       std::printf("  * Covered: scalar, both wind staggerings, 4-field width-3\n");
