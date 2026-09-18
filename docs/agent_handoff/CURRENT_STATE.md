@@ -1,17 +1,18 @@
 # Current Project State
 
-_Last updated 2026-09-17 (Prompt 39: C512 PeerHalo-vs-MPI discriminator,
-branch `experiment/held-suarez-e2e`, diagnostic-only — 1 new GPU job,
-existing `fv3_gpu_perf_bench` harness, no source changes. Result: the
-in-process `PeerHaloTransport` path scales C256->C512 at 3.69x (below
-even the Fortran path's 5.72x), while the six-rank `MpiHaloTransport`
-path collapses at 8.32x — isolating Prompt 37/38's C512 CUDA/Fortran=
-1.270 regression to the MPI transport/protocol layer specifically, not
-the shared device-side halo pack/unpack/staging code. CUDA-aware-MPI
-priority MODERATE(contingent)->HIGH CANDIDATE. One next experiment
-recommended (OpenMPI eager/rendezvous MCA threshold sweep at C512), not
-yet run. See §6/§8a/§9/§11 and `prompt_39_c512_peerhalo_discriminator.md`.
-This file holds current truth only._
+_Last updated 2026-09-17 (Prompt 40: C512 OpenMPI eager/rendezvous MCA
+threshold A/B test, branch `experiment/held-suarez-e2e`, 1 new GPU job
+(58445328), runtime-config-only — 0 source changes. Active transport for
+the six-rank same-node `MpiHaloTransport` job = `vader` (shared memory).
+Factory-default thresholds (eager 4096B/rendezvous 32768B) already sit
+far below both C256 (~67.8KB) and C512 (~135.4KB) messages, so no
+unique-to-C512 crossover exists under defaults. Raising
+`btl_vader_eager_limit` to 145000B or 524288B did NOT improve C512
+timing (+1.4-1.6% slower, not faster) — Decision Case B: **EAGER/
+RENDEZVOUS THRESHOLD NOT SUFFICIENT**. CUDA-aware-MPI priority confirmed
+**HIGH** (via elimination). One next experiment: CUDA-aware MPI A/B
+transport test at C512, not yet run. See §6/§8a/§9/§11 and
+`prompt_40_c512_mpi_protocol_ab.md`. This file holds current truth only._
 
 ## 1. Project Goal
 
@@ -176,12 +177,15 @@ Full field-by-field tables: `prompt_6b_cuda_fortran_validation.md`,
   Default Fortran path unchanged.
 - CUDA-aware MPI (Stage 2) and comm/compute overlap (Stage 3): unimplemented
   future work. Priority was LOW at C32-C128 (§8), MODERATE (contingent) at
-  C256/C512 after Prompt 38, and **raised to HIGH CANDIDATE after Prompt
-  39's discriminator isolated the C512 regression to the MPI transport
-  layer specifically** (in-process `PeerHaloTransport` scales normally at
-  C512; six-rank `MpiHaloTransport` does not) — see §8a/§9. Still not
-  implemented; one MCA-threshold discriminator recommended before any
-  implementation begins.
+  C256/C512 after Prompt 38, HIGH CANDIDATE after Prompt 39's PeerHalo-vs-
+  MPI discriminator isolated the C512 regression to the MPI transport
+  layer specifically, and **confirmed HIGH after Prompt 40's OpenMPI
+  eager/rendezvous MCA threshold A/B test found the runtime-tunable
+  protocol crossover NOT SUFFICIENT to explain the regression** (active
+  transport = `vader`; raising `btl_vader_eager_limit` above the C512
+  message size made timing mildly worse, not better) — see §8a/§9. Still
+  not implemented; the recommended next experiment is now a CUDA-aware
+  MPI A/B transport test at C512.
 
 ## 7. Standalone Integration Status
 
@@ -286,12 +290,27 @@ Fortran path's own 5.72x growth, and far below the six-rank
 C512 while MpiHaloTransport collapses, isolating the regression to the
 **MPI transport/protocol layer specifically**, not the shared device-side
 pack/unpack/staging mechanism. **CUDA-aware-MPI priority raised
-MODERATE(contingent)->HIGH CANDIDATE.** One next experiment recommended
-(OpenMPI eager/rendezvous MCA-threshold sweep at C512 vs. the 9089.05
-ms/call baseline), not yet run — see `prompt_39_c512_peerhalo_
-discriminator.md`. No optimization/CUDA-aware-MPI implementation
-attempted; numerical source unchanged; correctness (§9a) BITWISE,
-unaffected.
+MODERATE(contingent)->HIGH CANDIDATE.**
+
+**MCA threshold A/B tested (Prompt 40)**: 1 new GPU job (58445328),
+runtime-config-only, 0 source changes. Active transport for the
+six-rank same-node job confirmed = `vader` (no `smcuda`/`openib` in this
+OpenMPI 4.1.6 build). Both `btl_vader_eager_limit` (4096B) and
+`rndv_eager_limit` (32768B) factory defaults already sit far below the
+C256/C512 message sizes — no unique-to-C512 crossover under defaults.
+Reran the unmodified C512 job (2 reps/setting) with
+`btl_vader_eager_limit` raised to 145000B and 524288B: both mildly
+SLOWER than default, not faster (`DYN_CORE` ms/call: default 6393.83,
++1.59%/+1.44%; `COMM_DSW`: default 1032.52, +1.37%/+1.57%). Decision
+Case B: **EAGER/RENDEZVOUS THRESHOLD NOT SUFFICIENT**. (Baseline ran
+~30% faster in absolute terms than Prompt 37's historical figure, traced
+to node-to-node hardware variance — `warpa005` vs. `warpa009` — not a
+config defect; uniform across all 3 settings tested, so the internal
+A/B comparison remains valid.) **CUDA-aware-MPI priority confirmed
+HIGH**. One next experiment: CUDA-aware MPI A/B transport test at C512,
+not yet run — see `prompt_40_c512_mpi_protocol_ab.md`. No optimization/
+CUDA-aware-MPI implementation attempted in Prompt 39 or 40; numerical
+source unchanged; correctness (§9a) BITWISE, unaffected.
 
 ## 9. Known Limitations / Unvalidated Envelope
 
@@ -306,9 +325,12 @@ unaffected.
   `DYN_CORE` delta (Prompt 38), and the in-process `PeerHaloTransport`
   path — which shares all device-side pack/unpack code with
   `MpiHaloTransport` — scales normally at C512 (3.69x) while the six-rank
-  MPI path collapses (8.32x). One MCA-threshold discriminator recommended
-  before any CUDA-aware-MPI implementation (§8a/§11). No fix attempted.
-  Do not assume CUDA competitive above C256 without remeasuring.
+  MPI path collapses (8.32x). **MCA eager/rendezvous threshold A/B test
+  (Prompt 40) found runtime protocol tuning NOT SUFFICIENT** (both
+  alternative thresholds tested were mildly slower, not faster) —
+  CUDA-aware MPI A/B transport test is now the recommended next
+  experiment (§8a/§11). No fix attempted. Do not assume CUDA competitive
+  above C256 without remeasuring.
 - `MOIST_CAPPA`/`USE_COND`: **confirmed UNIMPLEMENTED in CUDA** (Prompt 30)
   — triple-gated rejection, by design predating this prompt (milestone
   3A.9). Closing needs the Riemann-solver `peg`/`gm2`/`cp2` terms
@@ -396,11 +418,16 @@ not fixed).
   performance scaling"), also not pushed. Push/merge only on explicit
   request. Prompts 35-38's `docs/agent_handoff/*.md` and this
   `CURRENT_STATE.md` update are uncommitted, awaiting explicit commit
-  request. No source files changed in Prompt 37, 38, or 39 (38 was
+  request. No source files changed in Prompt 37, 38, 39, or 40 (38 was
   diagnostic-only: static derivation + reads of existing logs, no job
   submitted; 39 ran one new GPU job against the existing, unmodified
-  `fv3_gpu_perf_bench` binary — no file under `cuda/`/`include/` or the
-  Fortran fixture tree touched in either).
+  `fv3_gpu_perf_bench` binary; 40 ran one new GPU job reusing the
+  unmodified `p37_c512_perf_cuda` job directory, changing only the
+  `OMPI_MCA_btl_vader_eager_limit` runtime env var — no file under
+  `cuda/`/`include/` or the Fortran fixture tree touched in any of the
+  three). New untracked file from Prompt 40: `<fortran_perf>/experiments/
+  p40_c512_mca_ab.sbatch` (job script only; per-rep logs live under
+  `p37_c512_perf_cuda/perf_logs_p40_mca/`, not committed).
 - Uncommitted source on `cuda/gpu-bringup` (Prompt 28+29, awaiting explicit
   commit request): `cuda/interface/fv3_gpu_dyncore_bridge.F90`
   (`env_flag_enabled` helper + fusion/Graph env wiring),
@@ -437,21 +464,20 @@ Until 1 or 2 closes, "broader GEOS integration" remains bounded to the
 already-validated production first-run subset (`hord_*=±6`, `grid_type=0`,
 `hydrostatic=false`, `a_imp=1.0`, `use_cond=moist_cappa=0`).
 
-**HS track — Prompt 39 isolated the C512 performance regression (§8a/§9)
-to the MPI transport/protocol layer specifically**, via the PeerHalo-vs-
-MPI discriminator. C512 correctness remains BITWISE (§9a, unaffected).
-Highest-priority open HS-track item, now narrowed to one specific MCA-
-level next experiment (below), ahead of any CUDA-aware-MPI implementation.
+**HS track — Prompt 40's MCA threshold A/B test found runtime OpenMPI
+protocol tuning NOT SUFFICIENT** to explain the C512 regression (§8a/§9).
+C512 correctness remains BITWISE (§9a, unaffected). CUDA-aware MPI is now
+the recommended next experiment, ahead of any implementation work.
 
 Open HS-track follow-ons (confirm scope before starting):
-1. **Run the recommended MCA-threshold discriminator**: rerun the
-   existing six-rank `MpiHaloTransport` C512 job (Prompt 37) under an
-   alternative OpenMPI eager/rendezvous-limit MCA setting (raised above
-   C512's ~135.4KB ordinary message size) and compare `COMM_DSW`/
-   `DYN_CORE` timing against the 9089.05 ms/call baseline — pure runtime
-   config, no source change. Confirms or refutes the eager/rendezvous
-   crossover before CUDA-aware MPI (now HIGH CANDIDATE) is implemented.
-   See `prompt_39_c512_peerhalo_discriminator.md`.
+1. **CUDA-aware MPI A/B transport test at C512** (recommended, not yet
+   run): compare the six-rank `MpiHaloTransport` C512 job against a
+   CUDA-aware-MPI-enabled transport variant (GPU-pointer MPI calls
+   instead of host-staged pack/D2H/MPI/H2D/unpack) to determine whether
+   GPUDirect/CUDA-aware transport recovers the regression. PeerHalo
+   compute, generic pack/unpack, and protocol/threshold tuning are all
+   now exonerated (Prompts 39/40) — this is the next discriminator, not
+   an implementation commitment. See `prompt_40_c512_mpi_protocol_ab.md` §7.
 2. **C256/C512 climatology / longer duration** — only short gates have run
    at either (§9a); no multi-day run attempted.
 3. **Further duration at C128** toward the ~200+ day HS-literature
@@ -519,6 +545,16 @@ only when the current task requires that level of detail (per
   priority MODERATE->HIGH CANDIDATE; halo sub-timers NOT AVAILABLE in
   harness; 1 recommended MCA-threshold-sweep next experiment, not
   implemented.
+- `prompt_40_c512_mpi_protocol_ab.md` — 1 GPU job (58445328), runtime-
+  MCA-config-only, 0 source changes; active transport = `vader`; both
+  C256/C512 messages already exceed factory-default eager/rendezvous
+  thresholds; A/B tested `btl_vader_eager_limit`=145000B/524288B vs.
+  default — both mildly SLOWER (+1.4-1.6%), Decision Case B: EAGER/
+  RENDEZVOUS THRESHOLD NOT SUFFICIENT; baseline -29.7% vs. historical
+  figure traced to node hardware variance (`warpa005` vs. `warpa009`),
+  immaterial to the internal A/B comparison; CUDA-aware-MPI priority
+  confirmed HIGH; next experiment = CUDA-aware-MPI A/B transport test,
+  not implemented.
 
 ---
 
