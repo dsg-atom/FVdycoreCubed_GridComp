@@ -1,41 +1,30 @@
 # Current Project State
 
-_Last updated 2026-09-18 (Prompt 45: root-caused the C512 `cuda_aware`
-`MpiHaloTransport` correctness failure left open by Prompt 44 —
-**DEVICE MEMORY CAPACITY, not a synchronization/pointer/lifetime defect.**
-**Fix (1 file, `cuda/dyn_core/vertical/fv3_vertical_kernels.cu`)**: the
-FATAL error path (`fv3_gpu_dyn_core_step failed`) previously discarded the
-actual failure detail — several early returns in `launch_update_dz_d`/
-`launch_vertical_solver` used bare enum returns instead of the project's
-`fail(error, code, api, message, native_code)` mechanism, and the two
-`cudaGetLastError()` checks discarded the captured error code/string.
-Wrapped all of them with `fail(...)` and embedded `cudaGetErrorString()`
-directly into the message (the Fortran bridge prints `api`+`message`, not
-`native_code`). With the real message visible, the crash reads
-`riem_solver3_kernel launch failed: out of memory`
-(`cudaErrorMemoryAllocation`). **Root cause, confirmed via `nvidia-smi`
-memory polling (job 58453867)**: six C512 ranks on one A100 already use
-**39466/40960 MiB (96.4%)** under the working `host_staged` transport —
-under 1.5GB headroom. `cuda_aware`'s Intel-MPI-runtime GPU-direct/RDMA
-buffer registration (`I_MPI_OFFLOAD=1`) needs device memory on top of that
-already-near-full baseline; the transport's own code
-(`fv3_gpu_halo_mpi.cpp`) makes zero extra `cudaMalloc` calls, so the extra
-consumption is Intel MPI's own runtime pool, external to this project's
-code. Different rank fails each run (PE 4/1/2/1 across 4 observed runs) —
-consistent with a genuine resource-exhaustion race, not rank-specific logic.
-**Transport unit test: 10/10 PASS** (6-rank ctest, both transport modes,
-16692 checks/run, 0 failures) — confirms the transport logic itself is
-correct at small buffer sizes; the failure is specific to C512's
-already-near-full device memory footprint. **C512 smoke (2 simulated
-hours)**: `host_staged` PASSED cleanly (job 58453614 step .0); `cuda_aware`
-FAILED at the very first Riemann-solver kernel launch during
-initialization, every attempt. No numerical comparison possible (cuda_aware
-never reaches a comparable state). **Decision: do NOT resume Prompt 43's
-cuda_aware performance A/B at C512 under the current six-ranks-per-A100
-density** — this is a real device memory ceiling, not a fixable software
-defect within Prompt 43's or Prompt 45's scope; `host_staged` remains the
-only C512-viable transport. See §7/§9/§11 and
-`prompt_45_cuda_aware_correctness.md`. This file holds current truth only._
+_Last updated 2026-09-18 (Prompt 46: tested Prompt 45's device-memory-
+capacity finding by lowering C512 rank density from 6-ranks/1-A100 to
+3-ranks/GPU across 2 A100s (`CUDA_VISIBLE_DEVICES=0,1`, existing
+`dev = mod(comm_rank, device_count)` round-robin, no source change — same
+6 ranks/6 tiles/1 tile-per-rank FV3 decomposition throughout).
+**Result: `cuda_aware` transport is now VIABLE (no OOM)** — job 58456709
+completed the full 6h C512 gate cleanly, peak GPU memory only ~5053
+MiB/GPU (12.3% of an A100), vs. Prompt 45's 96.4%-utilized crisis at
+1-GPU density. Numerically BITWISE identical to `host_staged` at the same
+density. **But performance is NOT significant**: paired 3-pair A/B (job
+58458525, same allocation, alternating transport) shows `DYN_CORE`
+median-of-3 ms/call 4701.72 (`host_staged`) vs 4700.39 (`cuda_aware`) —
+0.03% difference; `COMM_DSW`/`COMM_TOTAL` favor `cuda_aware` by only
+1.5-2.3%. **Decision: Case C — VIABLE BUT NOT PERFORMANCE-SIGNIFICANT;
+keep `host_staged` as the C512 default** (simpler, no Intel-MPI GPU-direct
+dependency, equally fast at this density). **Notable side finding (informal,
+not a controlled same-node A/B)**: 2-GPU `host_staged` itself measures
+~4702 ms/call `DYN_CORE` vs. Prompt 37's 1-GPU figure of 9089.05 ms/call —
+suggesting the C512 CUDA-vs-Fortran regression (§6/§7) may be substantially
+a per-GPU rank-density/contention effect, not solely MPI-transport-protocol
+cost growth. Flagged as the top candidate for a dedicated future prompt,
+not investigated further here (topology-change territory, out of Prompt
+46's scope). See §7/§9/§11 and
+`prompt_46_c512_two_gpu_cuda_aware_ab.md`. This file holds current truth
+only._
 
 ## 1. Project Goal
 
@@ -228,59 +217,35 @@ Full tables/reconciliation: `prompt_34_c32_perf_reconciliation.md`,
 `prompt_36_c256_correctness_performance.md`,
 `prompt_37_c512_correctness_performance.md`.
 
+**Informal 2-GPU data point (Prompt 46, not a controlled A/B against the
+row above — different job/possibly different node)**: at 3-ranks/GPU
+across 2 A100s, C512 `DYN_CORE` drops to ~4701 ms/call for both
+`host_staged` and `cuda_aware` — roughly half the 1-GPU-density figure
+above and, if it held under a controlled comparison, would flip the C512
+regression into a large CUDA win. Not yet formally re-measured; see §7
+Prompt 46 and `prompt_46_c512_two_gpu_cuda_aware_ab.md` §7.
+
 ## 7. C512 Root-Cause Track (Prompts 38-40)
 
-- **Prompt 38 (diagnostic-only, 0 new jobs)**: root cause is message-size-
-  regime-driven disproportionate halo-transport cost growth — C256
-  ordinary msg ≈67.8KB, C512 ≈135.4KB (~2x), but `COMM_DSW`'s CUDA-Fortran
-  delta grows 19.5x. CUDA-aware-MPI priority LOW -> MODERATE (contingent).
-  See `prompt_38_c512_comm_root_cause.md`.
-- **Prompt 39 (1 GPU job, job 58445168)**: in-process `PeerHaloTransport`
-  (shares all topology/pack/unpack code with `MpiHaloTransport`) run at
-  C256/C512 via `fv3_gpu_perf_bench`. PeerHalo C256->C512 growth = **3.69x**
-  — healthy, below Fortran's own 5.72x growth — while the six-rank
-  `MpiHaloTransport` path grows **8.32x** and collapses. **Isolates the
-  regression to the MPI transport/protocol layer specifically**, not the
-  shared device-side pack/unpack/staging mechanism. Priority ->
-  HIGH CANDIDATE. See `prompt_39_c512_peerhalo_discriminator.md`.
-- **Prompt 40 (1 GPU job, job 58445328, runtime-config-only, 0 source
-  changes)**: OpenMPI 4.1.6; active same-node transport confirmed =
-  **`vader`** (no `smcuda`/`openib` in this build). Factory-default
-  eager (4096B)/rendezvous (32768B) thresholds already sit far below both
-  C256 (~67.8KB) and C512 (~135.4KB) messages — both already on the
-  rendezvous/pipelined path under defaults, no unique-to-C512 crossover.
-  Raised `btl_vader_eager_limit` to 145000B and 524288B (2 reps each): both
-  mildly **SLOWER**, not faster (+1.4-1.6% on `DYN_CORE`/`COMM_DSW`).
-  **Decision Case B: EAGER/RENDEZVOUS THRESHOLD NOT SUFFICIENT.**
-  **CUDA-aware-MPI priority confirmed HIGH.** See
-  `prompt_40_c512_mpi_protocol_ab.md`.
-
-- **Prompt 41 (0 GPU jobs, 0 source changes, SUPERSEDED by Prompt 42)**:
-  found OpenMPI 4.1.6 (the "validated" dev stack) has no CUDA-aware build
-  (`opal_built_with_cuda_support=false`); true for OpenMPI 4.1.6 but
-  answering the wrong question — that library isn't what the real C512
-  job uses. See `prompt_41_c512_cuda_aware_mpi_ab.md`.
-- **Prompt 42 correction + redirect (1 GPU job, job 58450084, 0 production
-  source changes)**: discovered (via `CMakeCache.txt`/`ldd`/`g5_modules`/
-  the actual p37 job log) that the real C256/C512 six-rank job runs under
-  **Intel MPI 2021.13**, not OpenMPI — so Prompt 40's MCA eager-limit sweep
-  was inert (`OMPI_MCA_*` vars are not read by Intel MPI; its ±1.4-1.6%
-  deltas were noise, not a real threshold test) and Prompt 41's "CUDA-aware
-  MPI blocked" finding, while true for OpenMPI 4.1.6, was answering the
-  wrong question — Intel MPI was never evaluated. User approved redirecting
-  Prompt 42 to Intel MPI in place of the originally-planned HPC-X
-  evaluation. New standalone 2-rank device-buffer `MPI_Send`/`MPI_Recv`
-  test (`scratch_p42/intelmpi_cuda_aware_test.cu`) run on a real A100
-  (job 58450084, `warpa003`, rc=0): **PASS** at 4KB, 135KB (exact C512
-  ordinary-group halo message size), and 256KB when `I_MPI_OFFLOAD=1` is
-  set (`MPIX_Query_cuda_support()==1`, `libfabric provider: mlx`); **SIGSEGV**
-  without it. Because this is already the same Intel MPI 2021.13 linked
-  into `build_cuda_r8_intelmpi`/the production `StandAlone_FV3_Dycore.x`
-  (§2), no toolchain migration, no new build, no ABI risk.
-  **Classification: CUDA-AWARE MPI ENVIRONMENT PASS (Intel MPI 2021.13).**
-  Prompt 39's PeerHalo-vs-MPI discriminator (root cause = MPI transport/
-  protocol layer, not generic GPU halo work) is unaffected by this
-  correction. See `prompt_42_hpcx_cuda_aware_environment.md`.
+- **Prompts 38-42 (diagnostic chain, condensed — full detail in their own
+  files)**: 38 root-caused message-size-driven halo-transport cost growth
+  (C256->C512 msg ~2x, but CUDA-Fortran `COMM_DSW` delta grows 19.5x). 39
+  (job 58445168) isolated the regression to the **MPI transport/protocol
+  layer specifically** — in-process `PeerHaloTransport` (shares all
+  topology/pack/unpack code with `MpiHaloTransport`) scales healthily
+  (3.69x C256->C512, below Fortran's own 5.72x) while six-rank
+  `MpiHaloTransport` grows 8.32x and collapses. 40 (job 58445328) ruled out
+  OpenMPI eager/rendezvous threshold tuning (mildly slower, not faster).
+  41 found OpenMPI 4.1.6 has no CUDA-aware build — **superseded by 42**,
+  which discovered the real C256/C512 job actually runs under **Intel MPI
+  2021.13**, not OpenMPI (so 40's OpenMPI MCA sweep was inert and 41
+  answered the wrong question); a standalone 2-rank device-buffer test
+  (job 58450084) confirmed Intel MPI CUDA-aware PASS at the exact C512
+  halo message size with `I_MPI_OFFLOAD=1` (SIGSEGV without it) — same
+  Intel MPI already linked into production, no toolchain/ABI risk.
+  **CUDA-aware-MPI priority: HIGH, environment PASS.** See
+  `prompt_38_c512_comm_root_cause.md` through
+  `prompt_42_hpcx_cuda_aware_environment.md`.
 
 - **Prompt 43 (implementation, 0 net source changes beyond the existing
   Stage 0-5 diff)**: implemented the
@@ -316,17 +281,34 @@ Full tables/reconciliation: `prompt_34_c32_perf_reconciliation.md`,
   working transport). **Decision: do not resume Prompt 43's cuda_aware
   performance A/B at the current 6-ranks-per-A100 density.** See
   `prompt_45_cuda_aware_correctness.md`.
+- **Prompt 46 (3 GPU jobs — 58454451, 58456709, 58458525 — 0 source
+  changes, GPU-placement-only via `CUDA_VISIBLE_DEVICES=0,1`)**: tested
+  Prompt 45's deferred follow-on #1 (lower rank density). At 3-ranks/GPU
+  across 2 A100s: `host_staged` 2-GPU correctness confirmed (BITWISE vs.
+  1-GPU baseline); `cuda_aware` **no longer OOMs** (peak ~5053 MiB/GPU,
+  12.3% of capacity, vs. Prompt 45's 96.4%) and is BITWISE-identical to
+  `host_staged`; paired 3-pair performance A/B on the same allocation
+  shows `DYN_CORE` median-of-3 ms/call 4701.72 (`host_staged`) vs 4700.39
+  (`cuda_aware`) — 0.03% difference, `COMM_DSW`/`COMM_TOTAL` favor
+  `cuda_aware` by only 1.5-2.3%. **Decision Case C: VIABLE BUT NOT
+  PERFORMANCE-SIGNIFICANT — keep `host_staged` as the C512 default.**
+  Notable side finding (informal, not a controlled A/B): 2-GPU
+  `host_staged` itself runs at ~4701 ms/call vs. Prompt 37's 1-GPU figure
+  of 9089.05 ms/call — a ~2x gap suggesting the C512 regression (§6) may
+  be substantially a per-GPU rank-density effect, not solely MPI-transport
+  protocol cost; flagged, not investigated further (out of scope). See
+  `prompt_46_c512_two_gpu_cuda_aware_ab.md`.
 
-Numerical correctness (§5) unaffected by any of Prompts 38-45 — no
+Numerical correctness (§5) unaffected by any of Prompts 38-46 — no
 production source changed, C512 remains BITWISE PASS as of that
-validation. **Preferred C512 transport remains HOST-STAGED** — correctness-
-gate-ready (10/10 startup PASS, Prompt 44) and the only C512-viable
-transport. The `cuda_aware` variant (Prompt 43) is environment-viable
-(Prompt 42) and no longer blocked by MAPL, but is now understood to be
-blocked by device memory capacity at C512's current 6-ranks-per-A100
-density (Prompt 45) — not a software defect fixable without changing rank
-density or the transport's MPI memory strategy, both out of scope for
-correctness-only prompts.
+validation. **Preferred C512 transport remains HOST-STAGED** at any tested
+density — correctness-gate-ready (10/10 startup PASS, Prompt 44) and
+simpler than `cuda_aware`. The `cuda_aware` variant is now confirmed
+environment-viable (Prompt 42), correctness-viable at 2-GPU density
+(Prompt 46), and numerically bitwise-equivalent to `host_staged` — but not
+performance-significant at 2-GPU density (Prompt 46), so it does not
+displace `host_staged` as the default. At the original 6-ranks/1-GPU
+density it remains blocked by device memory capacity (Prompt 45).
 
 ## 8. Standalone Integration Status
 
@@ -359,9 +341,9 @@ correctness-only prompts.
 - CUDA MPS (`fv3_mps_lifecycle.sh`) requires `compute_mode=Default` (true
   on Discover `gpu_a100`); not yet wired into every standing job script as
   the default.
-- Multi-GPU (`dev = mod(comm_rank, device_count)`) implemented but
-  validated only at 2 GPUs/3 contexts-per-GPU; 4-GPU and MPS+multi-GPU
-  composition unmeasured.
+- Multi-GPU (`dev = mod(comm_rank, device_count)`) validated at C512 scale
+  at 2 GPUs/3-ranks-per-GPU (Prompt 46, both transports, correctness +
+  performance); 4-GPU and MPS+multi-GPU composition still unmeasured.
 - `install/bin/StandAlone_FV3_Dycore.x` and per-experiment binary copies
   not auto-synced with `build/bin/` after rebuild — always refresh and
   verify via `strings` before trusting a new flag.
@@ -376,17 +358,13 @@ correctness-only prompts.
   C512 was, and remains, a useful red flag worth checking logs for even
   post-fix (a healthy run takes the full requested walltime to make
   partial progress, or exits `rc=0` cleanly at a natural end-of-run).
-- **`cuda_aware` MpiHaloTransport BLOCKED by device memory capacity, not a
-  software defect (root-caused Prompt 45)**: six C512 ranks on one A100
-  already run at 96.4% device memory utilization (39466/40960 MiB) under
-  the working `host_staged` transport; `cuda_aware`'s additional Intel-MPI
-  GPU-direct/RDMA buffer registration exceeds the remaining ~1.5GB
-  headroom, crashing with `cudaErrorMemoryAllocation` at the first
-  Riemann-solver kernel launch (different rank each run). A real fix needs
-  either lower rank density (topology change) or a transport redesign that
-  avoids Intel MPI's GPU-direct buffer pool — both out of scope for a
-  correctness-only prompt. Host-staged transport unaffected and remains
-  the only C512-viable transport. See `prompt_45_cuda_aware_correctness.md`.
+- **`cuda_aware` MpiHaloTransport at C512**: blocked by device memory
+  capacity at the original 6-ranks/1-A100 density (`cudaErrorMemoryAllocation`,
+  Prompt 45); **confirmed viable and BITWISE-correct at 3-ranks/GPU across
+  2 A100s (Prompt 46)**, but not performance-significant there (<2.5%
+  delta vs. `host_staged` on any metric) — `host_staged` remains the
+  recommended default at any density. See
+  `prompt_45_cuda_aware_correctness.md`, `prompt_46_c512_two_gpu_cuda_aware_ab.md`.
 
 ## 10. Current Git / Working-Tree State
 
@@ -440,7 +418,15 @@ correctness-only prompts.
   (module-mismatch diagnostics, rebuild jobs, Stage 9 smoke/memory-polling
   scripts and logs), and
   `<fortran_perf>/experiments/p45_c512_cuda_aware_smoke/` (host_staged_out/,
-  cuda_aware_out/, cuda_aware_out2/, GPU memory-poll CSVs).
+  cuda_aware_out/, cuda_aware_out2/, GPU memory-poll CSVs). New untracked
+  from Prompt 46 (0 CUDA-dev-repo source files touched, GPU-placement-only
+  via `CUDA_VISIBLE_DEVICES`):
+  `docs/agent_handoff/prompt_46_c512_two_gpu_cuda_aware_ab.md`, and under
+  `<fortran_perf>/experiments/`: `p46_c512_2gpu_host_staged{,.sbatch}/`,
+  `p46_c512_2gpu_cuda_aware{,.sbatch}/`, `p46_c512_2gpu_perf/` (incl.
+  `fv3.j`, `perf_logs/pair{1,2,3}_{host_staged,cuda_aware}.log`),
+  `p46_c512_2gpu_perf_ab.sbatch`, job `.out` files and GPU-memory-poll CSVs
+  for jobs 58454451/58456709/58458525.
 - Untracked at repo root (both branches share the worktree): numerous
   scratch shell scripts/logs/probes from prior prompts, reusable tooling
   under `tools/` (savepoint validation — `compare_dcx_backends.py`,
@@ -457,30 +443,29 @@ correctness-only prompts.
 
 ## 11. Next Recommended Task
 
-**Active next task (Prompt 46 candidate): run the actual host-staged C512
-correctness gate.** MAPL startup is fixed (Prompt 44) and `cuda_aware` is
-now understood to be blocked by device memory capacity, not a fixable
-defect, at the current rank density (Prompt 45) — so the only remaining
-open C512 HS item is to run the real short correctness gate
-(savepoint/NetCDF T/U/V/PS comparison, not just startup) against
-`host_staged` transport, following §5's established methodology. This was
-not yet done under Prompts 43-45 (those focused on MAPL/transport
-diagnostics, not the gate itself).
+**Active next task (Prompt 47 candidate): controlled 1-GPU-vs-2-GPU C512
+performance A/B (same-node/same-job where feasible), transport held
+constant at `host_staged`.** Prompt 46's strongest new lead (§7/§9) is an
+informal ~2x `DYN_CORE` gap between 1-GPU/6-rank density (9089.05 ms/call,
+Prompt 37) and 2-GPU/3-ranks-per-GPU density (~4701 ms/call, Prompt 46) —
+if confirmed under a rigorous same-node comparison, this would mean the
+documented C512 CUDA-vs-Fortran regression (§6) is substantially a
+per-GPU rank/resource-contention effect at 6-ranks-per-A100, not solely
+the MPI-transport-protocol cost growth root-caused in Prompts 38-40. This
+is topology-adjacent (GPU placement, not FV3 decomposition) — confirm
+scope explicitly before starting, per this project's no-unscoped-topology-
+change norm.
 
-**Deferred, out-of-scope-for-a-correctness-prompt follow-ons on
-`cuda_aware`** (confirm scope explicitly before starting either):
-1. Lower rank density for `cuda_aware` at C512 (e.g. fewer ranks/GPU across
-   multiple GPUs) — an MPI topology/decomposition change.
-2. Investigate Intel MPI GPU-buffer-pool sizing controls
-   (`I_MPI_*` env vars) to reduce `cuda_aware`'s extra device-memory
-   footprint without changing topology — worth a quick environment-only
-   probe before attempting either, but not yet investigated.
+**Lower priority now that Prompt 46 closed the cuda_aware viability
+question**: Intel MPI GPU-buffer-pool sizing controls (`I_MPI_*` env
+vars) — cuda_aware is confirmed viable at 2-GPU density and not
+performance-significant there, so this investigation is no longer
+blocking anything.
 
-See `prompt_45_cuda_aware_correctness.md` (device-memory root cause),
-`prompt_44_mapl_resource_race.md` (MAPL fix + resume-gate evidence),
-`prompt_43_intelmpi_cuda_aware_ab.md` (transport implementation), and
-`prompt_42_hpcx_cuda_aware_environment.md` (environment-gate evidence;
-filename retained from original HPC-X scope).
+See `prompt_46_c512_two_gpu_cuda_aware_ab.md` (2-GPU A/B, Case C decision,
+the 1-GPU-vs-2-GPU lead), `prompt_45_cuda_aware_correctness.md`
+(device-memory root cause at 1-GPU density), `prompt_44_mapl_resource_race.md`
+(MAPL fix), `prompt_43_intelmpi_cuda_aware_ab.md` (transport implementation).
 
 **Mainline (`cuda/gpu-bringup`) tracks — confirm scope with the user before
 starting any:**
@@ -560,6 +545,13 @@ when the current task requires that level of detail.
   registration exceeds the ~1.5GB headroom); transport unit test 10/10 PASS
   both modes; decision: do not resume Prompt 43's cuda_aware performance
   A/B at the current rank density (§7/§9/§11).
+- `prompt_46_c512_two_gpu_cuda_aware_ab.md` — lowered C512 rank density to
+  3-ranks/GPU across 2 A100s (GPU-placement-only, no source change);
+  `cuda_aware` no longer OOMs (~5053 MiB/GPU peak) and is BITWISE-correct
+  vs. `host_staged`, but paired A/B shows <2.5% performance delta on any
+  metric (Case C: viable but not performance-significant; `host_staged`
+  remains the default); flagged an informal ~2x 1-GPU-vs-2-GPU `DYN_CORE`
+  gap as the top candidate for a future controlled A/B (§7/§9/§11).
 
 ---
 
