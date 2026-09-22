@@ -2,6 +2,7 @@
 #include "fv3_gpu_errors.hpp"
 #include "../cgrid/fv3_cgrid.hpp"
 #include "../vertical/fv3_vertical_kernels.cuh"
+#include "../vertical/fv3_pt_delz_remap.cuh"
 #include "../operators/wp_d_contract_cuda.hpp"
 #include "../operators/wp_d_contract.hpp"
 #include "../dgrid/wp_b_contract_cuda.hpp"
@@ -202,6 +203,13 @@ int fv3_build_production_dispatch(NumericalDispatch &out, fv3_gpu_error *e) noex
   // Prompt 6B omega finalization (dyn_core.F90:503-517 and :1205-1218).
   d.omega_pem_snapshot = &fv3::gpu::operators::launch_omega_pem_snapshot_cuda;
   d.omega_finalize = &fv3::gpu::operators::launch_omega_finalize_cuda;
+  // Prompt 52C-IMPLEMENT: fv_mapz_mod production pt/delz remap. Runs outside
+  // the acoustic loop (see the NumericalDispatch::pt_delz_remap comment in
+  // fv3_gpu_internal.hpp) -- installed in the same table purely so
+  // fv3_gpu_pt_delz_remap (fv3_gpu_runtime.cpp) can reach it without this
+  // translation unit's fv3_wp_c_vertical link becoming a reverse dependency
+  // of fv3_dyn_core_gpu.
+  d.pt_delz_remap = &fv3::gpu::vertical::launch_pt_delz_remap_ctx;
   out = d;
   return FV3_GPU_SUCCESS;
 }

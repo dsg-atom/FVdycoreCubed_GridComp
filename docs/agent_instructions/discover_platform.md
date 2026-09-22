@@ -113,6 +113,50 @@ The validated CUDA toolkit version during initial bring-up was:
 
 `nvcc V12.5.82`
 
+This stack is for **standalone CUDA-only development** (build directories
+such as `build_cuda_r8_mpi` and similar dev-only build directories). It is
+not the stack used for production standalone FV3 jobs — see the next
+section.
+
+---
+
+## Authoritative Production FV3/CUDA Runtime Stack (Intel MPI)
+
+**Production standalone FV3 jobs — and any performance/profiling work meant
+to be reproducible against production results — use Intel MPI, not the
+OpenMPI dev stack above.** This is the authoritative runtime environment for
+`StandAlone_FV3_Dycore.x` and any CUDA build matched to it
+(`build_cuda_r8_intelmpi`/`build_cuda_r4_intelmpi`):
+
+```bash
+module purge
+module use -a /discover/swdev/gmao_SIteam/modulefiles-SLES15
+module load GEOSenv
+module load comp/gcc/12.3.0
+module load comp/intel/2024.2.0
+module load mpi/impi/2021.13
+module load nvidia/nvhpc-byo-compiler/24.7
+export I_MPI_CXX=g++
+```
+
+Expected toolchain:
+
+- GCC/G++/GFortran (host compiler): 12.3.0
+- Intel compiler suite (icx/ifort/ifx): 2024.2.0
+- MPI: **Intel MPI 2021.13** (Build 20240515)
+- CUDA/nvcc: 12.5.x, from the same `nvidia/nvhpc-byo-compiler/24.7` module
+  used by the OpenMPI dev stack above
+- `I_MPI_CXX=g++` is required so Intel MPI's C++ wrappers use the GCC host
+  compiler, not an Intel C++ compiler, matching the CUDA build's host
+  toolchain
+
+**Do not substitute OpenMPI for Intel MPI when reproducibility or
+performance comparability with production/prior results matters.** Every
+production-scale (C256/C512) FV3 job to date has run under Intel MPI
+2021.13. A run under the OpenMPI dev stack is not a valid substitute for a
+production or performance-profiling baseline, even though both stacks build
+and run correctly in isolation.
+
 ---
 
 ## Why the BYO CUDA Module Is Used
@@ -145,6 +189,10 @@ CUDA/nvcc
 ```
 
 without rebuilding the broader GEOS dependency stack using NVIDIA compilers.
+
+The same `nvidia/nvhpc-byo-compiler/24.7` module is reused unchanged in the
+Intel-MPI production stack above — only the MPI/compiler modules around it
+differ.
 
 Do not switch to full modules such as:
 
@@ -212,6 +260,78 @@ Examples include:
 - later GPU numerical validation
 
 Do not run GPU executables directly on login nodes.
+
+---
+
+## GPU Profiling Tools (Nsight Systems / Nsight Compute)
+
+Both Nsight Systems (`nsys`) and Nsight Compute (`ncu`) are bundled inside
+the already-loaded `nvidia/nvhpc-byo-compiler/24.7` module's own SDK tree.
+No separate module exists or is needed for either tool — `module spider
+nsys`/`ncu`/`nsight` all report "Unable to find" on Discover; this is
+expected NVHPC packaging behavior, not a gap in the module system.
+
+Locations (NVHPC 24.7 SDK tree):
+
+```text
+NVHPC_ROOT=/usr/local/other/nvidia/hpc_sdk/Linux_x86_64/24.7
+
+$NVHPC_ROOT/profilers/Nsight_Systems/bin/nsys
+$NVHPC_ROOT/profilers/Nsight_Compute/ncu
+```
+
+PATH setup — add on top of either validated stack above (dev OpenMPI stack
+or production Intel-MPI stack); no additional `module load` is required:
+
+```bash
+NVHPC_ROOT=/usr/local/other/nvidia/hpc_sdk/Linux_x86_64/24.7
+export PATH=$NVHPC_ROOT/profilers/Nsight_Systems/bin:$NVHPC_ROOT/profilers/Nsight_Compute:$PATH
+```
+
+This is a pure `PATH` addition, not a module load. Confirmed on both the
+login node and a live `gpu_a100` compute node to leave `module list`,
+`mpirun` (Intel MPI 2021.13), `gcc`, and `nvcc` unchanged.
+
+### Nsight Systems (`nsys`)
+
+- Version: `2024.4.1.61-244134315967v0`
+- No separate module required — PATH addition only, above.
+- Compatible with the validated Intel-MPI FV3/CUDA runtime stack: confirmed
+  on a live `gpu_a100` compute node attaching to the real FV3 CUDA dyn_core
+  executable and capturing CUDA kernel/API activity, with Intel MPI 2021.13
+  remaining the active MPI implementation throughout.
+- Intended use: **first-stage CUDA timeline/system profiler** — system-wide
+  and per-process CUDA API/kernel timeline capture. This is the default,
+  low-risk profiling entry point for this project.
+- No known platform restriction for `nsys` (unaffected by the Nsight
+  Compute permission limitation below).
+
+### Nsight Compute (`ncu`)
+
+- Version: `2024.2.1.0 (build 34372528)`
+- No separate module required — same PATH addition as `nsys`, above.
+- Known historical limitation: on this Discover `gpu_a100` allocation, live
+  GPU hardware performance-counter access has repeatedly been denied at the
+  driver/permission level:
+  ```
+  ==ERROR== ERR_NVGPUCTRPERM - The user does not have permission to access
+  NVIDIA GPU Performance Counters on the target device 0.
+  ```
+  This is a platform/driver permission restriction, not a project
+  misconfiguration. No unprivileged workaround exists; resolving it requires
+  either an NCCS administrative change or an alternate profiling approach.
+  Do not attempt privilege workarounds, driver-configuration changes, or
+  `sudo` to bypass it.
+- **Before relying on Nsight Compute counter access for a new task, run a
+  GPU-node smoke test first** (a minimal Slurm GPU job attempting `ncu
+  --launch-count 1 ...` against any GPU executable). Do not assume the
+  historical `ERR_NVGPUCTRPERM` finding is stale, and do not assume it has
+  been fixed, without a fresh check in the current allocation.
+- Fallback tools when Nsight Compute counter access is blocked:
+  `compute-sanitizer` (correctness/memory diagnostics only, no
+  occupancy/throughput metrics; already validated on this platform), or
+  static `nvcc --resource-usage` / `-Xptxas -v` register/shared-memory
+  counts at compile time.
 
 ---
 
@@ -422,7 +542,9 @@ The current validated Prompt 5B stack is GCC-based.
 It is suitable for standalone CUDA development and is compatible with a
 GCC-based GEOS build environment.
 
-Production GEOS may also use an Intel compiler/Intel MPI configuration.
+Production standalone FV3 jobs use an Intel compiler/Intel MPI configuration
+— see "Authoritative Production FV3/CUDA Runtime Stack (Intel MPI)" above
+for the exact validated module sequence.
 
 Do not assume successful standalone GCC/CUDA bring-up automatically proves ABI
 compatibility with an Intel production GEOS build.
@@ -509,6 +631,11 @@ The initial Discover CUDA bring-up established:
 - R4 CPU-visible regression tests: 10/10 PASS
 - WP-E real GPU runtime: PASS
 - compute-sanitizer: PASS with 0 reported errors
+
+This bring-up used the OpenMPI dev stack ("Validated Discover CUDA
+Development Environment" above). See "Authoritative Production FV3/CUDA
+Runtime Stack (Intel MPI)" above for the separate Intel-MPI stack used for
+production standalone FV3 jobs and performance/profiling work.
 
 Integrated full dyn_core device execution and authoritative numerical validation
 are separate milestones and must not be inferred from these results.

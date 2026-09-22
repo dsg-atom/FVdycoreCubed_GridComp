@@ -2386,6 +2386,71 @@ extern "C" int fv3_gpu_dyn_core_step(fv3_gpu_context *c,const fv3_gpu_step_desc 
   *ev=issue_event(c->data);
   return FV3_GPU_SUCCESS;
 }
+/* Prompt 52C-IMPLEMENT: standalone entry for the production pt/delz vertical
+ * remap. Reached ONLY through the NumericalDispatch::pt_delz_remap function
+ * pointer -- never a direct reference to
+ * fv3::gpu::vertical::launch_pt_delz_remap_ctx -- because that symbol lives in
+ * the fv3_wp_c_vertical target and this translation unit is part of
+ * fv3_dyn_core_gpu, which fv3_wp_c_vertical/fv3_production_dispatch link
+ * PUBLIC against, not the other way around (same link-cycle constraint
+ * documented above fv3_gpu_install_production_dispatch in
+ * fv3_gpu_production_dispatch.cu).
+ *
+ * Runs OUTSIDE fv3_gpu_dyn_core_step's acoustic-substep walk, at fv_mapz.F90's
+ * Lagrangian_to_Eulerian call site -- one call per dyn_core invocation, not
+ * once per substep.
+ *
+ * `dependency` is the caller's fv3_gpu_sync_from_host event for the pt/delz
+ * field mask (pe/peln/pt/delz/delp/pk/pkz/ak/bk); this call orders the compute
+ * stream after it exactly as fv3_gpu_dyn_core_step orders its first substep
+ * after any prior H2D. `*ev` is the kernel-completion event on the compute
+ * stream; the caller must fv3_gpu_sync_to_host with the same mask afterward
+ * and wait on THAT call's event -- this function does not itself stage a D2H
+ * or block the host. */
+extern "C" int fv3_gpu_pt_delz_remap(fv3_gpu_context *c, fv3_gpu_event dependency,
+                                     fv3_gpu_event *ev, fv3_gpu_error *e) {
+  using namespace fv3::gpu; clear_error(e); if(ev) *ev=0;
+  if(!c||!ev)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"invalid context or event output");
+  if(c->data.phase!=ContextPhase::initialized)
+    return fail(e,FV3_GPU_STATE_CONFLICT,__func__,"context is not initialized");
+  if(dependency && dependency>c->data.last_event)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"dependency references an unknown event");
+
+  const NumericalDispatch &dispatch=c->data.dispatch;
+  if(dispatch.contract_version!=internal_contract_version || !dispatch.pt_delz_remap)
+    return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,"pt/delz remap dispatch slot is not installed");
+
+  ExecutionContext x{};
+  x.contract_version=internal_contract_version;
+  x.fields=&c->data.state.registry;
+  x.immutable=&c->data.immutable;
+  x.dispatch_params=&c->data.dispatch_params;
+  x.workspace=&c->data.workspace.layout;
+  x.submission=Submission{internal_contract_version,c->data.compute_stream,StreamId::compute,
+                          c->data.dispatch_params.acoustic_sequence};
+  x.dependencies=&c->data.dependencies;
+  x.corner_service=dispatch.corner_edge_service;
+  x.dispatch=&dispatch;
+
+  int rc=validate_execution_context(x,e);
+  if(rc) return rc;
+
+#ifdef FV3_GPU_ENABLE_CUDA
+  /* Mirror of the ordering fv3_gpu_dyn_core_step applies to its first
+   * substep: the caller's fv3_gpu_sync_from_host for this call's field mask
+   * runs on the transfer stream, and the kernel below runs on the compute
+   * stream, so without this the kernel could read un-copied device memory. */
+  {auto z=order_after(c->data.transfer_stream,c->data.compute_stream,c->data.event_transfer_done);
+   if(z!=cudaSuccess){ return cuda_fail(z,e,__func__,&c->data); }}
+#endif
+
+  rc=dispatch.pt_delz_remap(x,e);
+  if(rc!=FV3_GPU_SUCCESS) return rc;
+
+  *ev=issue_event(c->data);
+  return FV3_GPU_SUCCESS;
+}
 extern "C" int fv3_gpu_event_wait(fv3_gpu_context *c,fv3_gpu_event ev,fv3_gpu_error *e){using namespace fv3::gpu;clear_error(e);if(!c||!ev||ev>c->data.last_event)return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"unknown event");
 #ifdef FV3_GPU_ENABLE_CUDA
   /* Milestone 3A.9: wait for BOTH streams. This is the host's only blocking

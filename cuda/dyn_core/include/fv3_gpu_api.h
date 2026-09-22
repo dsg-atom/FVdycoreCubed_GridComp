@@ -228,6 +228,17 @@ int fv3_gpu_set_cubed_sphere_topology(fv3_gpu_context *, int32_t tile,
                                       const int32_t *rank_of_tile,
                                       fv3_gpu_error *);
 int fv3_gpu_dyn_core_step(fv3_gpu_context *, const fv3_gpu_step_desc *, fv3_gpu_event *, fv3_gpu_error *);
+/* Prompt 52C-IMPLEMENT: fv_mapz_mod's production pt/delz vertical remap
+ * (fv3::gpu::vertical::launch_pt_delz_remap_ctx), reached through the
+ * NumericalDispatch pt_delz_remap slot installed by
+ * fv3_gpu_install_production_dispatch. Runs OUTSIDE the acoustic-substep
+ * loop, once per dyn_core call, at fv_mapz.F90's Lagrangian_to_Eulerian call
+ * site -- NOT part of fv3_gpu_dyn_core_step. The caller is responsible for
+ * fv3_gpu_sync_from_host before this call (mask covering pe, peln, pt, delz,
+ * delp, pk, pkz, ak, bk) and fv3_gpu_sync_to_host with the same mask after --
+ * this entry only orders the compute-stream launch after `dependency` and
+ * returns the kernel-completion event; it neither transfers nor blocks. */
+int fv3_gpu_pt_delz_remap(fv3_gpu_context *, fv3_gpu_event dependency, fv3_gpu_event *, fv3_gpu_error *);
 int fv3_gpu_sync_to_host(fv3_gpu_context *, const fv3_gpu_field_mask *, fv3_gpu_event *, fv3_gpu_error *);
 int fv3_gpu_event_wait(fv3_gpu_context *, fv3_gpu_event, fv3_gpu_error *);
 int fv3_gpu_get_capabilities(fv3_gpu_context *, fv3_gpu_capabilities *);

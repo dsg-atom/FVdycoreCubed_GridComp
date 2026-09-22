@@ -179,6 +179,57 @@ Full reconciliation narrative, per-node tables, and the full C512
 root-cause chain: `docs/agent_handoff/milestone_summary_2026-09-19.md`
 §B/§D, and `prompt_38` through `prompt_48_c512_same_node_fc.md`.
 
+**Update (Prompts 49-52, branch `optimization/cuda-fv3-performance`,
+`docs/performance/`)**: a same-node Nsight Systems capture + CPU-sampling
+decomposition of the "comparable" C512 `DYN_CORE` window above found that
+existing GPU kernel compute is only 3.9% of the window and halo-sync
+blocking is 14.4% (evaluated, not safely reducible without a redesign —
+`p50_halo_sync_optimization`). The dominant cost, previously unattributed,
+is **large portions of the production timestep still running on the CPU
+in untranslated Fortran** alongside (not inside) the CUDA-replaced
+acoustic-substep loop: 64.66% of the window, of which `fv_mapz_mod`
+(vertical Lagrangian-to-Eulerian remapping) alone is 18.67% — the single
+largest individually-attributed CPU component. This is a **coverage gap**
+(work never ported), not a correctness gap — Gate C2 above remains
+closed and unaffected. `fv_mapz_mod` has been source-mapped and a CUDA
+port plan produced (`p52_fv_mapz_cuda_port_plan_2026-09-21.md`). See
+`docs/performance/cuda_fv3_optimization_roadmap_2026-09-21.md` for the
+full roadmap.
+
+**Update (Prompt 52B)**: `map_scalar`/`scalar_profile`/`cs_limiters`
+(`kord=9`, `iv∈{0,1}`, the production Held-Suarez C512 configuration) are
+now IMPLEMENTED (header-only `__host__ __device__` templates,
+`cuda/dyn_core/vertical/fv3_map_scalar_column.hpp`), COMPILED, GPU
+EXECUTED (one A100, `srun`), and NUMERICALLY VALIDATED against all 8
+Prompt 52A fixtures: bitwise PASS on the host path, and bitwise PASS on
+GPU once nvcc's default FMA contraction is disabled (`-fmad=false`);
+with default FMA the GPU shows round-off-only divergence (max_abs
+≤1.14e-13, max_rel ≤3.8e-16) fully explained by that contraction. Full
+report: `docs/performance/p52b_fv_mapz_cuda_standalone_2026-09-21.md`.
+This is standalone validation only — **not yet integrated into the
+production timestep** (no real kernel launcher/`ExecutionContext`
+wiring, no R4, no `mapn_tracer`); that integration is the next
+recommended step (§9).
+
+**Update (Prompt 52C → 52C-PREP)**: Prompt 52C found that the real `pt`/
+`delz` call sites in `Lagrangian_to_Eulerian` surround `map_scalar` with
+untested pressure-grid arithmetic (`peO`/`pn1`/`pn2`/`dpn1`/`dpn2`/`dpe`/
+`dpeO` derivation, pt/delz pre/post-transforms, a joint `pkz`
+post-processing step that runs after both remaps) — a real scope gap
+beyond 52B's standalone primitives. 52C-PREP closed this at the fixture
+level: a host-only harness (`model/pt_delz-driver/`) reproduces this
+arithmetic bitwise-repeatably against 6 deterministic fixtures. Two new
+architectural facts from this work: (1) `peO`/`dpe`/`dpeO` are local
+temporaries inside `Lagrangian_to_Eulerian`, not module-level/persistent
+state — no hidden state for a future CUDA port to carry across calls; (2)
+production compiles `fv_mapz.F90` with `-DMOIST_CAPPA -DUSE_COND`, but
+for the validated Held-Suarez config (`nwat=0`, `q(sphum)=0`),
+`moist_cv`'s case-default degeneracy makes the dry `k1k`/`rrg`/`akap`
+formula exactly (not approximately) equal to the MOIST_CAPPA-gated one —
+resolved, not a blocker, but the equivalence is contingent on
+`q(sphum)=0` and not independently field-verified against a live run.
+Full detail: `docs/performance/p52c_prep_pt_delz_fixture_2026-09-21.md`.
+
 ## 6. Standalone Integration Status
 
 - CUDA dyn_core runs inside the real `StandAlone_FV3_Dycore.x` under the
@@ -249,6 +300,25 @@ root-cause chain: `docs/agent_handoff/milestone_summary_2026-09-19.md`
   VALIDATED / PERFORMANCE VALIDATED).
 
 ## 9. Next Recommended Task
+
+**Performance track (`optimization/cuda-fv3-performance`, current
+branch) — confirm scope before starting:**
+0. `fv_mapz_mod` CUDA port, Phase 52C — production-timestep integration
+   of the now standalone-validated `map_scalar`/`scalar_profile`/
+   `cs_limiters` CUDA port (Prompt 52B, §5) plus the now fixture-validated
+   pt/delz surrounding arithmetic (Prompt 52C-PREP, §5 update above).
+   Fixture-level prep for pt/delz is done — resume at Stage 8
+   (implementation): a production kernel launcher (`ExecutionContext`/
+   `fv3_gpu_error` wiring, not the Stage-15 smoke kernel), an
+   FMA-contraction decision consistent with the rest of the CUDA
+   dyn_core, R4 validation, and real production `km`/`kn` sizes (fixtures
+   only cover `km=kn=10`). See
+   `docs/performance/p52b_fv_mapz_cuda_standalone_2026-09-21.md` §10 and
+   `docs/performance/p52c_prep_pt_delz_fixture_2026-09-21.md` §8-9 for the
+   full integration-readiness checklist and CUDA-unit/data-residency
+   preview. Largest individually-measured CPU coverage gap (18.67% of
+   window); Amdahl ceiling if fully ported ≈1.23x alone — necessary but
+   not sufficient for the 2x target on its own.
 
 **Mainline (`cuda/gpu-bringup`) tracks — confirm scope with the user
 before starting any:**

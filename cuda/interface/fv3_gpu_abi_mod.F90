@@ -319,6 +319,7 @@ module fv3_gpu_abi_mod
    public :: fv3_gpu_sync_from_host
    public :: fv3_gpu_dyn_core_step
    public :: fv3_gpu_sync_to_host
+   public :: fv3_gpu_pt_delz_remap
    public :: fv3_gpu_event_wait
    public :: fv3_gpu_get_capabilities
    public :: fv3_gpu_set_cuda_graph_mode
@@ -403,6 +404,22 @@ module fv3_gpu_abi_mod
          integer(c_int64_t), intent(out)       :: ev
          type(fv3_gpu_error), intent(inout)    :: err
       end function fv3_gpu_sync_to_host
+
+      ! Prompt 52C-IMPLEMENT: fv_mapz_mod's production pt/delz vertical remap.
+      ! Runs outside the acoustic-substep loop, once per dyn_core call, at
+      ! fv_mapz.F90's Lagrangian_to_Eulerian call site -- NOT part of
+      ! fv3_gpu_dyn_core_step. `dependency` is the caller's
+      ! fv3_gpu_sync_from_host event for the pt/delz field mask; `ev` is the
+      ! kernel-completion event. The caller must still fv3_gpu_sync_to_host
+      ! (same mask) and wait on THAT event -- this entry does not transfer.
+      integer(c_int) function fv3_gpu_pt_delz_remap(ctx, dependency, ev, err) &
+                              bind(C, name="fv3_gpu_pt_delz_remap")
+         import :: c_int, c_int64_t, c_ptr, fv3_gpu_error
+         type(c_ptr), value                 :: ctx
+         integer(c_int64_t), value          :: dependency
+         integer(c_int64_t), intent(out)    :: ev
+         type(fv3_gpu_error), intent(inout) :: err
+      end function fv3_gpu_pt_delz_remap
 
       integer(c_int) function fv3_gpu_event_wait(ctx, ev, err) &
                               bind(C, name="fv3_gpu_event_wait")

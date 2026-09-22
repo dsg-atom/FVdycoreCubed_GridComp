@@ -62,6 +62,7 @@ module fv3_gpu_dyncore_bridge
    public :: fv3_gpu_backend_enabled
    public :: fv3_gpu_interface_step_dyn
    public :: fv3_gpu_interface_pe_halo
+   public :: fv3_gpu_interface_pt_delz_remap
    public :: fv3_gpu_bridge_final
 
    ! ---- persistent per-rank state ---------------------------------------------
@@ -384,6 +385,61 @@ contains
 
    end subroutine fv3_gpu_interface_step_dyn
 
+! =============================================================================
+! fv_mapz_mod production pt/delz vertical remap (Prompt 52C-IMPLEMENT)
+! =============================================================================
+
+   ! Called from Lagrangian_to_Eulerian in place of the Fortran remap_t/delz
+   ! path, ONLY for the validated production subset (remap_option==0,
+   ! gmao_remap==0, kord_mt==kord_wz==kord_tm==9, nwat==0, R8) -- gating that
+   ! subset is the CALLER's responsibility (fv_mapz.F90), not this
+   ! subroutine's; this entry trusts it has already been checked, exactly as
+   ! launch_pt_delz_remap_ctx's own header comment documents.
+   !
+   ! By this call site fv3_gpu_interface_step_dyn's own D2H has already made
+   ! the host arrays authoritative for this dyn_core call (Stage 6/52C-prep
+   ! finding), so this call stages a fresh, narrow H2D of exactly the 9 fields
+   ! the kernel reads (pe, peln, pt, delz, delp, pk, pkz, ak, bk), launches the
+   ! kernel, D2Hs the same 9 fields back, and blocks once -- the same
+   ! one-host-wait-per-call shape as fv3_gpu_interface_step_dyn above, for the
+   ! same reason: everything after this point in Lagrangian_to_Eulerian reads
+   ! the Fortran arrays.
+   subroutine fv3_gpu_interface_pt_delz_remap(rc)
+      integer, intent(out) :: rc
+
+      type(fv3_gpu_field_mask) :: mask
+      type(fv3_gpu_error)      :: err
+      integer(c_int64_t)       :: ev_h2d, ev_kernel, ev_d2h
+      integer :: crc
+
+      rc = 0
+      if (.not. bridge_ready) then
+         call mpp_error(FATAL, 'fv3_gpu_interface_pt_delz_remap: called before '// &
+              'fv3_gpu_bridge_init succeeded')
+      endif
+
+      call pt_delz_remap_state_mask(mask)
+
+      crc = fv3_gpu_sync_from_host(ctx, mask, ev_h2d, err)
+      call check(crc, err, 'fv3_gpu_sync_from_host')
+
+      crc = fv3_gpu_pt_delz_remap(ctx, ev_h2d, ev_kernel, err)
+      call check(crc, err, 'fv3_gpu_pt_delz_remap')
+
+      ! D2H, then the one host wait for this call. fv3_gpu_sync_to_host orders
+      ! the transfer stream after whatever is outstanding on the compute
+      ! stream (event_compute_done), which the kernel above was enqueued on,
+      ! so this is correctly ordered after it without needing ev_kernel
+      ! threaded through explicitly -- same mechanism
+      ! fv3_gpu_interface_step_dyn relies on for its own D2H.
+      crc = fv3_gpu_sync_to_host(ctx, mask, ev_d2h, err)
+      call check(crc, err, 'fv3_gpu_sync_to_host')
+
+      crc = fv3_gpu_event_wait(ctx, ev_d2h, err)
+      call check(crc, err, 'fv3_gpu_event_wait')
+
+   end subroutine fv3_gpu_interface_pt_delz_remap
+
    !==========================================================================
    ! Complete pe's one halo ring at the dyn_core exit boundary.
    !
@@ -704,6 +760,23 @@ contains
          mask%words(id/64 + 1) = ibset(mask%words(id/64 + 1), mod(id, 64))
       end do
    end subroutine mutable_state_mask
+
+   ! Narrow mask for fv3_gpu_interface_pt_delz_remap -- exactly the 9 fields
+   ! launch_pt_delz_remap_ctx reads/writes (fv3_pt_delz_remap.cu), not the
+   ! full mutable_state_mask range above.
+   subroutine pt_delz_remap_state_mask(mask)
+      type(fv3_gpu_field_mask), intent(out) :: mask
+      integer, parameter :: ids(9) = &
+           (/ FV3_FID_PE, FV3_FID_PELN, FV3_FID_PT, FV3_FID_DELZ, FV3_FID_DELP, &
+              FV3_FID_PK, FV3_FID_PKZ, FV3_FID_AK, FV3_FID_BK /)
+      integer :: k
+      mask%abi_version  = FV3_GPU_ABI_VERSION
+      mask%struct_bytes = int(storage_size(mask)/8, c_int32_t)
+      mask%words = 0_c_int64_t
+      do k = 1, size(ids)
+         mask%words(ids(k)/64 + 1) = ibset(mask%words(ids(k)/64 + 1), mod(ids(k), 64))
+      end do
+   end subroutine pt_delz_remap_state_mask
 
    subroutine build_rank_of_tile(comm, comm_rank, tile, rank_of_tile)
       integer,            intent(in)  :: comm, comm_rank, tile

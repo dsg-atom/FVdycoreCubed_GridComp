@@ -407,6 +407,24 @@ struct NumericalDispatch {
    * cgrid_vertical_pre_halo above. */
   LaunchFn omega_pem_snapshot=nullptr;
   LaunchFn omega_finalize=nullptr;
+  /* Prompt 52C-IMPLEMENT: fv_mapz_mod's production pt/delz vertical remap
+   * (fv3::gpu::vertical::launch_pt_delz_remap_ctx). Unlike every slot above,
+   * this stage does NOT run inside fv3_gpu_dyn_core_step's per-substep walk --
+   * it runs once per dyn_core call, at fv_mapz.F90's Lagrangian_to_Eulerian
+   * call site, outside the acoustic loop entirely. It is still installed here
+   * (rather than a second dispatch table) so fv3_gpu_pt_delz_remap
+   * (fv3_gpu_runtime.cpp) can reach it through the SAME function-pointer
+   * indirection corner_edge_service already uses to avoid the
+   * fv3_dyn_core_gpu -> fv3_wp_c_vertical link cycle: this field is populated
+   * by fv3_build_production_dispatch (fv3_production_dispatch target, which
+   * links both fv3_dyn_core_gpu and fv3_wp_c_vertical) and only ever CALLED
+   * through the pointer from fv3_gpu_runtime.cpp (fv3_dyn_core_gpu target),
+   * which never references the launch_pt_delz_remap_ctx symbol directly.
+   * Additive tail slot, same argument as omega_pem_snapshot/omega_finalize
+   * above: validate_dispatch does not require it and a null value simply
+   * makes fv3_gpu_pt_delz_remap refuse with FV3_GPU_UNSUPPORTED_CONFIGURATION
+   * rather than affecting the acoustic loop at all. */
+  LaunchFn pt_delz_remap=nullptr;
 };
 
 int validate_execution_context(const ExecutionContext &, fv3_gpu_error *) noexcept;

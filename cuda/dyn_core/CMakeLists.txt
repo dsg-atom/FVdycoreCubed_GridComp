@@ -103,9 +103,15 @@ if(FV3_DYN_CORE_ENABLE_CUDA)
   # Riem_Solver_c, the C-grid Riemann solve (dyn_core.F90:583, dt2). It is a
   # genuinely distinct routine from Riem_Solver3, not an alias, but it reuses the
   # shared sim1_column device solver rather than forking it.
+  # Prompt 52C adds vertical/fv3_pt_delz_remap.cu: fv_mapz_mod's production
+  # pt/delz vertical-remap entry (Lagrangian_to_Eulerian, remap_option=0,
+  # gmao_remap=0, kord=9, nwat=0). Reuses map_scalar_column (Prompt 52B) and
+  # the RiemCViewC3/RiemViewC3 view adapters (fv3_riem_solver_c.cuh) rather
+  # than duplicating either.
   add_library(fv3_wp_c_vertical STATIC
     vertical/fv3_vertical_kernels.cu
     vertical/fv3_riem_solver_c.cu
+    vertical/fv3_pt_delz_remap.cu
   )
   target_include_directories(fv3_wp_c_vertical PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -278,6 +284,55 @@ if(BUILD_TESTING)
   target_include_directories(fv3_wp_c_column_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vertical)
   target_link_libraries(fv3_wp_c_column_test PRIVATE fv3_dyn_core_gpu)
   add_test(NAME fv3_wp_c_column COMMAND fv3_wp_c_column_test)
+
+  # WP-C fv_mapz vertical remap tests (Prompt 52B, CPU-visible host path of
+  # the __host__ __device__ map_scalar_column/scalar_profile_column header).
+  # Fixture dir is the repo-root Prompt 52A baseline snapshot, not under
+  # cuda/dyn_core/ -- pass its absolute path in at configure time since no
+  # existing SOURCE_DIR-style macro convention exists in this file to reuse.
+  add_executable(fv3_wp_c_map_scalar_test tests/vertical/test_map_scalar.cpp)
+  target_include_directories(fv3_wp_c_map_scalar_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vertical)
+  target_link_libraries(fv3_wp_c_map_scalar_test PRIVATE fv3_dyn_core_gpu)
+  target_compile_definitions(fv3_wp_c_map_scalar_test PRIVATE
+    FV3_MAP_SCALAR_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../tests/fortran_baseline/fv_mapz/fixtures")
+  add_test(NAME fv3_wp_c_map_scalar COMMAND fv3_wp_c_map_scalar_test)
+
+  # WP-C fv_mapz GPU smoke test (Prompt 52B, Stage 15): the same
+  # map_scalar_column/scalar_profile_column device functions launched from a
+  # real __global__ kernel on a real GPU. GPU-execution + bitwise sanity
+  # check only, plus a rough non-authoritative CPU-vs-GPU timing sanity
+  # check; not registered as a ctest (requires an actual GPU, unlike every
+  # other test in this block) -- run manually via srun.
+  add_executable(fv3_wp_c_map_scalar_gpu_smoke vertical/fv3_map_scalar_kernel.cu)
+  target_include_directories(fv3_wp_c_map_scalar_gpu_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/vertical ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(fv3_wp_c_map_scalar_gpu_smoke PRIVATE fv3_dyn_core_gpu)
+
+  # Diagnostic-only twin build with FMA contraction disabled, to localize
+  # whether GPU FMA reassociation explains any non-bitwise mismatch above
+  # (Prompt 52B Stage 11: root-cause before relaxing any tolerance).
+  add_executable(fv3_wp_c_map_scalar_gpu_smoke_nofma vertical/fv3_map_scalar_kernel.cu)
+  target_include_directories(fv3_wp_c_map_scalar_gpu_smoke_nofma PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/vertical ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(fv3_wp_c_map_scalar_gpu_smoke_nofma PRIVATE fv3_dyn_core_gpu)
+  target_compile_definitions(fv3_wp_c_map_scalar_gpu_smoke_nofma PRIVATE
+    FV3_MAP_SCALAR_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../tests/fortran_baseline/fv_mapz/fixtures")
+  target_compile_options(fv3_wp_c_map_scalar_gpu_smoke_nofma PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-fmad=false>)
+  target_compile_definitions(fv3_wp_c_map_scalar_gpu_smoke PRIVATE
+    FV3_MAP_SCALAR_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../tests/fortran_baseline/fv_mapz/fixtures")
+
+  # WP-C fv_mapz pt/delz production-remap GPU smoke test (Prompt 52C, Stage
+  # 8-9): fv3_pt_delz_remap.cu's real __global__ kernel launched on a real
+  # GPU, single column, compared against the pt_delz-driver Fortran
+  # fixtures. GPU-execution + tolerance-comparison check only; not
+  # registered as a ctest (requires an actual GPU) -- run manually via srun.
+  add_executable(fv3_wp_c_pt_delz_remap_gpu_smoke vertical/fv3_pt_delz_remap_smoke.cu)
+  target_include_directories(fv3_wp_c_pt_delz_remap_gpu_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/vertical ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(fv3_wp_c_pt_delz_remap_gpu_smoke PRIVATE fv3_dyn_core_gpu fv3_wp_c_vertical)
+  target_compile_definitions(fv3_wp_c_pt_delz_remap_gpu_smoke PRIVATE
+    FV3_PT_DELZ_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../tests/fortran_baseline/fv_mapz/pt_delz_fixtures")
 
   # WP-D operators tests (CPU-visible formulas)
   add_executable(fv3_wp_d_operators_test tests/operators/test_wp_d.cpp)
