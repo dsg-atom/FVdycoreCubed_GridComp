@@ -853,9 +853,26 @@ class PeerHaloTransport final : public halo::HaloTransport {
         return fail(e, FV3_GPU_CUDA_ERROR, api, cudaGetErrorString(crc), (int)crc);
     }
 
+    /* HaloPeerGroup remains tile(=physical-face)-indexed (Model B's per-thread
+     * identity IS the physical face by construction) -- send_table() above is
+     * unchanged. launch_halo_transfer (Prompt 112) now indexes its peer table
+     * by .rank (transport peer identity), not .tile, so this adapter re-keys
+     * the same six buffers from face-indexed to rank-indexed before calling
+     * it. At the one-rank-per-face production topology this is a lossless
+     * relabeling: exactly the same six pointers, just placed at a different
+     * slot, so production numerics/behavior are unchanged. */
     fv_real *send_table[halo::cubed_sphere_tiles + 1];
     pg_->send_table(send_table);
-    return halo::launch_halo_transfer(eff, geom, topo, send_table, recv, stream, e);
+    fv_real *send_by_rank[halo::cubed_sphere_tiles] = {};
+    for (int q = 0; q < 4; ++q) {
+      const EdgeNeighbor &nb = topo.neighbors[static_cast<size_t>(q)];
+      if (nb.tile >= 1 && nb.tile <= halo::cubed_sphere_tiles && nb.rank >= 0 &&
+          nb.rank < halo::cubed_sphere_tiles) {
+        send_by_rank[nb.rank] = send_table[nb.tile];
+      }
+    }
+    return halo::launch_halo_transfer(eff, geom, topo, send_by_rank, halo::cubed_sphere_tiles,
+                                      recv, stream, e);
   }
 
   int release_send(void *stream, fv3_gpu_error *e, const char *api) noexcept override {
@@ -1462,6 +1479,11 @@ extern "C" int fv3_gpu_create(const fv3_gpu_create_desc *d, fv3_gpu_context **ou
   rc=cudaSetDevice(device); if(rc!=cudaSuccess) return cuda_fail(rc,e,__func__);
   auto *ctx=new(std::nothrow) fv3_gpu_context; if(!ctx) return fail(e,FV3_GPU_OUT_OF_MEMORY,__func__,"context allocation failed");
   ctx->data.create=*d; ctx->data.create.device_ordinal=device;
+  /* Prompt 114: <= 0 means "caller predates/omitted this field" -- default to
+   * 1 (today's only supported one-rank-per-tile decomposition) rather than
+   * rejecting, so every existing caller's behavior is unchanged. */
+  if (ctx->data.create.layout_x<=0) ctx->data.create.layout_x=1;
+  if (ctx->data.create.layout_y<=0) ctx->data.create.layout_y=1;
   ctx->data.immutable.bounds={d->is,d->ie,d->js,d->je,d->npz,d->halo_width};
   ctx->data.immutable.topology=&ctx->data.topology;
   cudaStream_t compute{}, transfer{};
@@ -1555,7 +1577,8 @@ extern "C" int fv3_gpu_sync_from_host(fv3_gpu_context *c,const fv3_gpu_field_mas
  * tiles because a rank owning a sub-tile block has same-tile neighbours on some
  * edges, which this entry cannot express. */
 extern "C" int fv3_gpu_set_cubed_sphere_topology(fv3_gpu_context *c,int32_t tile,int64_t npx,int64_t npy,
-                                                 const int32_t *rank_of_tile,fv3_gpu_error *e){
+                                                 const int32_t *rank_of_tile,
+                                                 int32_t layout_x,int32_t layout_y,fv3_gpu_error *e){
   using namespace fv3::gpu; clear_error(e);
   if(!c||!rank_of_tile)return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"null context or rank table");
   if(c->data.phase==ContextPhase::failed)return fail(e,FV3_GPU_STATE_CONFLICT,__func__,"context has failed");
@@ -1569,6 +1592,11 @@ extern "C" int fv3_gpu_set_cubed_sphere_topology(fv3_gpu_context *c,int32_t tile
    * describing somebody else's neighbours. */
   if(rank_of_tile[tile-1]!=c->data.create.mpi_rank)
     return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"rank_of_tile disagrees with this context's mpi_rank");
+  /* Prompt 114: storage/validation only, same <=0-defaults-to-1 convention
+   * as fv3_gpu_create's create_desc fields -- does not affect which
+   * topology builder ran above or any neighbour/seam computation. */
+  t.layout_x = layout_x>0 ? layout_x : 1;
+  t.layout_y = layout_y>0 ? layout_y : 1;
   return set_topology(c,t,e);
 }
 /* Prompt 14/15 resumption: the public ABI counterpart of the internal

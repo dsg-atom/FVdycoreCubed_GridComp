@@ -150,6 +150,13 @@ module fv3_gpu_interface_mod
     integer(c_int32_t) :: halo_width
     integer(c_int32_t) :: flags
     integer(c_intptr_t) :: communicator_token
+    ! Prompt 114: additive-only mirror of the same fields added to
+    ! fv3_gpu_abi_mod.F90's fv3_gpu_create_desc, kept byte-identical to the
+    ! real ABI struct so fv3_gpu_create's struct_bytes>=need check keeps
+    ! accepting this module's (independent, hand-maintained) type. <=0 is
+    ! treated by the runtime as "unset", defaulting to 1.
+    integer(c_int32_t) :: layout_x
+    integer(c_int32_t) :: layout_y
   end type fv3_gpu_create_desc_t
 
   type, bind(c) :: fv3_gpu_state_desc_t
@@ -226,7 +233,8 @@ module fv3_gpu_interface_mod
     ! Milestone 3A.10: describe the cubed-sphere decomposition to the runtime.
     ! rank_of_tile is a 6-element table, entry n giving the MPI rank that owns
     ! mosaic tile n.
-    function fv3_gpu_set_cubed_sphere_topology(ctx, tile, npx, npy, rank_of_tile, err) &
+    function fv3_gpu_set_cubed_sphere_topology(ctx, tile, npx, npy, rank_of_tile, &
+        layout_x, layout_y, err) &
         bind(c, name='fv3_gpu_set_cubed_sphere_topology')
       import :: c_int, c_ptr, c_int32_t, c_int64_t, fv3_gpu_error_t
       type(c_ptr), value :: ctx
@@ -234,6 +242,9 @@ module fv3_gpu_interface_mod
       integer(c_int64_t), value :: npx
       integer(c_int64_t), value :: npy
       integer(c_int32_t), intent(in) :: rank_of_tile(6)
+      ! Prompt 114: additive-only mirror of the same trailing params added to
+      ! fv3_gpu_abi_mod.F90's interface. <=0 defaults to 1 in the runtime.
+      integer(c_int32_t), value :: layout_x, layout_y
       type(fv3_gpu_error_t), intent(out) :: err
       integer(c_int) :: fv3_gpu_set_cubed_sphere_topology
     end function
@@ -363,6 +374,12 @@ contains
     create_desc%halo_width = Atm%ng
     create_desc%flags = 0
     create_desc%communicator_token = comm
+    ! Prompt 114: same FMS layout metadata as fv3_gpu_dyncore_bridge.F90 --
+    ! Atm%layout(1:2) is FMS' own authoritative within-tile decomposition.
+    ! Storage/diagnostics only; the mpi_size==6 check below remains the sole
+    ! authority for what topology this module actually supports.
+    create_desc%layout_x = int(Atm%layout(1), c_int32_t)
+    create_desc%layout_y = int(Atm%layout(2), c_int32_t)
 
     ! Create GPU context
     status = fv3_gpu_create(create_desc, gpu_context, err)
@@ -398,7 +415,8 @@ contains
     enddo
     status = fv3_gpu_set_cubed_sphere_topology(gpu_context, int(Atm%tile, c_int32_t), &
                                                int(Atm%npx, c_int64_t), int(Atm%npy, c_int64_t), &
-                                               rank_of_tile, err)
+                                               rank_of_tile, &
+                                               create_desc%layout_x, create_desc%layout_y, err)
     if (status /= 0) then
       rc = err%code
       return

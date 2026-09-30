@@ -1,31 +1,18 @@
 # Current Project State
 
-_Last updated 2026-09-30 (checkpoint: Prompt 107 — implemented and
-validated node-local GPU device binding via
-`MPI_Comm_split_type(MPI_COMM_TYPE_SHARED,...)` in
-`fv3_gpu_bridge_init` (`fv3_gpu_dyncore_bridge.F90`), replacing the
-single-node-only `dev = mod(global_comm_rank, device_count)` rule with
-`dev = mod(local_rank, device_count)`. Fixed a real logging bug found
-along the way (`mpp_error(NOTE,...)` prints from PE 0 only; switched to
-per-rank `write(0,...)`, precedent: `FV_StateMod.F90`'s
-`P99_EXIT_DUMP`). Validated: single-node 1-GPU (degenerate case) and
-2-GPU (bit-identical to Prompt 103/106's mapping), and genuine 2-node
-multi-node (divergence proof vs. the old global-rank rule — node 1's
-actual mapping differs from what the old rule would have given).
-Exit-dump numerical samples bitwise identical across all 4 arms
-(routing-only change); no performance regression (CUDA still
-~1-1.5% faster than Fortran on the same post-fix topology). Discovered
-two new Discover platform constraints: `alla100` QOS caps a job's
-summed GPU count/memory (not per-node) at `gres/gpu=4`/`mem=510000M`;
-multi-node CUDA MPS needs an explicit `srun --overlap` broadcast (the
-existing `fv3_mps_lifecycle.sh` is head-node-only). Also found the
-"stale EXPDIR" bug (CURRENT_STATE §7) can cause a real job-collision
-crash under concurrency, not just harmless log-capture loss — fixed for
-this rundir. No numerical/CUDA-kernel/ABI/other-selector change; no
-commit/push. Doc:
-`docs/performance/p107_node_local_gpu_binding_2026-09-30.md`. Full
-history in `docs/agent_handoff/milestone_summary_2026-09-19.md`. This
-file holds only what the next coding agent needs to continue work._
+_Last updated 2026-09-30 (checkpoint: Prompt 114 — implemented Prompt
+113's bounded next task: wired `layout_x`/`layout_y` (from
+`Atm%layout(1:2)`) through the ABI/bridge/runtime, additive-only, no
+gate relaxation. Compile-verified against the REAL production fixture
+(Intel MPI `fvdycore` target); reconstructed the missing
+`build_cuda_r8_intelmpi` archive dir to reach a linked
+`StandAlone_FV3_Dycore.x`; GPU-executed clean C32 (6 ranks/1 GPU) and
+C512 (6 ranks/2 GPU/MPS) smokes, `layout=1x1` correct on every rank,
+timers within node-variance noise of pre-P114 baseline. All four
+>6-rank gates re-confirmed untouched. No commit/push. Doc:
+`docs/performance/p114_fms_layout_bridge_abi_plumbing_2026-09-30.md`.
+Full history in `docs/agent_handoff/milestone_summary_2026-09-19.md`.
+This file holds only what the next coding agent needs to continue._
 
 ## 1. Project Goal
 
@@ -197,67 +184,37 @@ ports CUDA, `State_To_FV` Fortran): TOTAL 3836.74 ms/call; also found
 MAPL `DYN_EPILOGUE` (688.67 ms/call). Prompt 101's C512 memory-inventory
 gap was **RESOLVED by Prompt 102** (below).
 
-**Prompt 101A — cumulative CUDA performance (CLOSED)**: same-node
-5-pair A/B, all-4-Fortran vs. current CUDA defaults (no prior baseline
-was valid — P48 measured only `DYN_CORE`). CUDA won 5/5: **TOTAL mean
-13.264% (1.153x); FV_DYN_LOOP mean 28.957%; REMAPPING mean 61.390%**.
-Per-port speedups above are each vs. a different baseline — do not sum
-them. Bottleneck now: `REMAP_TOTALENERGYCON` (comm-bound)/`TRACER_2D`
-(Fortran)/`DYN_EPILOGUE` (MAPL). See `p101a_*.md`.
+**Prompts 101A-107 (all CLOSED, full detail in §11)**: cumulative CUDA
+baseline (TOTAL 1.153x) -> C512 memory gap is per-rank not per-GPU ->
+2-GPU C512 validated (bitwise-exact, 19.68 GiB/GPU, TOTAL 1.120x,
+**recommended C512 mode: 2-GPU/3-ranks-per-GPU**) -> `State_To_FV`
+CUDA-ported and made **CONDITIONAL DEFAULT** at `device_count>=2` ->
+node-local `MPI_Comm_split_type` GPU binding validated single-/
+multi-node; `alla100` QOS caps job-wide (not per-node) GPU/mem;
+multi-node MPS needs an explicit `srun --overlap` broadcast (§7).
 
-**Prompt 102 — multi-GPU scaling architecture study (ARCHITECTURE/
-DESIGN ONLY, CLOSED)**: job 58639804, zero source change — memory gap
-**overwhelmingly per-rank/per-context** (HIGH confidence), not
-fixed-per-GPU; `comm_size==6`/no-intra-tile-halo is the binding
-constraint for C1024+. Decision: proceed to 2-GPU C512 validation
-(executed by Prompt 103). See `p102_*.md`.
+**Prompts 108-112 (sub-tile C1024+ halo chain, all CLOSED)**: 108 mapped
+the 24-stage C1024 intra-tile architecture (design only); 109
+implemented/validated the topology/donor-identification layer for a
+synthetic 24-rank layout (bridge gate untouched); 110 designed the
+Phase-5 wiring slice; 111 implemented it and found `launch_halo_transfer`
+indexed `peer_send` directly by `.tile` (fixed-6), blocking any
+layout=2x2 cross-face donor; 112 fixed this by separating physical face
+(`.tile`) from transport peer identity (`.rank`), GPU-validated at real
+24-rank MPI scale (**0/22224 failures**, 0 sanitizer errors/rank). No
+bridge/gate relaxed, no corner transport, no numerical change, no
+commit/push throughout. Docs listed in §11.
 
-**Prompt 103 — C512 2-GPU validation and performance (CLOSED, MULTI-GPU
-PERFORMANCE POSITIVE)**: executed P102's Stage-14 experiment (job
-58642794; resumed after a connection-loss interruption — 9 rundirs were
-already staged with a stale-`EXPDIR` defect, fixed before submission).
-1-GPU/6-ranks vs. 2-GPU/3-ranks-per-GPU, same allocation, unmodified
-`dev = mod(comm_rank, device_count)`. Correctness **BITWISE EXACT**
-(T/U/V/PS). Memory converged **19.68 GiB/GPU** (matches P102's
-projection). Performance **TOTAL 1.120x/10.70%** (3/3 pairs, ±0.5pp),
-**FV_DYN_LOOP 1.397x, DYN_CORE 1.773x**; COMM_TOTAL flat as expected.
-`State_To_FV` CUDA memory feasibility **CONFIRMED** (19.7 GiB/GPU free,
-~40x the P98-100 shortfall). **New recommended C512 mode:
-2-GPU/3-ranks-per-GPU.** See `p103_*.md`.
-
-**Prompt 104 — `State_To_FV` CUDA enabled/validated at 2-GPU**: executed
-P103's Option A (job 58645113). CUDA dispatch **CONFIRMED**
-(**+440.4 MiB/GPU** matching P100's +452.97 MiB prediction). Direct
-speedup **1.633x mean/38.75% reduction** (3/3 pairs). **TOTAL +1.01%
-mean**, FV_DYN_LOOP +0.60%, DYN_CORE flat (outside `k_split`). Memory
-SAFE (19.3 GiB/GPU free). See
-`p104_state_to_fv_2gpu_validation_performance_2026-09-29.md`.
-
-**Prompt 105 — closed Prompt 104's correctness gap**: re-inspected job
-58645113's *existing* rundirs (no new job) — P104's "no HISTORY
-output" claim was a wrong-directory check; output existed under each
-rundir's `scratch_c512_.../` subdirectory. Field comparison: **T/PS
-BITWISE, U/V ROUND-OFF CLEAN** (max_rel 1e-8 to 1.7e-6, 0/131584 NaN
-divergence), no halo/PE-layout-clustered error pattern. All three
-validation-hierarchy legs satisfied at C512/2-GPU/3-ranks-per-GPU. See
-`p105_state_to_fv_c512_2gpu_correctness_2026-09-29.md`.
-
-**Prompt 106 — `State_To_FV` CUDA made CONDITIONAL DEFAULT (CLOSED)**:
-selector-only change (see header) makes CUDA the default at
-`device_count>=2`, Fortran default otherwise (safe at the known-unsafe
-6-ranks/1-GPU density). `ENABLE`/`FORCE_FORTRAN` both preserved.
-Selector matrix (C32, job 58650663): 6/6 PASS incl. 1-GPU-safety and
-FORCE-wins-over-ENABLE. C512/2-GPU smoke (job 58651017, reused P104's
-rundirs): bare default selects CUDA (rc=0, `DYN_DATE_COUNT=30`, 0
-Abort/FATAL/OOM/NaN-Inf, peak 20585 MiB/GPU both GPUs — matches ~20.6
-GiB/GPU prediction); `FORCE_FORTRAN` escape hatch still selects
-Fortran (rc=0, same clean checks). No numerical/CUDA-kernel/ABI/
-other-selector change; no commit/push. Documented (not implemented) a
-multi-node device-mapping limitation — `dev = mod(comm_rank,
-device_count)`/the new default gate both assume single-node; a genuine
-multi-node topology needs `MPI_Comm_split_type`-based node-local
-ranking instead (§7, §9). See
-`p106_state_to_fv_default_policy_2026-09-29.md`.
+**Prompts 113-114 (CLOSED)**: 113 designed, 114 implemented, the FMS
+layout-metadata -> CUDA bridge integration. `Atm%layout(1:2)` confirmed
+authoritative; `layout_x/layout_y` now threaded additively through the
+ABI/runtime, `<=0`-defaults-to-1, GPU-executed clean at C32/C512-2GPU/MPS
+(jobs 58665460/58665576), `layout=1x1` correct every rank,
+behavior-neutral within node-variance noise. All four >6-rank gates
+re-confirmed untouched; a fifth, independent layout-consistency
+`MPI_Allgather` FATAL was added, not a relaxation. FMS within-tile rank
+ordering remains UNVERIFIED — recommended next step: Option A, a
+Fortran-only `layout=(2,2)` diagnostic (§9). Docs in §11.
 
 ## 6. Standalone Integration Status
 
@@ -296,15 +253,15 @@ ranking instead (§7, §9). See
   templates: **upgraded severity (Prompt 107)** — under concurrency (two
   jobs both pointing at the same stale directory) this caused a real
   `MPI_Abort`/job crash, not just harmless log-capture loss. Always grep
-  any copied `fv3.j` for `setenv EXPDIR` before submission, especially if
-  other jobs may run concurrently.
-- **`alla100` QOS caps a job's summed (not per-node) GPU/mem** (Prompt
-  107): `MaxTRES=gres/gpu=4,mem=510000M`; a 2-node `--gres=gpu:4` job
-  sums to 8 and hits `QOSMaxGRESPerJob` — budget GPU/mem job-wide.
-- **Multi-node CUDA MPS needs an explicit broadcast** (Prompt 107):
-  `fv3_mps_lifecycle.sh` is head-node-only; use
-  `srun --overlap --nodes=N --ntasks-per-node=1` to start/stop the MPS
-  daemon on every node. Pattern:
+  any copied `fv3.j` for `setenv EXPDIR` before submission.
+- **Prompt 107 (RESOLVED/VALIDATED)**: node-local `MPI_Comm_split_type`
+  GPU binding validated single-node (bit-identical) and genuine 2-node
+  multi-node, no regression — does **not** by itself resolve the
+  separate `comm_size==6` constraint below. `alla100` QOS caps a job's
+  summed (not per-node) GPU/mem (`MaxTRES=gres/gpu=4,mem=510000M`) —
+  budget job-wide for any multi-node job. Multi-node CUDA MPS needs an
+  explicit broadcast (`fv3_mps_lifecycle.sh` is head-node-only; use
+  `srun --overlap --nodes=N --ntasks-per-node=1`). See
   `p107_node_local_gpu_binding_2026-09-30.md` §5.
 - R4/R8 production (non-HS) validation covers only c8/c16/c32. HS
   validation covers c8-c128 up to 100-day, C256 (24h), C512 (6h) — no
@@ -320,33 +277,40 @@ ranking instead (§7, §9). See
   other unsupported/unvalidated density. `DYN_EPILOGUE` (688.67 ms/
   call, MAPL-dominated) remains the sole open Prompt-96 candidate,
   feasibility uncertain.
-- **Multi-node device-mapping limitation: RESOLVED (Prompt 107).**
-  `fv3_gpu_bridge_init` now derives a node-local rank via
-  `MPI_Comm_split_type(MPI_COMM_TYPE_SHARED,...)` and selects
-  `dev = mod(local_rank, device_count)`. Validated single-node
-  (bit-identical to Prompt 103/106) and genuine 2-node multi-node
-  (divergence proof vs. the old global-rank rule); no numerical/
-  performance regression. See
-  `p107_node_local_gpu_binding_2026-09-30.md`. Does **not** by itself
-  resolve the separate `comm_size==6`-hardcoded/no-intra-tile-halo
-  constraint below — that still blocks >6-rank scaling (e.g. C1024).
-- **Build blocker RESOLVED (Prompt 81B)**: an apparent `FV_StateMod.F90`
-  source mismatch was incremental-rebuild staleness — fixed by a clean
-  whole-target rebuild (forcing individual `.o` files is not enough).
-- **Structural cold-start tracer-zero limitation (found Prompt 77,
-  applies to the entire standalone harness family)**: with
-  `COLDSTART=1`+`external_ic=.false.`+empty `ExtData.rc` (the default
-  everywhere), `fv_restart.F90` never calls `fv_io_read_restart`/
-  `get_external_ic`, so `Atm%q` stays at its zero default all run. Any
-  future tracer-transport validation must seed `q` via a dedicated
-  mechanism or a different IC path — do not modify `fv_restart.F90`
-  without explicit authorization (declined for P77).
+- **Build blocker RESOLVED (Prompt 81B)**: `FV_StateMod.F90` mismatch
+  was incremental-rebuild staleness — use a clean whole-target rebuild.
+- **Structural cold-start tracer-zero limitation (Prompt 77, applies to
+  the whole standalone harness family)**: default `COLDSTART=1`+
+  `external_ic=.false.`+empty `ExtData.rc` means `fv_restart.F90` never
+  seeds `Atm%q`, so it stays zero all run. Future tracer-transport
+  validation needs a dedicated seeding mechanism — do not modify
+  `fv_restart.F90` without authorization (declined for P77).
 - **CUDA dyn_core bridge hardcodes `comm_size==6`** (one tile/rank), no
-  intra-tile (same-face) halo path. Raising rank count beyond 6 — the
-  natural lever for bounding per-rank memory at C1024+ (P102 §9,
-  resolved memory gap: overwhelmingly per-rank/per-context, HIGH
-  confidence) — needs a new halo-exchange architecture; not yet
-  designed beyond P102's options table.
+  intra-tile (same-face) halo path — the binding constraint for C1024+
+  (P102 §9: memory gap is per-rank, HIGH confidence). Architecture
+  mapped (Prompt 108); topology/donor-identification layer IMPLEMENTED +
+  GPU EXECUTED + VALIDATED for a synthetic 24-rank/2x2 layout (Prompt
+  109); Phase 5 field-data slice IMPLEMENTED (Prompt 111) then its
+  `launch_halo_transfer` blocker **FIXED and VALIDATED at real 24-rank
+  MPI scale (Prompt 112)** — the transport layer now separates physical
+  face (`.tile`, permanent 1..6) from transport peer identity (`.rank`,
+  generalized beyond 6) throughout builder/transfer/`MpiHaloTransport`.
+  **Still open**: the Fortran bridge's own `comm_size==6` gate and
+  `create_mpi_transport`'s production `comm_size==6` gate are both
+  intentionally untouched — no real >6-rank production path exists yet.
+  Bridge metadata plumbing **IMPLEMENTED by Prompt 114** (designed by
+  Prompt 113): `layout_x/layout_y`, derived from `Atm%layout(1:2)`, now
+  flow additively through the ABI/bridge/runtime, GPU-executed clean at
+  C32/C512 production scale, `layout=1x1` on every rank — WIRES ONLY, no
+  gate relaxed, no sub-tile derivation used anywhere (`p114_*.md`). The
+  second one-rank-per-tile gate inside `build_rank_of_tile`
+  (`fv3_gpu_dyncore_bridge.F90:1516`) remains unrelaxed; a new,
+  independent layout-consistency `MPI_Allgather` FATAL was added
+  alongside it. FMS within-tile rank ordering (row-major/x-fastest
+  assumption) remains UNVERIFIED — recommended next step is a
+  Fortran-only `layout=(2,2)` diagnostic (§9), before any sub-tile
+  topology-builder work. Corner transport remains metadata-only, no
+  message mechanism, separately gated.
 
 ## 8. Critical "Do Not Repeat" Lessons
 
@@ -396,23 +360,28 @@ ranking instead (§7, §9). See
 
 **Performance track (`optimization/cuda-fv3-performance`, current
 branch) — confirm scope before starting:**
-0. DONE through Prompt 106 — full detail in §5. All CUDA-port
-   close-out decisions (PT/DELZ, REMAP_UV, TRACER_2D NO-GO,
-   REMAP_Q/PRESSUREVARS, REMAP_TOTALENERGYCON BLOCKED, `FV_To_State`
-   KEEP ON CPU) stand unchanged. **Prompt 103 CLOSED**: 2-GPU C512
-   MULTI-GPU PERFORMANCE POSITIVE (TOTAL 1.120x/10.70%, bitwise-exact).
-   **Prompts 104-106 CLOSED**: `State_To_FV` CUDA fully validated
-   (GPU EXECUTED, NUMERICALLY VALIDATED, PERFORMANCE VALIDATED) and now
-   **CONDITIONAL DEFAULT ENABLED** at `device_count>=2`. **Prompt 107
-   CLOSED**: node-local GPU binding implemented/validated single- and
-   multi-node (§7) — the binding prerequisite for multi-node scaling.
-1. **Recommended next step: a C1024 test still needs its own `bdt`
-   stability search (§7) and, if it requires >6 ranks to fit memory
-   (likely, per P102), a new halo-exchange architecture** — the
-   `comm_size==6`-hardcoded/no-intra-tile-halo constraint (§7) is
-   unresolved and is the actual blocker now that node-local binding is
-   done. Confirm scope with the user first; not yet designed beyond
-   P102's options table.
+0. DONE through Prompt 112 — full detail in §5/§7 (do not reopen closed
+   CUDA-port decisions without fresh authorization). Sub-tile halo
+   chain: Prompt 108 mapped the C1024 architecture; Prompt 109
+   implemented/validated the topology/donor-identification layer;
+   Prompt 110 designed the Phase-5 wiring slice; Prompt 111 implemented
+   it and found the transfer-layer blocker; Prompt 112 fixed and
+   validated it at real 24-rank MPI scale — see §7's sub-tile bullet and
+   `p112_generalized_halo_transport_peer_ids_2026-09-30.md`.
+1. **DONE (Prompts 113-114): FMS layout metadata bridge-ABI plumbing,
+   designed then implemented.** `layout_x/layout_y` now flow through
+   the ABI/bridge/runtime, GPU-executed clean at C32/C512, all >6-rank
+   gates intact (`p114_*.md`). **Recommended next step: Option A** — a
+   Fortran-only `layout=(2,2)` diagnostic (print `Atm%layout`, each
+   rank's `(is,ie,js,je)` window, and `mpp_pe()`-relative ordering) to
+   empirically verify FMS's within-tile rank ordering before any
+   sub-tile topology-builder work is attempted; explicitly NOT Option C
+   (switching production topology construction). This remains
+   production-dispatch-adjacent and must not be attempted without
+   explicit sign-off. A C1024 run also needs its own `bdt` stability
+   search (§7). Lower priority: (a) Phase B corner-transport design
+   (deferred three times now); (b) fold Prompt 109's duplicated
+   vector-sign formula into one shared helper.
 2. Lower priority: (a) tracer-numerics validation for the §7 cold-start
    tracer-zero limitation; (b) narrow `use_cuda_tp2d` to always-Fortran
    (hygiene); (c) `FV_DYNAMICS` non-loop residual (537.37 ms/call,
@@ -451,14 +420,25 @@ search); fix the `scratch_*.log`/stale-`EXPDIR` harness bug (§7).
   `Held_Suarez_ForcingMod.F90` (this repo's root) is referenced by the
   tracked `CMakeLists.txt`/`FV_StateMod.F90` but never committed here —
   build is broken from a fresh checkout of *this* repo until added.
-- Prompts 100-106 each added one new untracked doc under
-  `docs/performance/` plus forward-pointing edits to prior docs. No
-  CUDA/Fortran source touched by any of them. Job scripts/rundirs live
-  under the separate `GEOSfvdycore_fortran_perf` checkout — not source,
-  not committed.
-- Numerous untracked scratch scripts/logs/probes exist at repo root and
-  under `perf_rerun_logs/`, `scratch_*/` — not source. Reusable tooling
-  lives under `tools/` — review file-by-file before any future commit.
+- Prompts 100-112 each added one untracked doc under `docs/performance/`
+  plus forward-pointing edits to prior docs. Prompt 111 added the
+  additive builder header + 2 new/extended test files; Prompt 112
+  modified `fv3_gpu_halo_mpi.{hpp,cpp}`, `fv3_gpu_halo_exchange.cu`,
+  `fv3_gpu_runtime.cpp` (peer-identity generalization) and added one new
+  test file (`test_halo_subtile_mpi_transport.cu`) + one
+  `CMakeLists.txt` target registration (§7's sub-tile bullet) — no
+  bridge/gate/numerical source touched by any of them. Prompt 113 added
+  one new untracked doc (`p113_*.md`, design/mapping only, zero source
+  touched) plus forward-pointing edits to `p112_*.md`, `p108_*.md`, and
+  the roadmap. Prompt 114 (edits detailed in §5) added 4 additive-only
+  source edits, one new doc, and reconstructed the previously-missing
+  `build_cuda_r8_intelmpi/` build dir (not to be committed) plus two new
+  rundirs and one sbatch script. Job scripts/rundirs live under the
+  separate `GEOSfvdycore_fortran_perf` checkout — not source, not
+  committed.
+- Untracked scratch scripts/logs/probes exist at repo root and under
+  `perf_rerun_logs/`, `scratch_*/` — not source; review file-by-file
+  before any future commit. Reusable tooling lives under `tools/`.
 - Do not commit: build dirs, profiler artifacts, `scratch_*/`, `*.out`
   Slurm logs, NetCDF output, restart data, binaries. Do commit (if
   explicitly requested): source fixes, permanent test/tooling, docs.
@@ -473,40 +453,50 @@ now in `docs/agent_handoff/milestone_summary_2026-09-19.md` — start
 there for anything historical. Below is condensed in §5/§7/§9; read a
 file only for step-by-step detail.
 
-- `prompt_43`-`prompt_48_*` — CUDA-aware `MpiHaloTransport`, MAPL crash
-  fix, device-memory root cause, rank-density refuted, authoritative
-  same-node C512 rerun (§5).
-- `p59`-`p69_*` — PT/DELZ chain, **PERFORMANCE POSITIVE — KEEP** (§5).
-- `p70`/`p71_remap_uv_*` — REMAP_UV mapping+CUDA, production default.
-- `p73`-`p83_*` — TRACER_2D chain: STOP CUDA TRACER PRODUCTION
-  OPTIMIZATION, CLOSED (§5).
-- `p84b`-`p93_*` — REMAP_Q and REMAP_PRESSUREVARS chains, both now
-  production default (§5).
-- `p94_*` — refreshed C512 hotspot profile; selected
-  `REMAP_TOTALENERGYCON` next.
-- `p95`-`p97_*` — `REMAP_TOTALENERGYCON` **BLOCKED BY COMMUNICATION**;
-  discovered `DYN_EPILOGUE`; `FV_To_State` **KEEP ON CPU** (§5).
-- `p98`-`p100_*` — `State_To_FV` Option-A port GPU-executed/C32-correct,
-  memory-blocked at 6-ranks/1-GPU (resolved in principle by P102, §5).
-- `p101_*`/`p101a_*` — C512 memory-gap accounting (**RESOLVED by
-  P102**) and the cumulative CUDA performance baseline (TOTAL 1.153x)
-  reused verbatim by P102 (§5).
-- `p102_*` — zero-source-change diagnostic: memory gap overwhelmingly
-  per-rank not fixed-per-GPU; decided to proceed to 2-GPU C512
-  validation. **ARCHITECTURE/DESIGN ONLY, CLOSED** (§5, §7).
-- `p103_*` — 2-GPU C512 validation (job 58642794): bitwise-exact,
-  19.68 GiB/GPU, **TOTAL 1.120x/10.70%**. **MULTI-GPU PERFORMANCE
-  POSITIVE, CLOSED** (§5).
-- `p104_*`/`p105_*` — enabled/validated `State_To_FV` CUDA at 2-GPU
-  (job 58645113): 1.633x direct, TOTAL +1.01%, T/PS BITWISE, U/V
-  ROUND-OFF CLEAN. **READY FOR DEFAULT ENABLE, CLOSED** (§5).
-- `p106_*` — default-enabled `State_To_FV` CUDA at `device_count>=2`
-  only (jobs 58650663/58651017, 6/6 and 2/2 PASS). **CONDITIONAL
-  DEFAULT ENABLED, CLOSED.**
-- `p107_*` — node-local `MPI_Comm_split_type` GPU binding (jobs
-  58658676/58658840/58658921): single-node bit-identical, genuine
-  2-node divergence proof, no regression. **VALIDATED, CLOSED** (§5,
+- `prompt_43`-`prompt_107_*` — full CUDA-aware `MpiHaloTransport`
+  bring-up through node-local multi-node GPU binding: PT/DELZ chain
+  (KEEP), REMAP_UV (production default), TRACER_2D (STOP CUDA TRACER
+  PRODUCTION OPTIMIZATION), REMAP_Q/REMAP_PRESSUREVARS (production
+  default), REMAP_TOTALENERGYCON (BLOCKED BY COMMUNICATION),
+  `FV_To_State` (KEEP ON CPU), `State_To_FV` (CUDA CONDITIONAL DEFAULT
+  at `device_count>=2`), 2-GPU C512 validation (TOTAL 1.120x/10.70%),
+  and node-local `MPI_Comm_split_type` GPU binding — all **CLOSED**,
+  fully condensed in §5/§7/§9; read the specific `p*.md` file only for
+  step-by-step numerical/job-ID detail.
+- `p108_*` — C1024 intra-tile halo-exchange architecture: 24-stage
+  design mapping the `comm_size==6` generalization (target 2x2
+  ranks/face, 24 ranks). **DESIGN/MAPPING ONLY, CLOSED** (header, §5,
   §7, §9).
+- `p109_*` — Phases 1-4 of the above: sub-tile topology/donor
+  identification IMPLEMENTED/GPU EXECUTED/VALIDATED for a synthetic
+  24-rank layout; includes the `cubed_sphere_neighbor`
+  device-callability fix. **CLOSED** (header, §5, §7, §9).
+- `p110_*` — Phase 5 wiring design: mapped topology consumers, selected
+  the additive-builder + field-data-test-harness slice, deferred corners.
+  **DESIGN/SCOPING ONLY, CLOSED** (header, §7, §9).
+- `p111_*` — implemented the Phase-5 slice: additive builder + field-data
+  harness. layout=1x1 real-kernel regression bitwise-clean (0/20736
+  failures). layout=2x2 found `launch_halo_transfer`'s `peer_send`
+  index gated to `nb.tile` in `[1,6]`, a whole-subsystem fixed-6-tile
+  constraint. **IMPLEMENTED + GPU EXECUTED, BLOCKED, CLOSED** — blocker
+  fixed by Prompt 112 (header, §7, §9).
+- `p112_*` — generalized `launch_halo_transfer`/`MpiHaloTransport` peer
+  storage to separate physical face from transport-peer identity;
+  GPU-executed a real 24-rank synthetic MPI test (0/22224 failures, 0
+  sanitizer errors/rank); fixed-6 re-audit found no remaining
+  ungeneralized transport storage; corrected two prior docs' inaccurate
+  "`launch_halo_unpack` never reads `.tile`" claim. Bridge/MPI-factory
+  `comm_size==6` gates untouched. **IMPLEMENTED + GPU EXECUTED +
+  NUMERICALLY VALIDATED, CLOSED** (header, §5, §7, §9).
+- `p113_*`/`p114_*` — 113 designed, 114 implemented, the FMS
+  decomposition-metadata -> CUDA bridge integration: `Atm%layout(1:2)`
+  is the authoritative `layout_x/layout_y` source; threaded additively
+  through ABI/bridge/runtime; GPU-executed clean at C32/C512 production
+  scale, behavior-neutral within node-variance noise; all four >6-rank
+  gates re-confirmed untouched. FMS within-tile rank ordering remains an
+  unverified assumption — recommended next step is a Fortran-only
+  `layout=(2,2)` diagnostic (Option A), not a topology-builder switch.
+  **IMPLEMENTED + GPU EXECUTED, CLOSED** (header, §5, §7, §9).
 
 ---
 

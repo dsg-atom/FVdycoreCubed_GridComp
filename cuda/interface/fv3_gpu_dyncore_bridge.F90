@@ -145,6 +145,11 @@ contains
       integer(c_int64_t)             :: ev
       integer(c_int32_t)             :: rank_of_tile(6)
       integer(c_int32_t)             :: mpi_transport_kind
+      ! Prompt 114: FMS decomposition layout metadata, wired through to the
+      ! ABI/runtime for storage/diagnostics only -- see fv3_gpu_bridge_init's
+      ! "layout" comment block below. Does not gate or alter any topology,
+      ! transport, or dispatch behavior.
+      integer(c_int32_t)             :: layout_x, layout_y
       integer :: crc, ierr, comm_rank, comm_size, dev
       integer :: local_rank, local_size, split_ierr
       integer :: fail_fid, fail_aux
@@ -163,6 +168,23 @@ contains
       if (comm_size /= 6) then
          call mpp_error(FATAL, 'fv3_gpu_bridge_init: the CUDA dyn_core backend '// &
               'requires exactly 6 ranks with one cubed-sphere tile per rank')
+      endif
+
+      ! ---- FMS decomposition layout metadata (Prompt 114) -----------------------
+      ! Atm%layout(1:2) is FMS' own authoritative within-tile decomposition
+      ! (Atm%layout(1)=layout_x, Atm%layout(2)=layout_y), pointer-aliased from
+      ! fv_control.F90 and already resident on Atm, which this subroutine
+      ! already receives -- no new plumbing above this call site. Today's
+      ! production configuration is always layout=(1,1) (one rank per tile);
+      ! the comm_size==6 gate above remains the SOLE authority for that, this
+      ! is storage/diagnostics only. A value <1 would mean FMS itself failed
+      ! to set up its own decomposition, which is a genuine FATAL, not a
+      ! "default and continue" case like an omitted ABI field.
+      layout_x = int(Atm%layout(1), c_int32_t)
+      layout_y = int(Atm%layout(2), c_int32_t)
+      if (layout_x < 1 .or. layout_y < 1) then
+         call mpp_error(FATAL, 'fv3_gpu_bridge_init: Atm%layout(1:2) reports '// &
+              'a non-positive within-tile decomposition; refusing to proceed')
       endif
 
       ! ---- node-local rank, for GPU binding on multi-node allocations -----------
@@ -205,6 +227,13 @@ contains
          ! codebase (see FV_StateMod.F90's P99_EXIT_DUMP), used here so every
          ! rank's binding line actually reaches the log, not just PE 0's.
          write(0,'(A)') trim(msg)
+
+         ! Prompt 114: additive diagnostic only, same env gate as the
+         ! FV3_GPU_BIND line above -- no unconditional production log added.
+         write(msg,'(a,i0,a,i0,a,i0,a,i0)') &
+              'FV3_GPU_LAYOUT layout=', layout_x, 'x', layout_y, &
+              ' tile=', Atm%tile, ' rank=', comm_rank
+         write(0,'(A)') trim(msg)
       endif
 
       ! ---- create -------------------------------------------------------------
@@ -225,6 +254,8 @@ contains
       cd%npz                = int(Atm%npz,    c_int64_t)
       cd%halo_width         = int(Atm%bd%ng,  c_int32_t)
       cd%flags              = 0
+      cd%layout_x           = layout_x
+      cd%layout_y           = layout_y
       ! Deliberately zero. The communicator does NOT cross here: this field has
       ! never been wired to anything, and MPI_Comm cannot appear in a stable C
       ! ABI. It crosses as the Fortran INTEGER handle at
@@ -299,12 +330,14 @@ contains
       ! runtime cross-checks it against this context's own mpi_rank.
       bridge_tile = Atm%tile
       rank_of_tile = -1
-      call build_rank_of_tile(comm, comm_rank, bridge_tile, rank_of_tile)
+      call build_rank_of_tile(comm, comm_rank, bridge_tile, rank_of_tile, &
+                              layout_x, layout_y)
 
       crc = fv3_gpu_set_cubed_sphere_topology(ctx, int(bridge_tile, c_int32_t), &
                                               int(Atm%npx, c_int64_t),          &
                                               int(Atm%npy, c_int64_t),          &
-                                              rank_of_tile, err)
+                                              rank_of_tile,                     &
+                                              layout_x, layout_y, err)
       call check(crc, err, 'fv3_gpu_set_cubed_sphere_topology')
 
       ! ---- halo transport ----------------------------------------------------
@@ -1429,10 +1462,18 @@ contains
       end do
    end subroutine state_to_fv_uv_mask
 
-   subroutine build_rank_of_tile(comm, comm_rank, tile, rank_of_tile)
+   subroutine build_rank_of_tile(comm, comm_rank, tile, rank_of_tile, layout_x, layout_y)
       integer,            intent(in)  :: comm, comm_rank, tile
       integer(c_int32_t), intent(out) :: rank_of_tile(6)
+      ! Prompt 114 Stage 7: reuses this routine's existing per-rank
+      ! MPI_Allgather rather than adding a second init-only collective.
+      ! Cross-checks that every rank in the (already-required) 6-rank
+      ! communicator agrees on the FMS within-tile layout -- a disagreement
+      ! here would mean ranks were launched against inconsistent Atm state,
+      ! which is a genuine FATAL, independent of the comm_size==6 gate.
+      integer(c_int32_t), intent(in)  :: layout_x, layout_y
       integer :: tile_of_rank(6), r, ierr
+      integer :: layout_of_rank(2,6), my_layout(2)
       character(len=160) :: msg
 
       tile_of_rank = -1
@@ -1440,6 +1481,21 @@ contains
       if (ierr /= MPI_SUCCESS) then
          call mpp_error(FATAL, 'fv3_gpu_bridge_init: MPI_Allgather of the tile map failed')
       endif
+
+      my_layout = (/ int(layout_x), int(layout_y) /)
+      call MPI_Allgather(my_layout, 2, MPI_INTEGER, layout_of_rank, 2, MPI_INTEGER, comm, ierr)
+      if (ierr /= MPI_SUCCESS) then
+         call mpp_error(FATAL, 'fv3_gpu_bridge_init: MPI_Allgather of the layout map failed')
+      endif
+      do r = 1, 6
+         if (layout_of_rank(1,r) /= int(layout_x) .or. layout_of_rank(2,r) /= int(layout_y)) then
+            write(msg,'(a,i0,a,i0,a,i0,a,i0,a,i0)') &
+                 'fv3_gpu_bridge_init: rank ', r-1, ' reports layout ', &
+                 layout_of_rank(1,r), 'x', layout_of_rank(2,r), &
+                 ' which disagrees with rank ', comm_rank
+            call mpp_error(FATAL, trim(msg))
+         endif
+      end do
 
       rank_of_tile = -1
       do r = 1, 6

@@ -405,12 +405,131 @@ bool make_cubed_sphere_topology(int tile, int64_t npx, int64_t npy,
                                 const int32_t *rank_of_tile,
                                 TopologyView &out) noexcept;
 
+namespace detail {
+
+/* The mosaic table and its consistency proofs. Moved here (from
+ * fv3_gpu_halo_topology.cpp) so that cubed_sphere_neighbor() below can be
+ * FV3_HALO_HD (host+device): a __device__-callable function's body must be
+ * visible to nvcc in every translation unit that instantiates it, which a
+ * separately-compiled host-only .cpp cannot provide. This is a mechanical
+ * device-callability fix only -- the table, the reciprocity/parity
+ * static_asserts, and the lookup itself are byte-for-byte the same logic
+ * that lived in the .cpp; see that file's history for the original
+ * CubeHalo.F90:213-261 / fv_mp_mod.F90:577-625 derivation comment. Numerical
+ * semantics unchanged.
+ *
+ * Anonymous-namespace-equivalent: `detail` here is internal-linkage-by-
+ * convention only (each including TU gets its own copy of this pure,
+ * side-effect-free table), matching the original .cpp's unnamed namespace. */
+
+struct Donor {
+  int8_t tile;   // 1-based
+  TileEdge edge; // the donor's OWN edge that abuts mine
+};
+
+inline constexpr TileEdge kW = TileEdge::west;
+inline constexpr TileEdge kE = TileEdge::east;
+inline constexpr TileEdge kS = TileEdge::south;
+inline constexpr TileEdge kN = TileEdge::north;
+
+/* Indexed [tile-1][static_cast<int>(TileEdge)]; see fv3_gpu_halo_topology.cpp
+ * (pre-move) for the full derivation comment.
+ *
+ * Defined via a macro and instantiated TWICE (once as an ordinary host array
+ * for the static_asserts/host use below, once more as a __device__ array
+ * when nvcc is active) so that cubed_sphere_neighbor() has device-resident
+ * storage to index at runtime on the GPU, while both instantiations remain
+ * textually identical -- a single source of truth, not a hand-duplicated
+ * table that could drift out of sync. */
+#define FV3_HALO_MOSAIC_TABLE_INIT                                                               \
+  {                                                                                               \
+      /* tile 1 */ {{5, kN}, {2, kW}, {6, kN}, {3, kW}},                                          \
+      /* tile 2 */ {{1, kE}, {4, kS}, {6, kE}, {3, kS}},                                          \
+      /* tile 3 */ {{1, kN}, {4, kW}, {2, kN}, {5, kW}},                                          \
+      /* tile 4 */ {{3, kE}, {6, kS}, {2, kE}, {5, kS}},                                          \
+      /* tile 5 */ {{3, kN}, {6, kW}, {4, kN}, {1, kW}},                                          \
+      /* tile 6 */ {{5, kE}, {2, kS}, {4, kE}, {1, kS}},                                          \
+  }
+
+inline constexpr Donor mosaic[cubed_sphere_tiles][4] = FV3_HALO_MOSAIC_TABLE_INIT;
+
+#if defined(__CUDACC__)
+/* Device-resident mirror of `mosaic`, used only by cubed_sphere_neighbor()
+ * when it executes on the GPU (see the __CUDA_ARCH__ branch below). Never
+ * referenced by the host-only static_asserts in this namespace. */
+/* `static`, not `inline`: an __device__ variable must have internal linkage
+ * in whole-program (non-`-rdc`) compilation, so each translation unit gets
+ * its own file-local copy -- consistent with `detail`'s anonymous-namespace-
+ * equivalent convention above. */
+__device__ static constexpr Donor mosaic_device[cubed_sphere_tiles][4] = FV3_HALO_MOSAIC_TABLE_INIT;
+#endif
+
+#undef FV3_HALO_MOSAIC_TABLE_INIT
+
+inline constexpr TileEdge kAllEdges[4] = {kW, kE, kS, kN};
+
+/* (a) reciprocity, checked by the compiler. */
+constexpr bool reciprocal_at(int tile, int e) {
+  const Donor d = mosaic[tile - 1][e];
+  const Donor back = mosaic[d.tile - 1][static_cast<int>(d.edge)];
+  return back.tile == tile && back.edge == kAllEdges[e];
+}
+/* (b) reversal <=> different axis <=> same tile parity. */
+constexpr bool parity_at(int tile, int e) {
+  const Donor d = mosaic[tile - 1][e];
+  const bool different_axis =
+      edge_is_x_normal(kAllEdges[e]) != edge_is_x_normal(d.edge);
+  const bool same_parity = ((tile & 1) == (int(d.tile) & 1));
+  return different_axis == same_parity;
+}
+constexpr bool table_is_consistent() {
+  for (int t = 1; t <= cubed_sphere_tiles; ++t)
+    for (int e = 0; e < 4; ++e)
+      if (!reciprocal_at(t, e) || !parity_at(t, e)) return false;
+  return true;
+}
+static_assert(table_is_consistent(),
+              "cubed-sphere mosaic table violates reciprocity or the "
+              "reversal<=>parity invariant; re-derive it from "
+              "CubeHalo.F90:213-261 before proceeding");
+
+/* Every tile has exactly two aligned and two rotated edges. */
+constexpr bool two_and_two() {
+  for (int t = 1; t <= cubed_sphere_tiles; ++t) {
+    int rotated = 0;
+    for (int e = 0; e < 4; ++e)
+      if (seam_is_reversed(kAllEdges[e], mosaic[t - 1][e].edge)) ++rotated;
+    if (rotated != 2) return false;
+  }
+  return true;
+}
+static_assert(two_and_two(), "each cube tile must have 2 aligned and 2 rotated edges");
+
+} // namespace detail
+
 /* The mosaic connectivity itself, exposed so tests can assert it directly
  * against CubeHalo.F90:213-261 without going through TopologyView.
  *
  * `tile` is 1-based. Writes the donor tile (1-based) and the donor's own edge
- * for my edge `mine`. Returns false for an out-of-range tile. */
-bool cubed_sphere_neighbor(int tile, TileEdge mine, int &donor_tile,
-                           TileEdge &donor_edge) noexcept;
+ * for my edge `mine`. Returns false for an out-of-range tile.
+ *
+ * FV3_HALO_HD: called from subtile_edge_neighbor()'s cross-face branch
+ * (fv3_gpu_halo_subtile_topology.hpp), which is itself FV3_HALO_HD -- see
+ * detail namespace above for why the implementation now lives here rather
+ * than in fv3_gpu_halo_topology.cpp. */
+FV3_HALO_HD inline bool cubed_sphere_neighbor(int tile, TileEdge mine, int &donor_tile,
+                                              TileEdge &donor_edge) noexcept {
+  if (tile < 1 || tile > cubed_sphere_tiles) return false;
+  const int e = static_cast<int>(mine);
+  if (e < 0 || e > 3) return false;
+#if defined(__CUDA_ARCH__)
+  const detail::Donor d = detail::mosaic_device[tile - 1][e];
+#else
+  const detail::Donor d = detail::mosaic[tile - 1][e];
+#endif
+  donor_tile = static_cast<int>(d.tile);
+  donor_edge = d.edge;
+  return true;
+}
 
 } // namespace fv3::gpu::halo

@@ -251,17 +251,25 @@ int launch_halo_pack(const HaloGroupSpec &spec, const HaloGeometry &g,
 /* Move each of my four edge slots from the DONOR's send buffer into my recv
  * buffer, device to device.
  *
- * `peer_send` is indexed by tile in 1..6 (entry 0 unused), which is the Model B
- * shape: one process holds every tile's buffers. An MPI build replaces exactly
- * this loop -- the buffers, the slot arithmetic, the pack and the unpack are
- * unchanged, which is the property §15 asks to be preserved.
+ * `peer_send` is indexed by EdgeNeighbor.rank (transport peer identity,
+ * 0..peer_count-1) -- NOT by EdgeNeighbor.tile (physical cube face, 1..6;
+ * see fv3_gpu_halo_subtile_view.hpp's field-mapping comment). Production
+ * callers pass `peer_count == cubed_sphere_tiles` with a rank-indexed table
+ * built from the same one-rank-per-face assignment the legacy tile-indexed
+ * table used, so production behavior is byte-for-byte unchanged (Prompt
+ * 112); this generalization only lets a test-only caller supply a larger
+ * peer table for a synthetic multi-rank-per-face topology. An MPI build
+ * replaces exactly this loop -- the buffers, the slot arithmetic, the pack
+ * and the unpack are unchanged, which is the property §15 asks to be
+ * preserved.
  *
  * The copy is per (field, edge) rather than one bulk copy per edge because slots
  * are strided by field, and correctness comes first (§ "Performance Work Comes
  * Later"). */
 int launch_halo_transfer(const HaloGroupSpec &spec, const HaloGeometry &g,
                          const TopologyView &topo, fv_real *const *peer_send,
-                         fv_real *recv, void *stream, fv3_gpu_error *e) noexcept {
+                         int32_t peer_count, fv_real *recv, void *stream,
+                         fv3_gpu_error *e) noexcept {
   clear_error(e);
   if (!spec.live) return fail(e, FV3_GPU_INVALID_ARGUMENT, __func__, "halo group is not live");
   if (!peer_send || !recv)
@@ -270,13 +278,13 @@ int launch_halo_transfer(const HaloGroupSpec &spec, const HaloGeometry &g,
   for (int q = 0; q < 4; ++q) {
     const TileEdge mine = static_cast<TileEdge>(q);
     const EdgeNeighbor &nb = topo.neighbors[q];
-    if (nb.tile < 1 || nb.tile > cubed_sphere_tiles)
+    if (nb.rank < 0 || nb.rank >= peer_count)
       return fail(e, FV3_GPU_INVALID_ARGUMENT, __func__,
-                  "edge has no neighbour tile; a connected topology is required "
+                  "edge has no neighbour rank; a connected topology is required "
                   "before any halo group may be exchanged");
-    const fv_real *src = peer_send[nb.tile];
+    const fv_real *src = peer_send[nb.rank];
     if (!src) return fail(e, FV3_GPU_INVALID_ARGUMENT, __func__,
-                          "neighbour tile has no send buffer");
+                          "neighbour rank has no send buffer");
     /* The donor packed the strip under ITS edge, and under the staggering of
      * whichever of its fields the seam makes me read. On a rotated seam that is
      * my partner, which occupies the OTHER slot of this same group -- so the

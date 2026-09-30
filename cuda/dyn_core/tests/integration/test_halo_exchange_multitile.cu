@@ -251,11 +251,14 @@ void exchange_group(uint32_t group, const char *label) {
     check(launch_halo_pack(spec, geom, fields[t], send[t], stream, &err) == FV3_GPU_SUCCESS,
           "pack succeeded");
 
-  fv_real *send_by_tile[7];
-  for (int t = 0; t <= 6; ++t) send_by_tile[t] = (t == 0) ? nullptr : send[t];
+  /* Prompt 112: launch_halo_transfer indexes by EdgeNeighbor.rank now, not
+   * .tile. rank_of_tile[] above is the identity permutation, so rank == tile
+   * - 1 for every tile here and this re-keying is exact/lossless. */
+  fv_real *send_by_rank[6];
+  for (int r = 0; r < 6; ++r) send_by_rank[r] = send[r + 1];
 
   for (int t = 1; t <= 6; ++t)
-    check(launch_halo_transfer(spec, geom, topo[t], send_by_tile, recv[t], stream, &err) ==
+    check(launch_halo_transfer(spec, geom, topo[t], send_by_rank, 6, recv[t], stream, &err) ==
               FV3_GPU_SUCCESS, "device-to-device transfer succeeded");
 
   for (int t = 1; t <= 6; ++t)

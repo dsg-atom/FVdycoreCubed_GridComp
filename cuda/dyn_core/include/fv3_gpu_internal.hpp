@@ -217,6 +217,14 @@ struct TopologyView {
    * edge_profile -- MUST reject zero rather than infer a value, because a
    * wrong npx/npy silently applies interior stencils at a panel seam. */
   int64_t npx=0, npy=0;
+  /* Prompt 114: FMS processor-layout metadata (Atm%layout(1:2)), stored
+   * verbatim from fv3_gpu_set_cubed_sphere_topology's trailing arguments.
+   * Purely additive with a default that reproduces today's only supported
+   * decomposition, so internal_contract_version does not move (same
+   * precedent as FieldId's own additive-tail comment above). Diagnostics/
+   * consistency-check use only -- no consumer derives sub-tile geometry
+   * (sub_i/sub_j/rank_within_face) from this yet. */
+  int32_t layout_x=1, layout_y=1;
 };
 struct ImmutableViews {
   uint32_t contract_version=internal_contract_version;

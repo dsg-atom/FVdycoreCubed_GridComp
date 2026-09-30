@@ -447,9 +447,16 @@ FV3_HALO_HD inline constexpr int64_t slot_offset(int64_t along_extent, int64_t n
 int launch_halo_pack(const HaloGroupSpec &, const HaloGeometry &, const HaloTileFields &,
                      fv_real *send, void *stream, fv3_gpu_error *,
                      bool fuse_edges = false) noexcept;
+/* Prompt 112: peer_send is indexed by EdgeNeighbor.rank (transport peer
+ * identity, 0..peer_count-1), not by EdgeNeighbor.tile (physical cube face,
+ * 1..6) -- see fv3_gpu_halo_subtile_view.hpp's field-mapping comment for the
+ * .tile-vs-.rank contract. peer_count is the caller-owned size of the
+ * peer_send array; production callers pass cubed_sphere_tiles (6) exactly as
+ * before, so production behavior is unchanged, but the primitive itself can
+ * now index a larger, test-only peer table. */
 int launch_halo_transfer(const HaloGroupSpec &, const HaloGeometry &, const TopologyView &,
-                         fv_real *const *peer_send_by_tile, fv_real *recv, void *stream,
-                         fv3_gpu_error *) noexcept;
+                         fv_real *const *peer_send_by_rank, int32_t peer_count, fv_real *recv,
+                         void *stream, fv3_gpu_error *) noexcept;
 int launch_halo_unpack(const HaloGroupSpec &, const HaloGeometry &, const TopologyView &,
                        const HaloTileFields &, const fv_real *recv, void *stream,
                        fv3_gpu_error *, bool fuse_edges = false) noexcept;

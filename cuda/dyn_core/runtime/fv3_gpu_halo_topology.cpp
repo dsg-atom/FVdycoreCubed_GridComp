@@ -38,83 +38,17 @@
 
 #include "fv3_gpu_halo_topology.hpp"
 
+// The mosaic table, its consistency static_asserts, and cubed_sphere_neighbor()
+// itself now live in fv3_gpu_halo_topology.hpp (namespace fv3::gpu::halo::detail)
+// so that cubed_sphere_neighbor() can be FV3_HALO_HD (host+device) -- a
+// __device__-callable function's body must be visible to nvcc wherever it is
+// instantiated, which this separately-compiled host-only .cpp cannot provide
+// to the CUDA translation units that need it (fv3_gpu_halo_subtile_topology.hpp's
+// subtile_edge_neighbor()). Purely a device-callability move; the table and
+// logic are unchanged. make_cubed_sphere_topology() below still uses
+// detail::mosaic directly, unchanged, via that header include.
+
 namespace fv3::gpu::halo {
-namespace {
-
-struct Donor {
-  int8_t tile;      // 1-based
-  TileEdge edge;    // the donor's OWN edge that abuts mine
-};
-
-constexpr TileEdge W = TileEdge::west;
-constexpr TileEdge E = TileEdge::east;
-constexpr TileEdge S = TileEdge::south;
-constexpr TileEdge N = TileEdge::north;
-
-/* Indexed [tile-1][static_cast<int>(TileEdge)]. TileEdge's enumerator order is
- * west, east, south, north (fv3_gpu_internal.hpp), so the columns below are in
- * that order and NOT in the W/E/S/N reading order of the comment block above by
- * accident -- they happen to coincide. */
-constexpr Donor mosaic[cubed_sphere_tiles][4] = {
-    /* tile 1 */ {{5, N}, {2, W}, {6, N}, {3, W}},
-    /* tile 2 */ {{1, E}, {4, S}, {6, E}, {3, S}},
-    /* tile 3 */ {{1, N}, {4, W}, {2, N}, {5, W}},
-    /* tile 4 */ {{3, E}, {6, S}, {2, E}, {5, S}},
-    /* tile 5 */ {{3, N}, {6, W}, {4, N}, {1, W}},
-    /* tile 6 */ {{5, E}, {2, S}, {4, E}, {1, S}},
-};
-
-constexpr TileEdge all_edges[4] = {W, E, S, N};
-
-/* (a) reciprocity, checked by the compiler. */
-constexpr bool reciprocal_at(int tile, int e) {
-  const Donor d = mosaic[tile - 1][e];
-  const Donor back = mosaic[d.tile - 1][static_cast<int>(d.edge)];
-  return back.tile == tile && back.edge == all_edges[e];
-}
-/* (b) reversal <=> different axis <=> same tile parity. */
-constexpr bool parity_at(int tile, int e) {
-  const Donor d = mosaic[tile - 1][e];
-  const bool different_axis =
-      edge_is_x_normal(all_edges[e]) != edge_is_x_normal(d.edge);
-  const bool same_parity = ((tile & 1) == (int(d.tile) & 1));
-  return different_axis == same_parity;
-}
-constexpr bool table_is_consistent() {
-  for (int t = 1; t <= cubed_sphere_tiles; ++t)
-    for (int e = 0; e < 4; ++e)
-      if (!reciprocal_at(t, e) || !parity_at(t, e)) return false;
-  return true;
-}
-static_assert(table_is_consistent(),
-              "cubed-sphere mosaic table violates reciprocity or the "
-              "reversal<=>parity invariant; re-derive it from "
-              "CubeHalo.F90:213-261 before proceeding");
-
-/* Every tile has exactly two aligned and two rotated edges. */
-constexpr bool two_and_two() {
-  for (int t = 1; t <= cubed_sphere_tiles; ++t) {
-    int rotated = 0;
-    for (int e = 0; e < 4; ++e)
-      if (seam_is_reversed(all_edges[e], mosaic[t - 1][e].edge)) ++rotated;
-    if (rotated != 2) return false;
-  }
-  return true;
-}
-static_assert(two_and_two(), "each cube tile must have 2 aligned and 2 rotated edges");
-
-} // namespace
-
-bool cubed_sphere_neighbor(int tile, TileEdge mine, int &donor_tile,
-                           TileEdge &donor_edge) noexcept {
-  if (tile < 1 || tile > cubed_sphere_tiles) return false;
-  const int e = static_cast<int>(mine);
-  if (e < 0 || e > 3) return false;
-  const Donor d = mosaic[tile - 1][e];
-  donor_tile = static_cast<int>(d.tile);
-  donor_edge = d.edge;
-  return true;
-}
 
 bool make_cubed_sphere_topology(int tile, int64_t npx, int64_t npy,
                                 const int32_t *rank_of_tile,
@@ -142,8 +76,8 @@ bool make_cubed_sphere_topology(int tile, int64_t npx, int64_t npy,
   t.periodic_y = 0;
 
   for (int e = 0; e < 4; ++e) {
-    const TileEdge mine = all_edges[e];
-    const Donor d = mosaic[tile - 1][e];
+    const TileEdge mine = detail::kAllEdges[e];
+    const detail::Donor d = detail::mosaic[tile - 1][e];
     EdgeNeighbor &nb = t.neighbors[static_cast<size_t>(mine)];
     nb.rank = rank_of_tile[d.tile - 1];
     nb.tile = static_cast<int16_t>(d.tile);

@@ -680,6 +680,15 @@ if(BUILD_TESTING)
   target_link_libraries(fv3_halo_topology_test PRIVATE fv3_dyn_core_gpu)
   add_test(NAME fv3_halo_topology COMMAND fv3_halo_topology_test)
 
+  # Prompt 109 Phases 1-4: generalized sub-tile (multi-rank-per-face) halo
+  # topology. Host-only for the same reason as fv3_halo_topology_test above --
+  # every function in fv3_gpu_halo_subtile_topology.hpp is a pure, total
+  # function of its arguments, ADDITIVE to (never modifying) the legacy
+  # topology this test regression-checks against at layout=1x1.
+  add_executable(fv3_halo_subtile_topology_test tests/runtime/test_halo_subtile_topology.cpp)
+  target_link_libraries(fv3_halo_subtile_topology_test PRIVATE fv3_dyn_core_gpu)
+  add_test(NAME fv3_halo_subtile_topology COMMAND fv3_halo_subtile_topology_test)
+
   # Milestone 3A.11V Task 2: the per-level damping translation. Host-only for
   # the same reason as the topology test -- translate_damping() is a total
   # function of its arguments, so the entire authoritative npz=10 production
@@ -752,6 +761,26 @@ if(BUILD_TESTING)
       SKIP_RETURN_CODE 77
     )
 
+    # Prompt 109 Phases 1-4, Stage 15: GPU-EXECUTED smoke test for the
+    # generalized sub-tile halo topology. Proves the new FV3_HALO_HD
+    # topology functions (fv3_gpu_halo_subtile_topology.hpp) actually
+    # execute on a real device and match the host results bit-for-bit --
+    # NOT a halo-fill/data-movement kernel (that is Phase 5+, out of this
+    # task's change budget). Reports 77 (SKIP) with no GPU, matching the
+    # convention used by every other GPU-requiring test above.
+    add_executable(fv3_halo_subtile_topology_cuda_test
+                   tests/runtime/test_halo_subtile_topology_cuda.cu)
+    target_link_libraries(fv3_halo_subtile_topology_cuda_test PRIVATE
+      fv3_dyn_core_gpu
+      CUDA::cudart
+    )
+    set_target_properties(fv3_halo_subtile_topology_cuda_test PROPERTIES CUDA_STANDARD 17)
+    add_test(NAME fv3_halo_subtile_topology_cuda COMMAND fv3_halo_subtile_topology_cuda_test)
+    set_tests_properties(fv3_halo_subtile_topology_cuda PROPERTIES
+      LABELS "gpu"
+      SKIP_RETURN_CODE 77
+    )
+
     # Milestone 3A.10 §13: permanent integrated MULTI-TILE halo exchange test.
     # All six cubed-sphere tiles, exchanged on the device through the real
     # pack -> D2D transfer -> seam-transforming unpack path, with every halo
@@ -765,6 +794,27 @@ if(BUILD_TESTING)
     set_target_properties(fv3_halo_exchange_multitile_test PROPERTIES CUDA_STANDARD 17)
     add_test(NAME fv3_halo_exchange_multitile COMMAND fv3_halo_exchange_multitile_test)
     set_tests_properties(fv3_halo_exchange_multitile PROPERTIES
+      LABELS "gpu"
+      SKIP_RETURN_CODE 77
+    )
+
+    # Prompt 111 (Phase 5, edges-only slice): sub-tile halo FIELD-DATA
+    # exchange test. Generalizes the multitile test above to layout=1x1 (N=6,
+    # a bitwise regression against the legacy builder's already-proven
+    # behavior) and layout=2x2 (N=24 synthetic sub-ranks), using the new
+    # additive fv3_gpu_halo_subtile_view.hpp builder in place of
+    # make_cubed_sphere_topology -- exercises the REAL, UNMODIFIED
+    # launch_halo_pack/launch_halo_transfer/launch_halo_unpack kernel chain.
+    # Edges only; no corner message. Reports 77 (SKIP) with no GPU.
+    add_executable(fv3_halo_subtile_exchange_test
+                   tests/integration/test_halo_subtile_exchange.cu)
+    target_link_libraries(fv3_halo_subtile_exchange_test PRIVATE
+      fv3_dyn_core_gpu
+      CUDA::cudart
+    )
+    set_target_properties(fv3_halo_subtile_exchange_test PROPERTIES CUDA_STANDARD 17)
+    add_test(NAME fv3_halo_subtile_exchange COMMAND fv3_halo_subtile_exchange_test)
+    set_tests_properties(fv3_halo_subtile_exchange PROPERTIES
       LABELS "gpu"
       SKIP_RETURN_CODE 77
     )
@@ -793,6 +843,54 @@ if(BUILD_TESTING)
                        ${MPIEXEC_PREFLAGS} $<TARGET_FILE:fv3_halo_mpi_transport_test>
                        ${MPIEXEC_POSTFLAGS})
       set_tests_properties(fv3_halo_mpi_transport PROPERTIES
+        LABELS "gpu;mpi"
+        SKIP_RETURN_CODE 77
+      )
+
+      # Prompt 109 Phases 1-4, Stage 14: permanent 24-RANK sub-tile halo MPI
+      # ROUTING test (fv3_gpu_halo_subtile_topology.hpp). Host-only, same
+      # reason as fv3_halo_subtile_topology_test above -- pure topology/tag
+      # logic, no CUDA field ever moves here -- so it needs MPI::MPI_CXX
+      # only, not CUDA::cudart, and does not need a GPU visible at runtime.
+      # Reuses the same MPI::MPI_CXX target found above; kept nested here
+      # rather than hoisted out because that target only exists when both
+      # FV3_DYN_CORE_ENABLE_CUDA and FV3_DYN_CORE_ENABLE_MPI_HALO are ON.
+      add_executable(fv3_halo_subtile_mpi_routing_test
+                     tests/integration/test_halo_subtile_mpi_routing.cpp)
+      target_link_libraries(fv3_halo_subtile_mpi_routing_test PRIVATE
+        fv3_dyn_core_gpu
+        MPI::MPI_CXX
+      )
+      add_test(NAME fv3_halo_subtile_mpi_routing
+               COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 24
+                       ${MPIEXEC_PREFLAGS} $<TARGET_FILE:fv3_halo_subtile_mpi_routing_test>
+                       ${MPIEXEC_POSTFLAGS})
+      set_tests_properties(fv3_halo_subtile_mpi_routing PROPERTIES
+        LABELS "mpi"
+      )
+
+      # Prompt 112, Stage 13: synthetic 24-RANK REAL-MPI sub-tile halo
+      # TRANSPORT existence proof (test_halo_subtile_mpi_transport.cu).
+      # Cross-process counterpart of fv3_halo_subtile_exchange_test's
+      # layout=2x2 in-process case, exercising MpiHaloTransport's Prompt 112
+      # Stage 7 arbitrary-size storage over a REAL 24-rank communicator via
+      # the TEST-ONLY create_mpi_transport_for_testing() factory.
+      # create_mpi_transport()'s production comm_size==6 gate is never
+      # called by this target. Needs a GPU visible to all 24 ranks; reports
+      # 77 (SKIP) rather than failing where no device exists.
+      add_executable(fv3_halo_subtile_mpi_transport_test
+                     tests/integration/test_halo_subtile_mpi_transport.cu)
+      target_link_libraries(fv3_halo_subtile_mpi_transport_test PRIVATE
+        fv3_dyn_core_gpu
+        CUDA::cudart
+        MPI::MPI_CXX
+      )
+      set_target_properties(fv3_halo_subtile_mpi_transport_test PROPERTIES CUDA_STANDARD 17)
+      add_test(NAME fv3_halo_subtile_mpi_transport
+               COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 24
+                       ${MPIEXEC_PREFLAGS} $<TARGET_FILE:fv3_halo_subtile_mpi_transport_test>
+                       ${MPIEXEC_POSTFLAGS})
+      set_tests_properties(fv3_halo_subtile_mpi_transport PROPERTIES
         LABELS "gpu;mpi"
         SKIP_RETURN_CODE 77
       )

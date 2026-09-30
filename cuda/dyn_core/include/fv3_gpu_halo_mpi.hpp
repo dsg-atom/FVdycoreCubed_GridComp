@@ -42,6 +42,7 @@
 #include "fv3_gpu_halo_transport.hpp"
 
 #include <string>
+#include <vector>
 
 namespace fv3::gpu::halo {
 
@@ -75,5 +76,19 @@ HaloTransport *create_mpi_host_staged_transport(int comm_fortran_handle, int32_t
 /* Destroy a transport returned by either constructor above. Does not call
  * MPI_Finalize and does not free the communicator, which the caller still owns. */
 void destroy_mpi_host_staged_transport(HaloTransport *t) noexcept;
+
+/* Prompt 112, Stage 13 -- TEST-ONLY. Constructs an MpiHaloTransport over an
+ * arbitrary-size communicator (`peer_count` ranks, several possibly sharing
+ * one PHYSICAL FACE `tile`, 1..6), bypassing create_mpi_transport's
+ * production comm_size==6 gate. No production call site references this
+ * function; it exists solely so a synthetic multi-rank-per-face test can
+ * exercise the transport's arbitrary-size-capable internal storage without
+ * making a real >6-rank production configuration reachable. `tile_of_rank`
+ * is the caller's own measured rank->face map (e.g. via its own
+ * MPI_Allgather) and is used as-is, not independently re-validated. */
+HaloTransport *create_mpi_transport_for_testing(int comm_fortran_handle, int32_t tile,
+                                                int peer_count,
+                                                const std::vector<int32_t> &tile_of_rank,
+                                                TransportMode mode, std::string *why) noexcept;
 
 }  // namespace fv3::gpu::halo

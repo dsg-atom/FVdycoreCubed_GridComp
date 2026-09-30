@@ -70,6 +70,7 @@
 #include <cstring>
 #include <new>
 #include <string>
+#include <vector>
 
 namespace fv3::gpu::halo {
 namespace {
@@ -94,10 +95,17 @@ inline MPI_Datatype fv_real_datatype() noexcept {
 
 class MpiHaloTransport final : public HaloTransport {
  public:
-  MpiHaloTransport(MPI_Comm comm, int32_t tile, int rank,
-                   const std::array<int32_t, cubed_sphere_tiles> &tile_of_rank,
-                   TransportMode mode) noexcept
-      : comm_(comm), tile_(tile), rank_(rank), tile_of_rank_(tile_of_rank), mode_(mode) {
+  /* Prompt 112: `size`/`tile_of_rank` are now measured, arbitrary-size
+   * inputs (a std::vector, not a fixed 6-slot std::array) rather than a
+   * hardcoded 6-tile assumption baked into storage. create_mpi_transport()
+   * still only ever calls this with size==cubed_sphere_tiles==6 (its own
+   * gate, unchanged, below); create_mpi_transport_for_testing() is the one
+   * new caller that can supply a larger size, for Stage 13's synthetic
+   * multi-rank-per-face test only. */
+  MpiHaloTransport(MPI_Comm comm, int32_t tile, int rank, int size,
+                   std::vector<int32_t> tile_of_rank, TransportMode mode) noexcept
+      : comm_(comm), tile_(tile), rank_(rank), size_(size),
+        tile_of_rank_(std::move(tile_of_rank)), mode_(mode) {
     layout_.fill(-1);
   }
 
@@ -373,10 +381,12 @@ class MpiHaloTransport final : public HaloTransport {
   MPI_Comm comm_ = MPI_COMM_NULL;
   int32_t tile_ = 0;
   int rank_ = -1;
-  /* Fixed at 6: create_mpi_host_staged_transport refuses any other communicator
-   * size, so this is validated rather than assumed. */
-  int size_ = cubed_sphere_tiles;
-  std::array<int32_t, cubed_sphere_tiles> tile_of_rank_{};
+  /* Measured at construction (Prompt 112) -- create_mpi_transport() always
+   * passes cubed_sphere_tiles (its own gate, unchanged, refuses any other
+   * communicator size before constructing); create_mpi_transport_for_testing()
+   * may pass a larger size for a synthetic multi-rank-per-face topology. */
+  int size_ = 0;
+  std::vector<int32_t> tile_of_rank_;
   TransportMode mode_ = TransportMode::host_staged;
   std::array<int32_t, kGroups> layout_{};
   fv_real *h_send_ = nullptr;
@@ -437,12 +447,12 @@ HaloTransport *create_mpi_transport(int comm_fortran_handle, int32_t tile,
    * transport routes by the topology's rank table, so the map it validates against
    * must be measured, not presumed. A duplicated or missing tile is refused here
    * rather than discovered as a wrong-donor halo later. */
-  std::array<int32_t, cubed_sphere_tiles> tiles{};
+  std::vector<int32_t> tiles(static_cast<size_t>(size));
   if (MPI_Allgather(&tile, 1, MPI_INT32_T, tiles.data(), 1, MPI_INT32_T, comm) !=
       MPI_SUCCESS)
     return refuse("could not gather the rank->tile map across the halo communicator");
   std::array<int, cubed_sphere_tiles + 1> seen{};
-  for (int r = 0; r < cubed_sphere_tiles; ++r) {
+  for (int r = 0; r < size; ++r) {
     if (tiles[r] < 1 || tiles[r] > cubed_sphere_tiles)
       return refuse("a rank of the halo communicator reported a tile outside 1..6");
     if (seen[tiles[r]]++)
@@ -450,7 +460,58 @@ HaloTransport *create_mpi_transport(int comm_fortran_handle, int32_t tile,
                     "of the six tiles must be held by exactly one rank");
   }
 
-  auto *t = new (std::nothrow) MpiHaloTransport(comm, tile, rank, tiles, mode);
+  auto *t = new (std::nothrow) MpiHaloTransport(comm, tile, rank, size, tiles, mode);
+  if (!t) return refuse("could not allocate the MPI halo transport");
+  return t;
+}
+
+/* Prompt 112, Stage 13 -- TEST-ONLY factory. Constructs an MpiHaloTransport
+ * over an arbitrary-size communicator (`peer_count` ranks, several possibly
+ * sharing one PHYSICAL FACE `tile`), bypassing create_mpi_transport's
+ * production comm_size==6 gate above (which is completely untouched by this
+ * function). Exists solely so a synthetic multi-rank-per-face test can
+ * exercise MpiHaloTransport's now-arbitrary-size-capable internal storage
+ * (Stage 7) without making any real >6-rank production configuration
+ * reachable -- no production call site references this function (verified
+ * by grep, see the Prompt 112 doc). `tile_of_rank` must already be the
+ * caller's own measured rank->face map (e.g. from its own MPI_Allgather); it
+ * is used as-is, not re-validated the way create_mpi_transport's is, since
+ * this is a test helper, not a hardened entry point. */
+HaloTransport *create_mpi_transport_for_testing(int comm_fortran_handle, int32_t tile,
+                                                int peer_count,
+                                                const std::vector<int32_t> &tile_of_rank,
+                                                TransportMode mode, std::string *why) noexcept {
+  const auto refuse = [&](const char *m) -> HaloTransport * {
+    if (why) *why = m;
+    return nullptr;
+  };
+
+  int inited = 0;
+  if (MPI_Initialized(&inited) != MPI_SUCCESS || !inited)
+    return refuse("MPI is not initialized; the caller owns MPI_Init and must call it "
+                  "before attaching the MPI halo transport");
+  if (tile < 1 || tile > cubed_sphere_tiles)
+    return refuse("tile must be a 1-based physical cube face in 1..6");
+  if (peer_count < 1 || static_cast<int>(tile_of_rank.size()) != peer_count)
+    return refuse("peer_count must match tile_of_rank's size");
+
+  MPI_Comm comm = MPI_Comm_f2c(static_cast<MPI_Fint>(comm_fortran_handle));
+  if (comm == MPI_COMM_NULL)
+    return refuse("the Fortran communicator handle does not name a valid MPI "
+                  "communicator");
+
+  int size = 0, rank = -1;
+  if (MPI_Comm_size(comm, &size) != MPI_SUCCESS ||
+      MPI_Comm_rank(comm, &rank) != MPI_SUCCESS)
+    return refuse("could not query the communicator's size and rank");
+  if (size != peer_count)
+    return refuse("communicator size does not match peer_count");
+
+  if (mode == TransportMode::cuda_aware && !MPIX_Query_cuda_support())
+    return refuse("cuda_aware MPI halo transport requested, but this MPI runtime "
+                  "reports MPIX_Query_cuda_support() == 0");
+
+  auto *t = new (std::nothrow) MpiHaloTransport(comm, tile, rank, size, tile_of_rank, mode);
   if (!t) return refuse("could not allocate the MPI halo transport");
   return t;
 }

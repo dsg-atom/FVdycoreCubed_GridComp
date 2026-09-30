@@ -1819,3 +1819,217 @@ decision point pending explicit authorization to implement. See
     device_count)` is single-node-safe only) as the recommended next
     task. See
     `docs/performance/p106_state_to_fv_default_policy_2026-09-29.md`.
+
+22. **Prompt 107 (2026-09-30)**: implemented and validated Prompt 106's
+    recommended next task — replaced the single-node-only
+    `dev = mod(global_comm_rank, device_count)` GPU-selection rule in
+    `fv3_gpu_dyncore_bridge.F90` with a node-local rule via
+    `MPI_Comm_split_type(MPI_COMM_TYPE_SHARED,...)` +
+    `dev = mod(local_rank, device_count)`. Fixed a real logging bug found
+    along the way (`mpp_error(NOTE,...)` prints from PE 0 only; switched
+    to per-rank `write(0,...)`). Validated single-node 1-/2-GPU
+    (bit-identical to Prompt 103/106's mapping) and genuine 2-node
+    multi-node (divergence proof vs. the old global-rank rule — node 1's
+    actual mapping differs from what the old rule would have given).
+    Exit-dump numerical samples bitwise identical across all 4 arms
+    (routing-only change); no performance regression. Discovered two new
+    Discover platform constraints: `alla100` QOS caps a job's summed GPU
+    count/memory at `gres/gpu=4`/`mem=510000M` job-wide, not per-node;
+    multi-node CUDA MPS needs an explicit `srun --overlap` broadcast. Also
+    upgraded the severity of the "stale EXPDIR" bug (previously thought to
+    cause only harmless log-capture loss) to a real job-collision crash
+    risk under concurrency. No numerical/CUDA-kernel/ABI/other-selector
+    change; no commit/push. **This closes the multi-node device-mapping
+    limitation** — the separate `comm_size==6`/no-intra-tile-halo
+    constraint (§Part 10 below) is untouched and remains the next
+    architectural blocker. See
+    `docs/performance/p107_node_local_gpu_binding_2026-09-30.md`.
+
+23. **Prompt 108 (2026-09-30, DESIGN/MAPPING ONLY)**: designed (did not
+    implement) the generalized intra-tile halo-exchange architecture
+    needed to remove the `comm_size==6` assumption, targeting a future
+    C1024 decomposition of 6 faces x 2x2 ranks/face = 24 ranks. Key
+    finding: the authoritative Fortran/FMS `domain_decomp`
+    (`fv_mp_mod.F90`) already natively supports `layout(1,2)>1` per
+    cubed-sphere tile (`npes_per_tile = npes_x*npes_y`,
+    `mpp_define_layout`/`mpp_define_mosaic`) — this capability is reused
+    for the numbering/neighbor-metadata design, not reinvented. The
+    CUDA-side gap is confined to `fv3_gpu_halo_topology.hpp/.cpp`'s
+    single-neighbor-per-edge `TopologyView`/`EdgeNeighbor` data model
+    (needs to grow to multi-segment-per-edge plus diagonal/mixed
+    corners) and the bridge's `comm_size==6` gate — the transport
+    pack/unpack pipeline and the seam rotation/vector-sign algebra are
+    both reusable as-is. Corner-fill kernels need generalization (each
+    2x2 sub-rank has exactly 1 true cube-panel corner, not 4).
+    Classification: **MODERATE HALO GENERALIZATION** (not a full
+    communication-architecture rewrite, not a config-only fix). Derived
+    an 8-phase minimal implementation plan with STOP/PASS gates.
+    Recommended next bounded task: implement/validate Phases 1-4
+    (CUDA-side topology/transport generalization, small grid, single
+    node) — explicitly not the bridge `comm_size` relaxation (Phase 6) or
+    a real 24-rank/C1024 run (Phase 8), each deferred to its own future
+    task. No production source changes; no commit/push. See
+    `docs/performance/p108_c1024_intra_tile_halo_architecture_2026-09-30.md`.
+
+24. **Prompt 109 (2026-09-30, IMPLEMENTED/COMPILED/GPU EXECUTED)**:
+    implemented Prompt 108's §15 Phases 1-4 — a new, additive, header-only
+    `fv3_gpu_halo_subtile_topology.hpp` giving `layout(2,2)`/24-rank
+    sub-tile rank numbering, same-face cardinal edges, cross-face segment
+    donors, and diagonal/mixed/true-cube corner taxonomy, all
+    `FV3_HALO_HD` (host+device). Found and fixed one genuine
+    device-callability gap in the existing `cubed_sphere_neighbor()`
+    (host-only, called from the new device-callable code): relocated its
+    mosaic table/lookup into `fv3_gpu_halo_topology.hpp` with a
+    macro-generated dual host/`static __device__` table (numerical
+    semantics unchanged, confirmed via legacy-test regression + host/
+    device bit-identical comparison). GPU-EXECUTED on a live A100
+    (24/24 ranks bit-identical device-vs-host), compute-sanitizer clean
+    (0 errors), 24-rank real-MPI routing test PASS (after fixing a
+    self-contained test-harness deadlock, non-blocking post-all/wait-all
+    fix), layout=1x1 exact regression preserved. Bridge `comm_size==6`
+    gate (`fv3_gpu_dyncore_bridge.F90:163`) and transport-layer gate
+    (`fv3_gpu_halo_mpi.cpp:416`) both confirmed untouched. Topology-only —
+    no field data movement, no numerical validation applicable this
+    phase, no production default changed, no commit/push. Recommended
+    next bounded task: Phase 5 (transport-backend generalization, same
+    small-grid/single-node scope). See
+    `docs/performance/p109_cuda_subtile_halo_phases1_4_2026-09-30.md`.
+
+25. **Prompt 110 (2026-09-30, DESIGN/SCOPING ONLY)**: mapped how Prompt
+    109's sub-tile topology wires into the production halo pipeline.
+    Findings: `launch_halo_pack` is topology-agnostic (no change needed);
+    `launch_halo_unpack` depends only on donor-edge metadata (no kernel
+    change, only correctly-populated `TopologyView`); `MpiHaloTransport`'s
+    real MPI addressing already keys on rank alone (small, deferred
+    generalization); corner exchange for diagonal/mixed corners is a
+    wholly new mechanism, not a generalization, and was deferred.
+    Corrected one input from Prompt 109's handoff: the transport-side
+    6-rank gate lives in `fv3_gpu_halo_mpi.cpp:416`
+    (`create_mpi_transport()`), not `fv3_gpu_halo_mpi.hpp`. Selected
+    Phase-5 implementation slice: an additive `SubTileId`+layout to
+    `TopologyView` builder plus a synthetic-rank field-data test harness
+    (edges only, layout=2x2, no bridge/gate change). No production source
+    changed, no commit/push. See
+    `docs/performance/p110_subtile_halo_transport_phase5_design_2026-09-30.md`.
+
+26. **Prompt 111 (2026-09-30, IMPLEMENTED + GPU EXECUTED, BLOCKED at
+    layout=2x2)**: implemented Prompt 110's selected Phase-5 slice — new
+    additive builder (`fv3_gpu_halo_subtile_view.hpp`) plus field-data
+    test harness (`test_halo_subtile_exchange.cu`) calling the real,
+    unmodified `launch_halo_pack`/`launch_halo_transfer`/
+    `launch_halo_unpack` chain. layout=1x1 (N=6) is a bitwise-clean
+    regression (0/20736 failures) — the new builder is a proven, exact,
+    lossless substitute for the legacy one at that layout. layout=2x2
+    (N=24) is **BLOCKED**: `launch_halo_transfer`
+    (`fv3_gpu_halo_exchange.cu:273`) hardcodes `nb.tile` to
+    `[1,cubed_sphere_tiles=6]` for its `peer_send` table lookup — a
+    whole-subsystem constraint (recurs independently in
+    `fv3_gpu_halo_peer.hpp` and `fv3_gpu_halo_mpi.cpp`), not a one-off
+    check — which the sub-tile builder's donor-rank-based `.tile` (up to
+    24) legitimately exceeds for any cross-face donor. All 6 halo groups
+    fail identically (confirmed via instrumented rerun: not a per-group
+    or vector-vs-scalar defect). Topology-only correctness at layout=2x2
+    remains fully validated (T12/T13, host-only). compute-sanitizer: 0
+    errors on all 3 CUDA binaries touched. No production source changed,
+    no gate relaxed, no commit/push. Next: Phase 6 bridge metadata
+    plumbing must now also generalize this transfer-layer gate/indexing
+    — a larger scope than Prompt 110 assumed; requires fresh
+    authorization, not attempted here. See
+    `docs/performance/p111_subtile_topology_fielddata_validation_2026-09-30.md`.
+
+27. **Prompt 112 (2026-09-30, IMPLEMENTED + GPU EXECUTED + NUMERICALLY
+    VALIDATED at 24-rank real MPI scale)**: fixed Prompt 111's blocker by
+    separating physical face identity (`EdgeNeighbor.tile`, 1..6,
+    permanent seam-math fact) from transport peer identity
+    (`EdgeNeighbor.rank`, 0..peer_count-1). Generalized
+    `launch_halo_transfer` to index `peer_send` by `.rank` with an
+    explicit `peer_count` parameter (was hardcoded `.tile`/6);
+    generalized `MpiHaloTransport`'s internal peer storage to
+    `std::vector` (was fixed `std::array<int32_t,6>`). New test-only
+    factory `create_mpi_transport_for_testing()` and new test
+    `test_halo_subtile_mpi_transport.cu` (CMake target
+    `fv3_halo_subtile_mpi_transport_test`) GPU-executed a real 24-rank
+    MPI run (`mpirun --oversubscribe -np 24` on one A100) exercising the
+    generalized transfer/peer-storage path end-to-end: **0/22,224
+    failures**, **0 compute-sanitizer errors on all 24 ranks**. Combined
+    sanitizer sweep also reconfirmed the two pre-existing binaries
+    unregressed (`fv3_halo_subtile_exchange_test` 0/102,402,
+    `fv3_halo_exchange_multitile_test` 0/20,484). Fixed-6 re-audit found
+    no remaining ungeneralized transport storage — every other
+    `cubed_sphere_tiles`/literal-6 occurrence is either the still-active
+    Fortran-bridge or MPI-factory production gate (both untouched,
+    re-verified by source read) or a legitimate physical-6-face bound
+    check. Corrected two prior docs' inaccurate "`launch_halo_unpack`
+    never reads `.tile`" claim (it does, as a sanity bound, never as an
+    index — `p110_*.md`/`p111_*.md` updated in place). No bridge/MPI-
+    factory gate relaxed, no real >6-rank production path opened, no
+    corner transport, no numerical/seam-math change, no R4 change, no
+    commit/push. Bridge metadata plumbing (extracting real FMS
+    `layout_x/layout_y` into the bridge) remains a separate, larger,
+    fresh-authorization-required task — recommended next step. See
+    `docs/performance/p112_generalized_halo_transport_peer_ids_2026-09-30.md`.
+
+28. **Prompt 113 (2026-09-30, DESIGN/MAPPING ONLY, CLOSED)**: designed the
+    FMS decomposition metadata to CUDA bridge integration. Found
+    `Atm%layout(1:2)` (`fv_arrays.F90:1287`, pointer-aliased from the
+    `fv_core_nml` namelist at `fv_control.F90:1333`) is the authoritative,
+    already-resident runtime source for `layout_x/layout_y` - no FMS
+    query call needed. Found the bridge call site
+    (`fv3_gpu_bridge_init(Atm, comm, ...)`, `FV_StateMod.F90:1264`)
+    already receives the full `Atm` and already reads `Atm%tile`
+    (`fv3_gpu_dyncore_bridge.F90:300`), so reaching `Atm%layout` needs
+    zero new plumbing - the gap is an ABI/gate gap, not an access gap.
+    Found a second, previously undocumented one-rank-per-tile gate inside
+    `build_rank_of_tile` (`fv3_gpu_dyncore_bridge.F90:1451`) beyond the
+    known top-level `comm_size==6` check - both must generalize together.
+    Specified a minimal additive ABI extension (`layout_x`/`layout_y`
+    appended to `fv3_gpu_create_desc` and to
+    `fv3_gpu_set_cubed_sphere_topology`, `(sub_i,sub_j)` derived
+    CUDA-side, not duplicated over the ABI) and a bounded, SMALL-
+    complexity next task (wire-only: add the fields, populate them,
+    take no new branch on their value - gates stay exactly as they are).
+    Confirmed FMS's within-tile row-major/x-fastest rank convention
+    remains an assumed, not source-verified, fact (FMS is a precompiled
+    external dependency, not vendored in either repo) and recommended a
+    bounded runtime cross-check as mitigation rather than leaving it a
+    silent assumption. No ABI change, no gate relaxation, no 24-rank run,
+    no corner transport, no numerical/seam-math change, no CUDA-aware
+    MPI, no production-default change, no R4 change, no commit/push. See
+    `docs/performance/p113_fms_bridge_subtile_metadata_design_2026-09-30.md`.
+
+29. **Prompt 114 (2026-09-30, IMPLEMENTED + GPU EXECUTED, CLOSED)**:
+    implemented Prompt 113's bounded next task — wired `layout_x`/
+    `layout_y` (derived from `Atm%layout(1:2)`) through
+    `fv3_gpu_create_desc`, `fv3_gpu_set_cubed_sphere_topology` (both the
+    active-bridge ABI and the legacy `fv3_gpu_interface_mod.F90`
+    mirror), the bridge, and the CUDA runtime's `TopologyView` storage —
+    additive-only, same `<=0`-defaults-to-1 normalization as existing
+    fields, zero new production branch. Added a second `MPI_Allgather`
+    in `build_rank_of_tile` cross-checking every rank reports the same
+    layout (FATAL on mismatch), and an `FV3_GPU_LAYOUT` debug print
+    under the existing `RUN_CUDA_FV3_LOG_GPU_BINDING` gate. Compile-
+    verified the C++/CUDA side (`ctest` 37/39, 2 pre-existing no-GPU-on-
+    login-node failures) and, critically, the active-bridge Fortran/ABI
+    side against the REAL production fixture (`fvdycore` target, Intel
+    MPI toolchain) — zero new errors. Reconstructed the missing
+    `build_cuda_r8_intelmpi` archive directory (9 archives, unrelated
+    build-infra gap, not a code defect) to reach a fully linked
+    `StandAlone_FV3_Dycore.x`. GPU-executed clean smoke tests at both
+    C32 (6 ranks/1 GPU) and C512 (6 ranks/2 GPUs, MPS ON) — `rc=0`, full
+    untruncated step counts, zero FATAL/Abort/NaN/Inf, correct
+    `layout=1x1` on every rank at both scales, and C512 timers within
+    documented node-variance noise of the pre-P114 baseline (behavioral-
+    neutrality smoke check, not a bitwise/savepoint comparison). Re-
+    confirmed by source read that all four >6-rank production gates
+    (bridge `comm_size==6`; `build_rank_of_tile`'s tile-map FATAL;
+    runtime's `mpi_size!=cubed_sphere_tiles` check;
+    `create_mpi_transport()`'s `comm_size==6` gate) remain untouched. No
+    sub-tile derivation added to production. `fv3_gpu_interface_mod.F90`
+    mirror edits are structural-only, not independently compiled (not
+    part of the production fixture's build — flagged). Recommended next
+    task: verify FMS's within-tile rank ordering via a Fortran-only
+    `layout=(2,2)` diagnostic (Option A) before any topology-builder
+    switch. No gate relaxed, no corner transport, no numerical/seam-math
+    change, no CUDA-aware MPI, no production-default change, no R4
+    change, no commit/push. See
+    `docs/performance/p114_fms_layout_bridge_abi_plumbing_2026-09-30.md`.

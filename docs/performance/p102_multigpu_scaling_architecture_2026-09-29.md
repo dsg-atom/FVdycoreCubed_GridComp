@@ -457,6 +457,19 @@ differences from the validated single-GPU MPS configuration.
    scale — would need its own re-evaluation at higher rank counts, not
    assumed here).
 
+   **Architecture mapped, not implemented (Prompt 108,
+   `p108_c1024_intra_tile_halo_architecture_2026-09-30.md`)**: found the
+   Fortran/FMS `domain_decomp` side already natively supports
+   `layout(1,2)>1` per tile (reused, not reinvented); the CUDA-side gap is
+   confined to `fv3_gpu_halo_topology.hpp/.cpp`'s single-neighbor-per-edge
+   data model and the bridge's `comm_size==6` gate. Classification:
+   MODERATE HALO GENERALIZATION (not a full communication-architecture
+   rewrite — transport pack/unpack mechanics and the seam rotation/sign
+   algebra are both reusable as-is). Recommended next bounded task:
+   implement/validate the CUDA-side topology/transport generalization
+   (small grid, single node) — the bridge `comm_size` relaxation and any
+   real 24-rank run are each deferred to their own future task.
+
 ## Stage 18 — Recommended Architecture (ownership boundaries)
 
 ```

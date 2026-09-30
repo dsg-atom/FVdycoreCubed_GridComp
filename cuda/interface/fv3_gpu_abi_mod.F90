@@ -123,6 +123,11 @@ module fv3_gpu_abi_mod
       integer(c_int32_t) :: halo_width
       integer(c_int32_t) :: flags
       integer(c_intptr_t) :: communicator_token
+      ! Prompt 114: additive-only FMS decomposition metadata (storage/
+      ! diagnostics only -- does not enable any >6-rank production path).
+      ! <=0 is treated by the runtime as "unset", defaulting to 1.
+      integer(c_int32_t) :: layout_x
+      integer(c_int32_t) :: layout_y
    end type fv3_gpu_create_desc
 
    type, bind(C), public :: fv3_gpu_state_desc
@@ -389,13 +394,18 @@ module fv3_gpu_abi_mod
       end function fv3_gpu_install_production_dispatch
 
       integer(c_int) function fv3_gpu_set_cubed_sphere_topology( &
-                                 ctx, tile, npx, npy, rank_of_tile, err) &
+                                 ctx, tile, npx, npy, rank_of_tile, &
+                                 layout_x, layout_y, err) &
                               bind(C, name="fv3_gpu_set_cubed_sphere_topology")
          import :: c_int, c_int32_t, c_int64_t, c_ptr, fv3_gpu_error
          type(c_ptr), value                 :: ctx
          integer(c_int32_t), value          :: tile
          integer(c_int64_t), value          :: npx, npy
          integer(c_int32_t), intent(in)     :: rank_of_tile(*)
+         ! Prompt 114: additive-only FMS decomposition metadata (storage/
+         ! diagnostics only). <=0 is treated by the runtime as "unset",
+         ! defaulting to 1; does not enable any >6-rank production path.
+         integer(c_int32_t), value          :: layout_x, layout_y
          type(fv3_gpu_error), intent(inout) :: err
       end function fv3_gpu_set_cubed_sphere_topology
 

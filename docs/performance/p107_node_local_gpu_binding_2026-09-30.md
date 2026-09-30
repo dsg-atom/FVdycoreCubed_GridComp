@@ -268,6 +268,19 @@ intra-tile/same-face halo path) — is untouched and unresolved by Prompt
 not addressed here. Node-local binding is a **necessary prerequisite**
 for multi-node C1024 but does not by itself unblock it.
 
+**Architecture now mapped (Prompt 108, design/mapping only, no source
+change)**: `docs/performance/p108_c1024_intra_tile_halo_architecture_2026-09-30.md`
+designs the generalization needed to remove the `comm_size==6` assumption
+(target: 2×2 ranks/face, 24 ranks). Found that FMS/`fv_mp_mod.F90`'s
+`domain_decomp` already supports `layout(1,2)>1` per tile natively (reused,
+not reinvented); the CUDA-side gap is confined to
+`fv3_gpu_halo_topology.hpp/.cpp`'s single-neighbor-per-edge `TopologyView`
+data model and the bridge's `comm_size==6` gate. Classification: MODERATE
+HALO GENERALIZATION. Recommended next bounded task: implement/validate
+Stage-15 Phases 1-4 (CUDA-side topology/transport generalization only, small
+grid, single node) — explicitly not the bridge `comm_size` gate (Phase 6) or
+a real 24-rank/C1024 run (Phase 8), each its own future task.
+
 ## 13. Files Changed
 
 - `cuda/interface/fv3_gpu_dyncore_bridge.F90` — `MPI_Comm_split_type`-based

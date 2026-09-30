@@ -107,6 +107,15 @@ typedef struct fv3_gpu_create_desc {
   uint32_t halo_width;
   uint32_t flags;
   uintptr_t communicator_token;
+  /* Prompt 114: FMS processor-layout metadata (Atm%layout(1:2)), additive
+   * tail fields per the struct_bytes/header_ok convention. <= 0 means "not
+   * supplied" and is treated by fv3_gpu_create as 1 (one rank per tile,
+   * today's only supported decomposition) -- this preserves every existing
+   * caller's behavior unchanged, including callers whose struct predates
+   * these fields and therefore zero-initializes them. Storage/diagnostics
+   * only; no topology behavior is gated on these values yet. */
+  int32_t layout_x;
+  int32_t layout_y;
 } fv3_gpu_create_desc;
 
 typedef struct fv3_gpu_state_desc {
@@ -288,10 +297,18 @@ int fv3_gpu_sync_from_host(fv3_gpu_context *, const fv3_gpu_field_mask *, fv3_gp
  * general multi-rank MPI.
  *
  * Returns FV3_GPU_INVALID_ARGUMENT on any inconsistent argument, without
- * modifying the context. */
+ * modifying the context.
+ *
+ * Prompt 114: layout_x/layout_y are the same additive FMS processor-layout
+ * metadata as fv3_gpu_create_desc's fields, trailing here for the same
+ * reason. Stored/validated (>= 1, else defaulted to 1) only -- they do not
+ * change which topology builder runs or how neighbours are computed; the
+ * one-rank-per-tile mpi_size check above is unaffected and remains the sole
+ * gate on decomposition shape. */
 int fv3_gpu_set_cubed_sphere_topology(fv3_gpu_context *, int32_t tile,
                                       int64_t npx, int64_t npy,
                                       const int32_t *rank_of_tile,
+                                      int32_t layout_x, int32_t layout_y,
                                       fv3_gpu_error *);
 int fv3_gpu_dyn_core_step(fv3_gpu_context *, const fv3_gpu_step_desc *, fv3_gpu_event *, fv3_gpu_error *);
 /* Prompt 52C-IMPLEMENT: fv_mapz_mod's production pt/delz vertical remap
