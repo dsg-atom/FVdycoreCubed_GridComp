@@ -779,6 +779,12 @@ contains
     ! dp_ref is indexed by absolute level in the kernels, so it is 0-based like
     ! every other vertical axis even though Fortran declares it 1:npz.
     call add1(FV3_FID_DP_REF, c_loc(r_dp_ref(1)), 0, npz)
+    ! ak/bk (Atm%ak/Atm%bk, fv_arrays.F90:1503-1504) are genuine Atm components
+    ! -- registered in-place, group (a), like the grid metrics below, not
+    ! module-owned scratch. npz+1 interface values, 0-based like every other
+    ! vertical axis even though Fortran declares them 1:npz+1.
+    call add1(FV3_FID_AK, c_loc(Atm%ak(1)), 0, npz+1)
+    call add1(FV3_FID_BK, c_loc(Atm%bk(1)), 0, npz+1)
 
     ! --- (a) grid metrics, fv_arrays.F90:1583-1720 --------------------------
     ! Cell centre (isd:ied, jsd:jed)

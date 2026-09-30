@@ -30,6 +30,7 @@ struct Fixture {
   std::string name;
   int km = 0, kn = 0, iv = 0, kord = 0;
   double q_min = 0.0;
+  bool gmao_bot = false, gmao_top = false; // Prompt 61: GMAO boundary flags
   std::vector<double> pe1, pe2;       // km+1 / kn+1 entries
   std::vector<double> q1, q2_fortran; // km / kn entries
 };
@@ -57,6 +58,18 @@ bool load_fixture(const std::string &path, Fixture &f) {
     }
     if (line.rfind("# q_min=", 0) == 0) {
       f.q_min = std::atof(line.substr(line.find('=') + 1).c_str());
+      continue;
+    }
+    if (line.rfind("# gmao_bot=", 0) == 0) {
+      std::istringstream iss(line.substr(1));
+      std::string tok;
+      while (iss >> tok) {
+        auto eq = tok.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = tok.substr(0, eq), val = tok.substr(eq + 1);
+        if (key == "gmao_bot") f.gmao_bot = std::atoi(val.c_str()) != 0;
+        else if (key == "gmao_top") f.gmao_top = std::atoi(val.c_str()) != 0;
+      }
       continue;
     }
     if (line.rfind("# k  pe1", 0) == 0) { section = 1; continue; }
@@ -121,7 +134,7 @@ bool run_case(const std::string &fixture_dir, const std::string &case_name, bool
   fv3::gpu::vertical::map_scalar_column<double>(
       pe1_c, dpe1_c, pe2_c, dpe2_c, q1_c, q2_c, c2.data(), c3.data(), c4.data(),
       gam.data(), q.data(), reinterpret_cast<bool *>(extm.data()), f.km, f.kn,
-      f.iv, f.q_min);
+      f.iv, f.q_min, f.gmao_bot, f.gmao_top);
 
   const Metrics m = compare(f.q2_fortran, q2_cuda);
   const bool ok = m.mismatch_count == 0 && m.nan_count == 0;
@@ -166,6 +179,29 @@ int main() {
   bool all_ok = true;
   for (const char *c : kCases) all_ok &= run_case(dir, c, true);
 
+  // Prompt 61: dedicated GMAO top/bottom boundary-condition case. Unlike
+  // every case above, this fixture was generated with optional_bot=.true.,
+  // optional_top=.true. passed to the authoritative Fortran map_scalar, and
+  // its 6 target levels were constructed (see the Fortran driver's
+  // run_case_gmao_bc) to trigger, one level at a time: k=1 B4 (top
+  // extrapolate), k=2 B5 (top interpolate), k=3 ordinary interior (no GMAO
+  // branch, regression control), k=4 B3 (bottom interpolate), k=5 B2
+  // (bottom extrapolate), k=6 B1 (entire grid below old ps). See
+  // docs/performance/p61_map_scalar_gmao_boundary_conditions_2026-09-23.md.
+  all_ok &= run_case(dir, "case9_gmao_boundary_conditions.txt", true);
+
+  // Prompt 71 Stage 2: iv=-1 (winds, REMAP_UV) boundary-clamp coverage.
+  // case10 is a uniform-sign control (clamp branches must stay inert,
+  // matching the iv=1 PPM/limiter machinery exactly); case11/case12
+  // deliberately trigger the new top/bottom sign-consistency clamp;
+  // case13 is an interior-sign-change control confirming the clamp does
+  // not spuriously fire away from the boundary. See docs/performance/
+  // p70_remap_uv_cuda_port_plan_2026-09-23.md Section 10.
+  all_ok &= run_case(dir, "case10_wind_uniform_sign_iv_neg1.txt", true);
+  all_ok &= run_case(dir, "case11_wind_top_sign_reversal.txt", true);
+  all_ok &= run_case(dir, "case12_wind_bottom_sign_reversal.txt", true);
+  all_ok &= run_case(dir, "case13_wind_interior_sign_reversal.txt", true);
+
   // Stage 13: determinism -- repeat case1 (smooth) and case6 (limiter-
   // activating) several times, require bitwise-identical repeats.
   std::vector<double> first_run;
@@ -185,7 +221,7 @@ int main() {
     fv3::gpu::vertical::map_scalar_column<double>(
         pe1_c, dpe1_c, pe2_c, dpe2_c, q1_c, q2_c, c2.data(), c3.data(),
         c4.data(), gam.data(), q.data(), reinterpret_cast<bool *>(extm.data()),
-        f.km, f.kn, f.iv, f.q_min);
+        f.km, f.kn, f.iv, f.q_min, f.gmao_bot, f.gmao_top);
     if (rep == 0) first_run = q2_cuda;
     else if (q2_cuda != first_run) {
       std::fprintf(stderr, "DETERMINISM FAIL: case6 repeat %d differs\n", rep);

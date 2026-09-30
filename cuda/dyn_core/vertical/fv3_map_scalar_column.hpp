@@ -19,20 +19,44 @@
 // Held-Suarez C512 config kord_mt=kord_wz=kord_tm=9):
 //   * kord == 9 branch of scalar_profile only (:2095-2127). Other abs(kord)
 //     branches (7,10,12,13,14,15,16, and the <16 catchall) are NOT ported.
-//   * iv in {0,1} only (map_scalar's "temp"/"other" and "constituent"
-//     modes). iv=-1 (winds) and iv=2 (cs remap-temp) are NOT ported.
+//   * iv in {0,1,-1} (map_scalar's "temp"/"other", "constituent", and
+//     "winds" modes). iv=-1's top/bottom sign-consistency clamps
+//     (fv_mapz.F90:2357-2364 top, :2581-2588 bottom -- REMAP_UV, Prompt 71)
+//     are ported exactly, mirroring the existing iv==0 branch shape. iv=2
+//     (cs remap-temp) is NOT ported.
 //   * the "else" (iv/=-2) tridiagonal solve for q(:) only (:1926-1954).
 //     iv==-2 (qs-bounded tridiagonal, :1901-1925) is NOT ported -- the
 //     fixture/production driver never passes qs.
 //   * abs(kord)>9 is false whenever kord==9 exactly, so ext5/ext6
 //     (:2029-2037) are dead code in this scope and are not computed.
-//   * map_scalar's "standard FV3 remapping" branch only (:1624-1665).
-//     The GMAO bottom/top linear-extrapolation branches (:1600-1621),
-//     gated on optional_bot/optional_top, are NOT ported -- confirmed by
-//     direct inspection of the fixture driver (map_scalar-driver/main.F90)
-//     that it never passes q_bot/optional_bot/optional_top, so
-//     gmao_bot=gmao_top=.false. always for every fixture.
-//   * mapn_tracer is out of scope by directive and is not touched here.
+//   * map_scalar's "standard FV3 remapping" branch (:1770-1811 in the
+//     current authoritative source) PLUS the 5 GMAO top/bottom
+//     boundary-condition branches (:1744-1767), gated on the new trailing
+//     gmao_bot/gmao_top parameters (Prompt 61) -- ported exactly, one-for-
+//     one, from map_scalar's if/else-if chain, including the LM1/LP0
+//     search (:1733-1743) computed unconditionally every k, matching
+//     Fortran. Both new parameters default to false, so every pre-Prompt-
+//     61 call site (map_scalar-driver fixtures, the delz remap call site,
+//     the GPU smoke kernel) is numerically unchanged. Only the production
+//     pt remap call site (fv3_pt_delz_remap.cu) passes gmao_bot=gmao_top=
+//     true, matching FV_StateMod.F90:558-559's unconditional GEOS
+//     production default (optional_bot=gmao_bot_bc, optional_top=
+//     gmao_top_bc at pt's own map_scalar call site, fv_mapz.F90:622-633).
+//     See docs/performance/p61_map_scalar_gmao_boundary_conditions_
+//     2026-09-23.md for the branch-by-branch derivation and validation.
+//   * (Prompt 85) scalar_profile's abs(kord)<9 branch (:2487-2501) added as
+//     an explicit `kord` parameter (default 9, so every pre-existing call
+//     site is byte-for-byte unchanged) on scalar_profile_column and
+//     map_scalar_column. Only kord==8 is exercised/validated (the
+//     production REMAP_Q kord_tr value); no other abs(kord)<9 value has
+//     fixture coverage. mapn_tracer's own nq-batched Mapping loop
+//     (fv_mapz.F90:2081-2192) is NOT re-ported here -- for nq==1 (the only
+//     validated REMAP_Q dispatch case) it is byte-for-byte the same
+//     "standard FV3 remapping" computation as map_scalar_column's own
+//     gmao_bot=false/gmao_top=false path, so REMAP_Q reuses
+//     map_scalar_column directly (iv=0, kord=8) instead of duplicating it.
+//     nq>1 (multi-tracer batching) is out of scope and not supported by
+//     this reuse.
 //
 // Numerical semantics changed relative to the Fortran: NO.
 //===========================================================================
@@ -130,7 +154,7 @@ template <class T>
 FV3_VERTICAL_HD inline void scalar_profile_column(
     const Column<const T> c1, Column<T> c2, Column<T> c3, Column<T> c4,
     const Column<const T> delp, T *gam, T *q, bool *extm, int km, int iv,
-    T qmin) {
+    T qmin, int kord = 9) {
   // ---- tridiagonal solve for q(:), "else" branch only (:1926-1954) -------
   {
     const T grat = delp[1] / delp[0];
@@ -193,9 +217,13 @@ FV3_VERTICAL_HD inline void scalar_profile_column(
     }
   }
 
-  // ---- top-layer (k=1) mode adjustment (:2046-2067) ----------------------
-  // iv==-1/iv==2 branches (:2050-2060) are out of scope (iv in {0,1} only).
-  if (iv == 0) c2[0] = fv3_max<T>(T(0), c2[0]);
+  // ---- top-layer (k=1) mode adjustment (fv_mapz.F90:2357-2367) -----------
+  // iv==2 branch is out of scope (not used by any ported CUDA path).
+  if (iv == 0) {
+    c2[0] = fv3_max<T>(T(0), c2[0]);
+  } else if (iv == -1) {
+    if (c2[0] * c1[0] <= T(0)) c2[0] = T(0);
+  }
   c4[0] = T(3) * (T(2) * c1[0] - (c2[0] + c3[0]));
   cs_limiters_column<T>(1, extm[0], c1[0], c2[0], c3[0], c4[0]);
 
@@ -203,31 +231,59 @@ FV3_VERTICAL_HD inline void scalar_profile_column(
   c4[1] = T(3) * (T(2) * c1[1] - (c2[1] + c3[1]));
   cs_limiters_column<T>(2, extm[1], c1[1], c2[1], c3[1], c4[1]);
 
-  // ---- Huynh's 2nd constraint for interior, abs(kord)==9 only (:2095-2127)
-  for (int k = 2; k <= km - 3; ++k) {
-    if ((extm[k] && extm[k - 1]) || (extm[k] && extm[k + 1]) ||
-        (extm[k] && c1[k] < qmin)) {
-      c2[k] = c1[k]; c3[k] = c1[k]; c4[k] = T(0);
-    } else {
-      c4[k] = T(3) * (T(2) * c1[k] - (c2[k] + c3[k]));
-      if (fv3_fabs<T>(c4[k]) > fv3_fabs<T>(c2[k] - c3[k])) {
-        const T pmp_1 = c1[k] - T(2) * gam[k + 1];
-        const T lac_1 = pmp_1 + T(1.5) * gam[k + 2];
-        c2[k] = fv3_min<T>(fv3_max<T>(c2[k], fv3_min<T>(c1[k], fv3_min<T>(pmp_1, lac_1))),
-                            fv3_max<T>(c1[k], fv3_max<T>(pmp_1, lac_1)));
-        const T pmp_2 = c1[k] + T(2) * gam[k];
-        const T lac_2 = pmp_2 - T(1.5) * gam[k - 1];
-        c3[k] = fv3_min<T>(fv3_max<T>(c3[k], fv3_min<T>(c1[k], fv3_min<T>(pmp_2, lac_2))),
-                            fv3_max<T>(c1[k], fv3_max<T>(pmp_2, lac_2)));
+  // ---- Huynh's 2nd constraint for interior (:2486-2673) ------------------
+  // kord==9 (default; unchanged from the pre-Prompt-85 port, :2503-2535) vs
+  // abs(kord)<9 (Prompt 85, REMAP_Q kord==8 only, :2487-2501) are mutually
+  // exclusive per fv_mapz.F90's own if/elseif chain -- no other kord value
+  // (10,12,13,14,15,16,<16-catchall) is ported; a non-9 kord here always
+  // means kord==8, the only abs(kord)<9 value the CUDA REMAP_Q dispatch
+  // ever passes (see fv3_pt_delz_remap.cu / the REMAP_Q wrapper).
+  if (kord == 9) {
+    for (int k = 2; k <= km - 3; ++k) {
+      if ((extm[k] && extm[k - 1]) || (extm[k] && extm[k + 1]) ||
+          (extm[k] && c1[k] < qmin)) {
+        c2[k] = c1[k]; c3[k] = c1[k]; c4[k] = T(0);
+      } else {
         c4[k] = T(3) * (T(2) * c1[k] - (c2[k] + c3[k]));
+        if (fv3_fabs<T>(c4[k]) > fv3_fabs<T>(c2[k] - c3[k])) {
+          const T pmp_1 = c1[k] - T(2) * gam[k + 1];
+          const T lac_1 = pmp_1 + T(1.5) * gam[k + 2];
+          c2[k] = fv3_min<T>(fv3_max<T>(c2[k], fv3_min<T>(c1[k], fv3_min<T>(pmp_1, lac_1))),
+                              fv3_max<T>(c1[k], fv3_max<T>(pmp_1, lac_1)));
+          const T pmp_2 = c1[k] + T(2) * gam[k];
+          const T lac_2 = pmp_2 - T(1.5) * gam[k - 1];
+          c3[k] = fv3_min<T>(fv3_max<T>(c3[k], fv3_min<T>(c1[k], fv3_min<T>(pmp_2, lac_2))),
+                              fv3_max<T>(c1[k], fv3_max<T>(pmp_2, lac_2)));
+          c4[k] = T(3) * (T(2) * c1[k] - (c2[k] + c3[k]));
+        }
       }
+      if (iv == 0) cs_limiters_column<T>(0, extm[k], c1[k], c2[k], c3[k], c4[k]);
     }
-    if (iv == 0) cs_limiters_column<T>(0, extm[k], c1[k], c2[k], c3[k], c4[k]);
+  } else {
+    // abs(kord)<9 (:2487-2501): unconditional PMP/LAC clamp every k, no
+    // extm/qmin gating inside this branch itself (extm is still consulted
+    // by the shared trailing cs_limiters call below, exactly as :2671 does
+    // for every kord branch).
+    for (int k = 2; k <= km - 3; ++k) {
+      const T pmp_1 = c1[k] - T(2) * gam[k + 1];
+      const T lac_1 = pmp_1 + T(1.5) * gam[k + 2];
+      c2[k] = fv3_min<T>(fv3_max<T>(c2[k], fv3_min<T>(c1[k], fv3_min<T>(pmp_1, lac_1))),
+                          fv3_max<T>(c1[k], fv3_max<T>(pmp_1, lac_1)));
+      const T pmp_2 = c1[k] + T(2) * gam[k];
+      const T lac_2 = pmp_2 - T(1.5) * gam[k - 1];
+      c3[k] = fv3_min<T>(fv3_max<T>(c3[k], fv3_min<T>(c1[k], fv3_min<T>(pmp_2, lac_2))),
+                          fv3_max<T>(c1[k], fv3_max<T>(pmp_2, lac_2)));
+      c4[k] = T(3) * (T(2) * c1[k] - (c2[k] + c3[k]));
+      if (iv == 0) cs_limiters_column<T>(0, extm[k], c1[k], c2[k], c3[k], c4[k]);
+    }
   }
 
-  // ---- Bottom layer subgrid constraints (:2270-2286) ---------------------
-  // iv==-1 branch (:2274-2278) out of scope.
-  if (iv == 0) c3[km - 1] = fv3_max<T>(T(0), c3[km - 1]);
+  // ---- Bottom layer subgrid constraints (fv_mapz.F90:2579-2588) ----------
+  if (iv == 0) {
+    c3[km - 1] = fv3_max<T>(T(0), c3[km - 1]);
+  } else if (iv == -1) {
+    if (c3[km - 1] * c1[km - 1] <= T(0)) c3[km - 1] = T(0);
+  }
 
   c4[km - 2] = T(3) * (T(2) * c1[km - 2] - (c2[km - 2] + c3[km - 2]));
   cs_limiters_column<T>(2, extm[km - 2], c1[km - 2], c2[km - 2], c3[km - 2], c4[km - 2]);
@@ -236,57 +292,104 @@ FV3_VERTICAL_HD inline void scalar_profile_column(
   cs_limiters_column<T>(1, extm[km - 1], c1[km - 1], c2[km - 1], c3[km - 1], c4[km - 1]);
 }
 
-// map_scalar (fv_mapz.F90:1519-1671), "standard FV3 remapping" branch only
-// (see file header for the full scope statement). q1 doubles as a4(1,:)
+// map_scalar (fv_mapz.F90:1519-1671 for the header's original line range;
+// current authoritative source has the subroutine at :1665-1817): "standard
+// FV3 remapping" branch (:1770-1811) PLUS the 5 GMAO top/bottom boundary-
+// condition branches (:1744-1767), see file header. q1 doubles as a4(1,:)
 // (never mutated by scalar_profile_column); c2/c3/c4 are caller scratch of
 // length km. gam/q/extm are scalar_profile_column's own scratch (see above).
+// gmao_bot/gmao_top are map_scalar's optional_bot/optional_top, ported as
+// plain booleans (both default false, preserving every pre-existing call
+// site's behavior unchanged) rather than as Fortran `optional` arguments --
+// this header has no "argument absent" concept, and false is exactly
+// map_scalar's own `.false.` default when optional_bot/optional_top are not
+// present (:1705-1709).
 template <class T>
 FV3_VERTICAL_HD inline void map_scalar_column(
     const Column<const T> pe1, const Column<const T> dpe1,
     const Column<const T> pe2, const Column<const T> dpe2,
     const Column<const T> q1, Column<T> q2, T *c2, T *c3, T *c4, T *gam,
-    T *q, bool *extm, int km, int kn, int iv, T qmin) {
+    T *q, bool *extm, int km, int kn, int iv, T qmin,
+    bool gmao_bot = false, bool gmao_top = false, int kord = 9) {
   Column<T> c2v{c2, 1}, c3v{c3, 1}, c4v{c4, 1};
-  scalar_profile_column<T>(q1, c2v, c3v, c4v, dpe1, gam, q, extm, km, iv, qmin);
+  scalar_profile_column<T>(q1, c2v, c3v, c4v, dpe1, gam, q, extm, km, iv, qmin, kord);
 
   const T r3 = T(1) / T(3);
   const T r23 = T(2) / T(3);
 
   int k0 = 0;
   for (int k = 0; k < kn; ++k) {
-    for (int l = k0; l < km; ++l) {
-      if (pe2[k] >= pe1[l] && pe2[k] <= pe1[l + 1]) {
-        const T pl = (pe2[k] - pe1[l]) / dpe1[l];
-        if (pe2[k + 1] <= pe1[l + 1]) {
-          // entire new interval within old layer l (:1629-1637)
-          const T pr = (pe2[k + 1] - pe1[l]) / dpe1[l];
-          const T pfac1 = pr + pl;
-          const T pfac2 = r3 * (pr * pfac1 + pl * pl);
-          q2[k] = c2[l] + T(0.5) * (c4[l] + c3[l] - c2[l]) * pfac1 - c4[l] * pfac2;
-          k0 = l;
-        } else {
-          // fractional area, spans one or more further old layers
-          // (:1638-1660)
-          const T pfac0 = pe1[l + 1] - pe2[k];
-          const T pfac1 = T(1) + pl;
-          const T pfac2 = r3 * (T(1) + pl * pfac1);
-          T qsum = pfac0 * (c2[l] + T(0.5) * (c4[l] + c3[l] - c2[l]) * pfac1 -
-                            c4[l] * pfac2);
-          for (int m = l + 1; m < km; ++m) {
-            if (pe2[k + 1] > pe1[m + 1]) {
-              qsum += dpe1[m] * q1[m];
-            } else {
-              const T dp = pe2[k + 1] - pe1[m];
-              const T esl = dp / dpe1[m];
-              const T pfac0b = T(1) - r23 * esl;
-              qsum += dp * (c2[m] + T(0.5) * esl * (c3[m] - c2[m] + c4[m] * pfac0b));
-              k0 = m;
-              break;
-            }
-          }
-          q2[k] = qsum / dpe2[k];
-        }
+    // ---- LM1/LP0 search (:1733-1743), computed unconditionally every k,
+    // exactly matching Fortran -- LM1/LP0 are kept 1-based (as in the
+    // Fortran source) and translated to 0-based only at each array-access
+    // use site below (Fortran index X -> C++ index X-1), so every branch's
+    // arithmetic below is a literal transcription, not a re-derivation.
+    int LM1 = 1, LP0 = 1;
+    while (LP0 <= km) {
+      if (pe1[LP0 - 1] < pe2[k]) {
+        LP0 = LP0 + 1;
+      } else {
         break;
+      }
+    }
+    LM1 = (LP0 - 1 > 1) ? (LP0 - 1) : 1;
+    LP0 = (LP0 < km) ? LP0 : km;
+
+    if (gmao_bot && pe2[k] >= pe1[km]) {
+      // Entire grid below old ps (:1746-1747)
+      q2[k] = q1[km - 1];
+    } else if (gmao_bot && LM1 == km && LP0 == km) {
+      // Extrapolate linearly below last model level (:1750-1752)
+      const T pfac0 = (pe2[k] - pe1[km - 1]) / (pe1[km - 1] - pe1[km - 2]);
+      q2[k] = q1[km - 1] + (q1[km - 1] - q1[km - 2]) * pfac0;
+    } else if (gmao_bot && LP0 == km) {
+      // Interpolate linearly between levels, bottom variant (:1755-1757)
+      const T pfac0 = (pe2[k] - pe1[LP0 - 1]) / (pe1[LM1 - 1] - pe1[LP0 - 1]);
+      q2[k] = q1[LP0 - 1] + (q1[LM1 - 1] - q1[LP0 - 1]) * pfac0;
+    } else if (gmao_top && LM1 == 1 && LP0 == 1) {
+      // Extrapolate linearly above first model level (:1760-1762)
+      const T pfac0 = (pe2[k] - pe1[0]) / (pe1[1] - pe1[0]);
+      q2[k] = q1[0] + (q1[1] - q1[0]) * pfac0;
+    } else if (gmao_top && LM1 == 1) {
+      // Interpolate linearly between levels, top variant (:1765-1767)
+      const T pfac0 = (pe2[k] - pe1[LP0 - 1]) / (pe1[LM1 - 1] - pe1[LP0 - 1]);
+      q2[k] = q1[LP0 - 1] + (q1[LM1 - 1] - q1[LP0 - 1]) * pfac0;
+    } else {
+      // Standard FV3 remapping (:1770-1811) -- unchanged from pre-Prompt-61.
+      for (int l = k0; l < km; ++l) {
+        if (pe2[k] >= pe1[l] && pe2[k] <= pe1[l + 1]) {
+          const T pl = (pe2[k] - pe1[l]) / dpe1[l];
+          if (pe2[k + 1] <= pe1[l + 1]) {
+            // entire new interval within old layer l (:1629-1637)
+            const T pr = (pe2[k + 1] - pe1[l]) / dpe1[l];
+            const T pfac1 = pr + pl;
+            const T pfac2 = r3 * (pr * pfac1 + pl * pl);
+            q2[k] = c2[l] + T(0.5) * (c4[l] + c3[l] - c2[l]) * pfac1 - c4[l] * pfac2;
+            k0 = l;
+          } else {
+            // fractional area, spans one or more further old layers
+            // (:1638-1660)
+            const T pfac0 = pe1[l + 1] - pe2[k];
+            const T pfac1 = T(1) + pl;
+            const T pfac2 = r3 * (T(1) + pl * pfac1);
+            T qsum = pfac0 * (c2[l] + T(0.5) * (c4[l] + c3[l] - c2[l]) * pfac1 -
+                              c4[l] * pfac2);
+            for (int m = l + 1; m < km; ++m) {
+              if (pe2[k + 1] > pe1[m + 1]) {
+                qsum += dpe1[m] * q1[m];
+              } else {
+                const T dp = pe2[k + 1] - pe1[m];
+                const T esl = dp / dpe1[m];
+                const T pfac0b = T(1) - r23 * esl;
+                qsum += dp * (c2[m] + T(0.5) * esl * (c3[m] - c2[m] + c4[m] * pfac0b));
+                k0 = m;
+                break;
+              }
+            }
+            q2[k] = qsum / dpe2[k];
+          }
+          break;
+        }
       }
     }
   }

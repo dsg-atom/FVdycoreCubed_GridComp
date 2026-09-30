@@ -1530,7 +1530,8 @@ extern "C" int fv3_gpu_initialize_state(fv3_gpu_context *c, const fv3_gpu_state_
     WorkspaceRequest requests[]={{WorkspaceId::cgrid,cgrid_bytes,256},{WorkspaceId::transport,transport_bytes,256},{WorkspaceId::vertical,vertical_bytes,256},{WorkspaceId::operators,operator_bytes,256}};
     if(build_workspace_layout(requests,4,c->data.workspace.layout,e)!=0)goto rollback;if(cudaMalloc(&c->data.workspace.allocation,c->data.workspace.layout.total_bytes)!=cudaSuccess)goto rollback;
     for(auto &slice:c->data.workspace.layout.slices)slice.data=(char*)c->data.workspace.allocation+slice.offset; }
-  c->data.state.fields=std::move(staged);c->data.state.registry=registry;c->data.immutable.grid=&c->data.state.registry;c->data.phase=ContextPhase::initialized; *ev=issue_event(c->data); return FV3_GPU_SUCCESS;
+  c->data.state.fields=std::move(staged);c->data.state.registry=registry;c->data.immutable.grid=&c->data.state.registry;c->data.phase=ContextPhase::initialized;
+  *ev=issue_event(c->data); return FV3_GPU_SUCCESS;
 rollback: for(auto &x:staged) cudaFree(x.device);if(c->data.workspace.allocation){cudaFree(c->data.workspace.allocation);c->data.workspace={};} c->data.phase=ContextPhase::failed; if(e && e->code!=FV3_GPU_SUCCESS)return e->code; return fail(e,FV3_GPU_CUDA_ERROR,__func__,"state or workspace allocation/upload failed");
 #else
   return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,"runtime was built without CUDA");
@@ -2451,6 +2452,661 @@ extern "C" int fv3_gpu_pt_delz_remap(fv3_gpu_context *c, fv3_gpu_event dependenc
   *ev=issue_event(c->data);
   return FV3_GPU_SUCCESS;
 }
+/* Prompt 71: standalone entry for the production u/v vertical remap
+ * (REMAP_UV). Reached ONLY through NumericalDispatch::remap_uv, same
+ * link-cycle rationale as fv3_gpu_pt_delz_remap immediately above.
+ *
+ * Runs OUTSIDE fv3_gpu_dyn_core_step's acoustic-substep walk, at
+ * fv_mapz.F90's Lagrangian_to_Eulerian call site (timer 'Remap_UV') --
+ * one call per dyn_core invocation. The caller is responsible for
+ * dispatching this AFTER fv3_gpu_pt_delz_remap in the same dyn_core call
+ * (REMAP_UV reads pe only after PT/DELZ's own closing update -- see
+ * fv3_remap_uv.cu's header comment); this function does not itself
+ * enforce that ordering beyond ordinary compute-stream program order.
+ *
+ * `dependency` is the caller's fv3_gpu_sync_from_host event for the u/v
+ * field mask (u/v/pe/ak/bk); `*ev` is the kernel-completion event on the
+ * compute stream -- same one-call-in, one-event-out contract as
+ * fv3_gpu_pt_delz_remap. */
+extern "C" int fv3_gpu_remap_uv(fv3_gpu_context *c, fv3_gpu_event dependency,
+                                fv3_gpu_event *ev, fv3_gpu_error *e) {
+  using namespace fv3::gpu; clear_error(e); if(ev) *ev=0;
+  if(!c||!ev)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"invalid context or event output");
+  if(c->data.phase!=ContextPhase::initialized)
+    return fail(e,FV3_GPU_STATE_CONFLICT,__func__,"context is not initialized");
+  if(dependency && dependency>c->data.last_event)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"dependency references an unknown event");
+
+  const NumericalDispatch &dispatch=c->data.dispatch;
+  if(dispatch.contract_version!=internal_contract_version || !dispatch.remap_uv)
+    return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,"remap_uv dispatch slot is not installed");
+
+  ExecutionContext x{};
+  x.contract_version=internal_contract_version;
+  x.fields=&c->data.state.registry;
+  x.immutable=&c->data.immutable;
+  x.dispatch_params=&c->data.dispatch_params;
+  x.workspace=&c->data.workspace.layout;
+  x.submission=Submission{internal_contract_version,c->data.compute_stream,StreamId::compute,
+                          c->data.dispatch_params.acoustic_sequence};
+  x.dependencies=&c->data.dependencies;
+  x.corner_service=dispatch.corner_edge_service;
+  x.dispatch=&dispatch;
+
+  int rc=validate_execution_context(x,e);
+  if(rc) return rc;
+
+#ifdef FV3_GPU_ENABLE_CUDA
+  {auto z=order_after(c->data.transfer_stream,c->data.compute_stream,c->data.event_transfer_done);
+   if(z!=cudaSuccess){ return cuda_fail(z,e,__func__,&c->data); }}
+#endif
+
+  rc=dispatch.remap_uv(x,e);
+  if(rc!=FV3_GPU_SUCCESS) return rc;
+
+  *ev=issue_event(c->data);
+  return FV3_GPU_SUCCESS;
+}
+/* Prompt 85/86B/87: standalone entry for the production tracer vertical
+ * remap (REMAP_Q, mapn_tracer nq=2: sphum kord=9, cld_amt kord=9 --
+ * corrected by Prompt 87 from the originally assumed kord=[8,9]; see
+ * fv3_remap_q.cuh's header comment for the FV_StateMod.F90:563 source
+ * chain). Reached ONLY through NumericalDispatch::
+ * remap_q, same link-cycle rationale as fv3_gpu_pt_delz_remap/
+ * fv3_gpu_remap_uv immediately above.
+ *
+ * Runs OUTSIDE fv3_gpu_dyn_core_step's acoustic-substep walk, at
+ * fv_mapz.F90's Lagrangian_to_Eulerian call site (timer 'Remap_Q') -- one
+ * call per dyn_core invocation. The caller is responsible for dispatching
+ * this AFTER fv3_gpu_pt_delz_remap in the same dyn_core call (REMAP_Q reads
+ * pe only after PT/DELZ's own closing update -- see fv3_remap_q.cu's header
+ * comment); this function does not itself enforce that ordering beyond
+ * ordinary compute-stream program order.
+ *
+ * Unlike fv3_gpu_pt_delz_remap/fv3_gpu_remap_uv, this entry is NOT purely a
+ * dispatch trigger: q has no FieldRegistry identity (see fv3_remap_q.cuh's
+ * header comment), so this function itself owns the ONE contiguous H2D
+ * (before the kernel) and ONE contiguous D2H (after the kernel) that carry
+ * it, using a persistent, grow-only, context-owned device buffer
+ * (ContextData::remap_q_buffer) rather than the general per-field registry
+ * path -- deliberately, to keep this a single pair of transfers per call
+ * (Stage 3's transfer-count gate), not a per-field/per-column marshaling
+ * loop of the kind Prompt 82 root-caused as a regression in the unrelated
+ * TRACER_2D CUDA path.
+ *
+ * `q` must point to exactly `q_elements` host doubles laid out as Fortran's
+ * own q(isd:ied,jsd:jed,km,nq) for this tile (i fastest, then j, then k,
+ * then nq slowest/outermost); `q_elements` must equal
+ * (ied-isd+1)*(jed-jsd+1)*km*nq for this context's current bounds, or this
+ * call fails closed with FV3_GPU_INVALID_ARGUMENT rather than silently
+ * copying a partial/oversized buffer. `nq`/`kord1`/`kord2` (Prompt 86B/87)
+ * must be exactly 2/9/9 -- the only validated production schedule (sphum
+ * kord=9, cld_amt kord=9, fv_dynamics.F90:941-944 combined with
+ * FV_StateMod.F90:563's unconditional kord_tr=9 override); anything else
+ * fails
+ * closed with FV3_GPU_UNSUPPORTED_CONFIGURATION rather than guessing a
+ * schedule (explicit nq + two kord values, not a general variable-length
+ * tracer metadata API, per Stage 5's scope). `dependency` is the caller's
+ * most recent event (e.g. fv3_gpu_remap_uv's own event) this call must be
+ * ordered after; `*ev` is the completion event for both kernels and this
+ * call's own D2H copy -- the caller must fv3_gpu_event_wait on it before
+ * reading `q` again (this function does not block the host). R8-only,
+ * matching this port's validated scope; an R4 build's fv_real would
+ * silently mismatch this API's `double *q`, so no R4 caller may use this
+ * entry until that is revisited. */
+extern "C" int fv3_gpu_remap_q(fv3_gpu_context *c, fv3_gpu_event dependency,
+                               double *q, int64_t q_elements,
+                               int32_t nq, int32_t kord1, int32_t kord2,
+                               int32_t fill,
+                               fv3_gpu_event *ev, fv3_gpu_error *e) {
+  using namespace fv3::gpu; clear_error(e); if(ev) *ev=0;
+  if(!c||!ev)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"invalid context or event output");
+  if(!q||q_elements<=0)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"null q or non-positive q_elements");
+  if(nq!=2||kord1!=9||kord2!=9)
+    return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,
+                "REMAP_Q requires nq=2, kord1=9 (sphum), kord2=9 (cld_amt) -- "
+                "the only validated production tracer schedule");
+  if(c->data.phase!=ContextPhase::initialized)
+    return fail(e,FV3_GPU_STATE_CONFLICT,__func__,"context is not initialized");
+  if(dependency && dependency>c->data.last_event)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"dependency references an unknown event");
+
+  const NumericalDispatch &dispatch=c->data.dispatch;
+  if(dispatch.contract_version!=internal_contract_version || !dispatch.remap_q)
+    return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,"remap_q dispatch slot is not installed");
+
+  const auto &bd=c->data.immutable.bounds;
+  const int64_t isd=bd.is-static_cast<int64_t>(bd.halo_width);
+  const int64_t ied=bd.ie+static_cast<int64_t>(bd.halo_width);
+  const int64_t jsd=bd.js-static_cast<int64_t>(bd.halo_width);
+  const int64_t jed=bd.je+static_cast<int64_t>(bd.halo_width);
+  const int64_t km=bd.npz;
+  if(ied<isd || jed<jsd || km<=0)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"empty q memory domain");
+  const int64_t need_elements=(ied-isd+1)*(jed-jsd+1)*km*static_cast<int64_t>(nq);
+  if(q_elements!=need_elements)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,
+                "q_elements does not match (ied-isd+1)*(jed-jsd+1)*km*nq for this context's bounds");
+  const uint64_t need_bytes=static_cast<uint64_t>(need_elements)*sizeof(fv_real);
+
+  if(c->data.remap_q_buffer==nullptr || c->data.remap_q_buffer_bytes<need_bytes){
+    if(c->data.remap_q_buffer) cudaFree(c->data.remap_q_buffer);
+    c->data.remap_q_buffer=nullptr; c->data.remap_q_buffer_bytes=0;
+    void *buf=nullptr;
+    const cudaError_t arc=cudaMalloc(&buf,static_cast<size_t>(need_bytes));
+    if(arc!=cudaSuccess) return cuda_fail(arc,e,__func__,&c->data);
+    c->data.remap_q_buffer=static_cast<fv_real*>(buf);
+    c->data.remap_q_buffer_bytes=need_bytes;
+  }
+
+  ExecutionContext x{};
+  x.contract_version=internal_contract_version;
+  x.fields=&c->data.state.registry;
+  x.immutable=&c->data.immutable;
+  x.dispatch_params=&c->data.dispatch_params;
+  x.workspace=&c->data.workspace.layout;
+  x.submission=Submission{internal_contract_version,c->data.compute_stream,StreamId::compute,
+                          c->data.dispatch_params.acoustic_sequence};
+  x.dependencies=&c->data.dependencies;
+  x.corner_service=dispatch.corner_edge_service;
+  x.dispatch=&dispatch;
+
+  int rc=validate_execution_context(x,e);
+  if(rc) return rc;
+
+#ifdef FV3_GPU_ENABLE_CUDA
+  /* ONE contiguous H2D, straight from the caller's Fortran q pointer into
+   * the persistent device buffer -- no host-side pack/unpack loop (Stage 3).
+   * Enqueued on the transfer stream, then ordered before the compute
+   * stream exactly as fv3_gpu_pt_delz_remap/fv3_gpu_remap_uv order their
+   * callers' own sync_from_host work: cudaEventRecord below captures this
+   * memcpy too, since it is enqueued on transfer_stream before the record. */
+  {
+    const cudaError_t hrc=cudaMemcpyAsync(c->data.remap_q_buffer,q,
+                                          static_cast<size_t>(need_bytes),
+                                          cudaMemcpyHostToDevice,
+                                          static_cast<cudaStream_t>(c->data.transfer_stream));
+    if(hrc!=cudaSuccess) return cuda_fail(hrc,e,__func__,&c->data);
+  }
+  {auto z=order_after(c->data.transfer_stream,c->data.compute_stream,c->data.event_transfer_done);
+   if(z!=cudaSuccess){ return cuda_fail(z,e,__func__,&c->data); }}
+#endif
+
+  c->data.dispatch_params.remap_q_buffer=c->data.remap_q_buffer;
+  c->data.dispatch_params.remap_q_nq=nq;
+  c->data.dispatch_params.remap_q_kord1=kord1;
+  c->data.dispatch_params.remap_q_kord2=kord2;
+  c->data.dispatch_params.remap_q_fill=fill;
+  rc=dispatch.remap_q(x,e);
+  if(rc!=FV3_GPU_SUCCESS) return rc;
+
+#ifdef FV3_GPU_ENABLE_CUDA
+  /* ONE contiguous D2H, back into the SAME caller q pointer, ordered after
+   * the kernel (transfer_stream waits for everything queued on
+   * compute_stream up to this point, mirroring fv3_gpu_sync_to_host's own
+   * compute-before-transfer ordering). The caller must fv3_gpu_event_wait
+   * before touching q again -- this call does not block the host. */
+  {auto z=order_after(c->data.compute_stream,c->data.transfer_stream,c->data.event_compute_done);
+   if(z!=cudaSuccess){ return cuda_fail(z,e,__func__,&c->data); }}
+  {
+    const cudaError_t drc=cudaMemcpyAsync(q,c->data.remap_q_buffer,
+                                          static_cast<size_t>(need_bytes),
+                                          cudaMemcpyDeviceToHost,
+                                          static_cast<cudaStream_t>(c->data.transfer_stream));
+    if(drc!=cudaSuccess) return cuda_fail(drc,e,__func__,&c->data);
+  }
+#endif
+
+  *ev=issue_event(c->data);
+  return FV3_GPU_SUCCESS;
+}
+/* Prompt 92: standalone entry for the production pressure-variable vertical
+ * remap (REMAP_PRESSUREVARS). Reached ONLY through NumericalDispatch::
+ * remap_pressurevars, same link-cycle rationale as fv3_gpu_pt_delz_remap/
+ * fv3_gpu_remap_uv/fv3_gpu_remap_q above.
+ *
+ * Runs OUTSIDE fv3_gpu_dyn_core_step's acoustic-substep walk, at
+ * fv_mapz.F90's Lagrangian_to_Eulerian call site (timer
+ * 'Remap_PressureVars') -- one call per dyn_core invocation, AFTER
+ * fv3_gpu_pt_delz_remap in the same dyn_core call (reads pe only after
+ * PT/DELZ's own closing update -- see fv3_remap_pressurevars.cu's header
+ * comment); this function does not itself enforce that ordering beyond
+ * ordinary compute-stream program order.
+ *
+ * Like fv3_gpu_remap_q, this entry is NOT purely a dispatch trigger:
+ * q(sphum) and cappa have no FieldRegistry identity here (see
+ * fv3_remap_pressurevars.cuh's header comment), so this function owns TWO
+ * persistent, grow-only, context-owned device buffers and their transfers
+ * -- q_sphum's ONE contiguous H2D (read-only input) and cappa's ONE
+ * contiguous H2D (preserves halo bytes this kernel never touches) before
+ * the kernel, plus cappa's ONE contiguous D2H after -- rather than a
+ * per-field/per-column marshaling loop, matching Stage 3/4's transfer-count
+ * gate. */
+extern "C" int fv3_gpu_remap_pressurevars(fv3_gpu_context *c, fv3_gpu_event dependency,
+                                          double *q_sphum, double *cappa,
+                                          int64_t elements,
+                                          fv3_gpu_event *ev, fv3_gpu_error *e) {
+  using namespace fv3::gpu; clear_error(e); if(ev) *ev=0;
+  if(!c||!ev)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"invalid context or event output");
+  if(!q_sphum||!cappa||elements<=0)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"null q_sphum/cappa or non-positive elements");
+  if(c->data.phase!=ContextPhase::initialized)
+    return fail(e,FV3_GPU_STATE_CONFLICT,__func__,"context is not initialized");
+  if(dependency && dependency>c->data.last_event)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"dependency references an unknown event");
+
+  const NumericalDispatch &dispatch=c->data.dispatch;
+  if(dispatch.contract_version!=internal_contract_version || !dispatch.remap_pressurevars)
+    return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,"remap_pressurevars dispatch slot is not installed");
+
+  const auto &bd=c->data.immutable.bounds;
+  const int64_t isd=bd.is-static_cast<int64_t>(bd.halo_width);
+  const int64_t ied=bd.ie+static_cast<int64_t>(bd.halo_width);
+  const int64_t jsd=bd.js-static_cast<int64_t>(bd.halo_width);
+  const int64_t jed=bd.je+static_cast<int64_t>(bd.halo_width);
+  const int64_t km=bd.npz;
+  if(ied<isd || jed<jsd || km<=0)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"empty q_sphum/cappa memory domain");
+  const int64_t need_elements=(ied-isd+1)*(jed-jsd+1)*km;
+  if(elements!=need_elements)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,
+                "elements does not match (ied-isd+1)*(jed-jsd+1)*km for this context's bounds");
+  const uint64_t need_bytes=static_cast<uint64_t>(need_elements)*sizeof(fv_real);
+
+  if(c->data.remap_pressurevars_qsphum_buffer==nullptr || c->data.remap_pressurevars_qsphum_buffer_bytes<need_bytes){
+    if(c->data.remap_pressurevars_qsphum_buffer) cudaFree(c->data.remap_pressurevars_qsphum_buffer);
+    c->data.remap_pressurevars_qsphum_buffer=nullptr; c->data.remap_pressurevars_qsphum_buffer_bytes=0;
+    void *buf=nullptr;
+    const cudaError_t arc=cudaMalloc(&buf,static_cast<size_t>(need_bytes));
+    if(arc!=cudaSuccess) return cuda_fail(arc,e,__func__,&c->data);
+    c->data.remap_pressurevars_qsphum_buffer=static_cast<fv_real*>(buf);
+    c->data.remap_pressurevars_qsphum_buffer_bytes=need_bytes;
+  }
+  if(c->data.remap_pressurevars_cappa_buffer==nullptr || c->data.remap_pressurevars_cappa_buffer_bytes<need_bytes){
+    if(c->data.remap_pressurevars_cappa_buffer) cudaFree(c->data.remap_pressurevars_cappa_buffer);
+    c->data.remap_pressurevars_cappa_buffer=nullptr; c->data.remap_pressurevars_cappa_buffer_bytes=0;
+    void *buf=nullptr;
+    const cudaError_t arc=cudaMalloc(&buf,static_cast<size_t>(need_bytes));
+    if(arc!=cudaSuccess) return cuda_fail(arc,e,__func__,&c->data);
+    c->data.remap_pressurevars_cappa_buffer=static_cast<fv_real*>(buf);
+    c->data.remap_pressurevars_cappa_buffer_bytes=need_bytes;
+  }
+
+  ExecutionContext x{};
+  x.contract_version=internal_contract_version;
+  x.fields=&c->data.state.registry;
+  x.immutable=&c->data.immutable;
+  x.dispatch_params=&c->data.dispatch_params;
+  x.workspace=&c->data.workspace.layout;
+  x.submission=Submission{internal_contract_version,c->data.compute_stream,StreamId::compute,
+                          c->data.dispatch_params.acoustic_sequence};
+  x.dependencies=&c->data.dependencies;
+  x.corner_service=dispatch.corner_edge_service;
+  x.dispatch=&dispatch;
+
+  int rc=validate_execution_context(x,e);
+  if(rc) return rc;
+
+#ifdef FV3_GPU_ENABLE_CUDA
+  /* TWO contiguous H2D copies, straight from the caller's Fortran pointers
+   * into the persistent device buffers -- no host-side pack/unpack loop
+   * (Stage 3/4). q_sphum is read-only input; cappa's H2D preserves halo
+   * bytes this kernel never touches, so its later D2H round-trips them
+   * unchanged. Both enqueued on the transfer stream, then ordered before
+   * the compute stream exactly as fv3_gpu_remap_q orders its own H2D. */
+  {
+    const cudaError_t hrc1=cudaMemcpyAsync(c->data.remap_pressurevars_qsphum_buffer,q_sphum,
+                                           static_cast<size_t>(need_bytes),
+                                           cudaMemcpyHostToDevice,
+                                           static_cast<cudaStream_t>(c->data.transfer_stream));
+    if(hrc1!=cudaSuccess) return cuda_fail(hrc1,e,__func__,&c->data);
+    const cudaError_t hrc2=cudaMemcpyAsync(c->data.remap_pressurevars_cappa_buffer,cappa,
+                                           static_cast<size_t>(need_bytes),
+                                           cudaMemcpyHostToDevice,
+                                           static_cast<cudaStream_t>(c->data.transfer_stream));
+    if(hrc2!=cudaSuccess) return cuda_fail(hrc2,e,__func__,&c->data);
+  }
+  {auto z=order_after(c->data.transfer_stream,c->data.compute_stream,c->data.event_transfer_done);
+   if(z!=cudaSuccess){ return cuda_fail(z,e,__func__,&c->data); }}
+#endif
+
+  c->data.dispatch_params.remap_pressurevars_qsphum_buffer=c->data.remap_pressurevars_qsphum_buffer;
+  c->data.dispatch_params.remap_pressurevars_cappa_buffer=c->data.remap_pressurevars_cappa_buffer;
+  c->data.dispatch_params.remap_pressurevars_isd=isd;
+  c->data.dispatch_params.remap_pressurevars_jsd=jsd;
+  c->data.dispatch_params.remap_pressurevars_nih=ied-isd+1;
+  c->data.dispatch_params.remap_pressurevars_njh=jed-jsd+1;
+  rc=dispatch.remap_pressurevars(x,e);
+  if(rc!=FV3_GPU_SUCCESS) return rc;
+
+#ifdef FV3_GPU_ENABLE_CUDA
+  /* ONE contiguous D2H for cappa only -- q_sphum is read-only input and is
+   * never copied back, mirroring fv3_gpu_remap_q's own compute-before-
+   * transfer ordering. The caller must fv3_gpu_event_wait before touching
+   * cappa again -- this call does not block the host. */
+  {auto z=order_after(c->data.compute_stream,c->data.transfer_stream,c->data.event_compute_done);
+   if(z!=cudaSuccess){ return cuda_fail(z,e,__func__,&c->data); }}
+  {
+    const cudaError_t drc=cudaMemcpyAsync(cappa,c->data.remap_pressurevars_cappa_buffer,
+                                          static_cast<size_t>(need_bytes),
+                                          cudaMemcpyDeviceToHost,
+                                          static_cast<cudaStream_t>(c->data.transfer_stream));
+    if(drc!=cudaSuccess) return cuda_fail(drc,e,__func__,&c->data);
+  }
+#endif
+
+  *ev=issue_event(c->data);
+  return FV3_GPU_SUCCESS;
+}
+/* Prompt 99: standalone entry for the production State_To_FV Phase A
+ * (u/v tiny_number fill + interior copy, BEFORE mpp_get_boundary).
+ * Reached ONLY through NumericalDispatch::state_to_fv_phase_a, same
+ * link-cycle rationale as fv3_gpu_remap_q/fv3_gpu_remap_pressurevars
+ * above.
+ *
+ * Runs OUTSIDE fv3_gpu_dyn_core_step's acoustic-substep walk, once per
+ * k_split sub-iteration, immediately before fv_dynamics() -- see
+ * vertical/fv3_state_to_fv.cuh's header comment for the full Phase A/
+ * B/C split. The caller (cuda/interface/fv3_gpu_dyncore_bridge.F90's
+ * fv3_gpu_interface_state_to_fv_phase_a) must follow this call with
+ * fv3_gpu_sync_to_host (u/v-only mask) to bring u/v to the host for the
+ * UNCHANGED Fortran mpp_get_boundary call, then fv3_gpu_sync_from_host
+ * (same mask) before Phase C runs -- this function does not touch
+ * mpp_get_boundary itself.
+ *
+ * Like fv3_gpu_remap_q/fv3_gpu_remap_pressurevars, this entry is NOT
+ * purely a dispatch trigger: STATE%VARS%U/V have no FieldRegistry
+ * identity here (see fv3_state_to_fv.cuh's header comment), so this
+ * function owns two persistent, grow-only, context-owned device
+ * buffers and their ONE-contiguous-H2D-each transfer, matching Stage
+ * 3/4's transfer-count gate. It also issues the u(:,:,:)=tiny_number/
+ * v(:,:,:)=tiny_number full-buffer fills directly on compute_stream,
+ * via the existing fv3_fill_device_constant utility (fv3_gpu_state_
+ * poison.hpp), strictly before dispatch.state_to_fv_phase_a(x,e)'s
+ * interior-copy kernel -- same stream, so CUDA's ordinary in-stream
+ * ordering guarantees the fill completes before the kernel starts,
+ * matching the Fortran source's own sequential fill-then-overwrite
+ * order (FV_StateMod.F90:2571-2592). */
+extern "C" int fv3_gpu_state_to_fv_phase_a(fv3_gpu_context *c, fv3_gpu_event dependency,
+                                           double *state_u, double *state_v,
+                                           int64_t elements,
+                                           fv3_gpu_event *ev, fv3_gpu_error *e) {
+  using namespace fv3::gpu; clear_error(e); if(ev) *ev=0;
+  if(!c||!ev)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"invalid context or event output");
+  if(!state_u||!state_v||elements<=0)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"null state_u/state_v or non-positive elements");
+  if(c->data.phase!=ContextPhase::initialized)
+    return fail(e,FV3_GPU_STATE_CONFLICT,__func__,"context is not initialized");
+  if(dependency && dependency>c->data.last_event)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"dependency references an unknown event");
+
+  const NumericalDispatch &dispatch=c->data.dispatch;
+  if(dispatch.contract_version!=internal_contract_version || !dispatch.state_to_fv_phase_a)
+    return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,"state_to_fv_phase_a dispatch slot is not installed");
+
+  const auto &bd=c->data.immutable.bounds;
+  const int64_t is=bd.is, ie=bd.ie, js=bd.js, je=bd.je, km=bd.npz;
+  if(ie<is || je<js || km<=0)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"empty state_u/state_v compute domain");
+  const int64_t need_elements=(ie-is+1)*(je-js+1)*km;
+  if(elements!=need_elements)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,
+                "elements does not match (ie-is+1)*(je-js+1)*km for this context's bounds");
+  const uint64_t need_bytes=static_cast<uint64_t>(need_elements)*sizeof(fv_real);
+
+  if(c->data.state_to_fv_u_buffer==nullptr || c->data.state_to_fv_u_buffer_bytes<need_bytes){
+    if(c->data.state_to_fv_u_buffer) cudaFree(c->data.state_to_fv_u_buffer);
+    c->data.state_to_fv_u_buffer=nullptr; c->data.state_to_fv_u_buffer_bytes=0;
+    void *buf=nullptr;
+    const cudaError_t arc=cudaMalloc(&buf,static_cast<size_t>(need_bytes));
+    if(arc!=cudaSuccess) return cuda_fail(arc,e,__func__,&c->data);
+    c->data.state_to_fv_u_buffer=static_cast<fv_real*>(buf);
+    c->data.state_to_fv_u_buffer_bytes=need_bytes;
+  }
+  if(c->data.state_to_fv_v_buffer==nullptr || c->data.state_to_fv_v_buffer_bytes<need_bytes){
+    if(c->data.state_to_fv_v_buffer) cudaFree(c->data.state_to_fv_v_buffer);
+    c->data.state_to_fv_v_buffer=nullptr; c->data.state_to_fv_v_buffer_bytes=0;
+    void *buf=nullptr;
+    const cudaError_t arc=cudaMalloc(&buf,static_cast<size_t>(need_bytes));
+    if(arc!=cudaSuccess) return cuda_fail(arc,e,__func__,&c->data);
+    c->data.state_to_fv_v_buffer=static_cast<fv_real*>(buf);
+    c->data.state_to_fv_v_buffer_bytes=need_bytes;
+  }
+
+  ExecutionContext x{};
+  x.contract_version=internal_contract_version;
+  x.fields=&c->data.state.registry;
+  x.immutable=&c->data.immutable;
+  x.dispatch_params=&c->data.dispatch_params;
+  x.workspace=&c->data.workspace.layout;
+  x.submission=Submission{internal_contract_version,c->data.compute_stream,StreamId::compute,
+                          c->data.dispatch_params.acoustic_sequence};
+  x.dependencies=&c->data.dependencies;
+  x.corner_service=dispatch.corner_edge_service;
+  x.dispatch=&dispatch;
+
+  int rc=validate_execution_context(x,e);
+  if(rc) return rc;
+
+#ifdef FV3_GPU_ENABLE_CUDA
+  {
+    const cudaError_t hrc1=cudaMemcpyAsync(c->data.state_to_fv_u_buffer,state_u,
+                                           static_cast<size_t>(need_bytes),
+                                           cudaMemcpyHostToDevice,
+                                           static_cast<cudaStream_t>(c->data.transfer_stream));
+    if(hrc1!=cudaSuccess) return cuda_fail(hrc1,e,__func__,&c->data);
+    const cudaError_t hrc2=cudaMemcpyAsync(c->data.state_to_fv_v_buffer,state_v,
+                                           static_cast<size_t>(need_bytes),
+                                           cudaMemcpyHostToDevice,
+                                           static_cast<cudaStream_t>(c->data.transfer_stream));
+    if(hrc2!=cudaSuccess) return cuda_fail(hrc2,e,__func__,&c->data);
+  }
+  {auto z=order_after(c->data.transfer_stream,c->data.compute_stream,c->data.event_transfer_done);
+   if(z!=cudaSuccess){ return cuda_fail(z,e,__func__,&c->data); }}
+
+  /* FV_StateMod.F90:2571-2572 u(:,:,:)=tiny_number; v(:,:,:)=tiny_number --
+   * full FieldRegistry buffer fills, strictly before the interior-copy
+   * kernel below, on the SAME compute_stream (see this function's header
+   * comment for why in-stream ordering alone is sufficient here). */
+  {
+    const auto *v_u=c->data.state.registry.find(FieldId::u);
+    const auto *v_v=c->data.state.registry.find(FieldId::v);
+    if(!v_u||!v_v)
+      return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"u/v FieldRegistry views not found");
+    const uint64_t u_bytes=static_cast<uint64_t>(v_u->element_bytes)*v_u->extent[0]*v_u->extent[1]*v_u->extent[2];
+    const uint64_t v_bytes=static_cast<uint64_t>(v_v->element_bytes)*v_v->extent[0]*v_v->extent[1]*v_v->extent[2];
+    constexpr fv_real kTinyNumber=fv_real(1e-15);
+    int frc=fv3_fill_device_constant(v_u->data,u_bytes,kTinyNumber,c->data.compute_stream);
+    if(frc!=static_cast<int>(cudaSuccess)) return cuda_fail(static_cast<cudaError_t>(frc),e,__func__,&c->data);
+    frc=fv3_fill_device_constant(v_v->data,v_bytes,kTinyNumber,c->data.compute_stream);
+    if(frc!=static_cast<int>(cudaSuccess)) return cuda_fail(static_cast<cudaError_t>(frc),e,__func__,&c->data);
+  }
+#endif
+
+  c->data.dispatch_params.state_to_fv_u_buffer=c->data.state_to_fv_u_buffer;
+  c->data.dispatch_params.state_to_fv_v_buffer=c->data.state_to_fv_v_buffer;
+  rc=dispatch.state_to_fv_phase_a(x,e);
+  if(rc!=FV3_GPU_SUCCESS) return rc;
+
+  *ev=issue_event(c->data);
+  return FV3_GPU_SUCCESS;
+}
+/* Prompt 99: standalone entry for the production State_To_FV Phase C
+ * (w copy, pe transpose, peln/pk, ps pack, delp, pt, delz, pkz -- AFTER
+ * mpp_get_boundary). Reached ONLY through NumericalDispatch::
+ * state_to_fv_phase_c, same link-cycle rationale as
+ * fv3_gpu_state_to_fv_phase_a above.
+ *
+ * Same "owns its own no-FieldRegistry-identity transfers" shape as
+ * fv3_gpu_state_to_fv_phase_a: five ONE-contiguous-H2D inputs
+ * (state_w/state_pe/state_pt/state_pkz/state_dz) before the kernel, and
+ * one ONE-contiguous-D2H output (ps -- packed into its own is:ie x
+ * js:je scratch buffer, no FieldRegistry identity and no downstream
+ * device consumer, see fv3_state_to_fv.cuh's header comment) after.
+ * Also issues the pe/delp/pt full-buffer tiny_number fills directly on
+ * compute_stream, via fv3_fill_device_constant, strictly before
+ * dispatch.state_to_fv_phase_c(x,e)'s kernel and in the SAME order the
+ * Fortran source writes them (pe :2604, delp :2652, pt :2668) -- same
+ * in-stream-ordering argument as fv3_gpu_state_to_fv_phase_a's u/v
+ * fills. */
+extern "C" int fv3_gpu_state_to_fv_phase_c(fv3_gpu_context *c, fv3_gpu_event dependency,
+                                           double *state_w, double *state_pe,
+                                           double *state_pt, double *state_pkz,
+                                           double *state_dz, double *ps,
+                                           int64_t elements, int64_t elements_pe,
+                                           fv3_gpu_event *ev, fv3_gpu_error *e) {
+  using namespace fv3::gpu; clear_error(e); if(ev) *ev=0;
+  if(!c||!ev)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"invalid context or event output");
+  if(!state_w||!state_pe||!state_pt||!state_pkz||!state_dz||!ps||elements<=0||elements_pe<=0)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,
+                "null state_w/state_pe/state_pt/state_pkz/state_dz/ps or non-positive elements");
+  if(c->data.phase!=ContextPhase::initialized)
+    return fail(e,FV3_GPU_STATE_CONFLICT,__func__,"context is not initialized");
+  if(dependency && dependency>c->data.last_event)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"dependency references an unknown event");
+
+  const NumericalDispatch &dispatch=c->data.dispatch;
+  if(dispatch.contract_version!=internal_contract_version || !dispatch.state_to_fv_phase_c)
+    return fail(e,FV3_GPU_UNSUPPORTED_CONFIGURATION,__func__,"state_to_fv_phase_c dispatch slot is not installed");
+
+  const auto &bd=c->data.immutable.bounds;
+  const int64_t is=bd.is, ie=bd.ie, js=bd.js, je=bd.je, km=bd.npz;
+  if(ie<is || je<js || km<=0)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"empty state_to_fv_phase_c compute domain");
+  const int64_t cols=(ie-is+1)*(je-js+1);
+  const int64_t need_elements=cols*km;
+  const int64_t need_elements_pe=cols*(km+1);
+  if(elements!=need_elements)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,
+                "elements does not match (ie-is+1)*(je-js+1)*km for this context's bounds");
+  if(elements_pe!=need_elements_pe)
+    return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,
+                "elements_pe does not match (ie-is+1)*(je-js+1)*(km+1) for this context's bounds");
+  const uint64_t need_bytes=static_cast<uint64_t>(need_elements)*sizeof(fv_real);
+  const uint64_t need_bytes_pe=static_cast<uint64_t>(need_elements_pe)*sizeof(fv_real);
+  const uint64_t need_bytes_ps=static_cast<uint64_t>(cols)*sizeof(fv_real);
+
+  auto grow=[&](fv_real *&buf, uint64_t &buf_bytes, uint64_t bytes)->int{
+    if(buf==nullptr || buf_bytes<bytes){
+      if(buf) cudaFree(buf);
+      buf=nullptr; buf_bytes=0;
+      void *raw=nullptr;
+      const cudaError_t arc=cudaMalloc(&raw,static_cast<size_t>(bytes));
+      if(arc!=cudaSuccess) return cuda_fail(arc,e,__func__,&c->data);
+      buf=static_cast<fv_real*>(raw);
+      buf_bytes=bytes;
+    }
+    return FV3_GPU_SUCCESS;
+  };
+
+  int grc;
+  grc=grow(c->data.state_to_fv_w_buffer,c->data.state_to_fv_w_buffer_bytes,need_bytes); if(grc) return grc;
+  grc=grow(c->data.state_to_fv_pe_buffer,c->data.state_to_fv_pe_buffer_bytes,need_bytes_pe); if(grc) return grc;
+  grc=grow(c->data.state_to_fv_pt_buffer,c->data.state_to_fv_pt_buffer_bytes,need_bytes); if(grc) return grc;
+  grc=grow(c->data.state_to_fv_pkz_buffer,c->data.state_to_fv_pkz_buffer_bytes,need_bytes); if(grc) return grc;
+  grc=grow(c->data.state_to_fv_dz_buffer,c->data.state_to_fv_dz_buffer_bytes,need_bytes); if(grc) return grc;
+  grc=grow(c->data.state_to_fv_ps_buffer,c->data.state_to_fv_ps_buffer_bytes,need_bytes_ps); if(grc) return grc;
+
+  ExecutionContext x{};
+  x.contract_version=internal_contract_version;
+  x.fields=&c->data.state.registry;
+  x.immutable=&c->data.immutable;
+  x.dispatch_params=&c->data.dispatch_params;
+  x.workspace=&c->data.workspace.layout;
+  x.submission=Submission{internal_contract_version,c->data.compute_stream,StreamId::compute,
+                          c->data.dispatch_params.acoustic_sequence};
+  x.dependencies=&c->data.dependencies;
+  x.corner_service=dispatch.corner_edge_service;
+  x.dispatch=&dispatch;
+
+  int rc=validate_execution_context(x,e);
+  if(rc) return rc;
+
+#ifdef FV3_GPU_ENABLE_CUDA
+  {
+    const cudaError_t hrc1=cudaMemcpyAsync(c->data.state_to_fv_w_buffer,state_w,
+                                           static_cast<size_t>(need_bytes),
+                                           cudaMemcpyHostToDevice,
+                                           static_cast<cudaStream_t>(c->data.transfer_stream));
+    if(hrc1!=cudaSuccess) return cuda_fail(hrc1,e,__func__,&c->data);
+    const cudaError_t hrc2=cudaMemcpyAsync(c->data.state_to_fv_pe_buffer,state_pe,
+                                           static_cast<size_t>(need_bytes_pe),
+                                           cudaMemcpyHostToDevice,
+                                           static_cast<cudaStream_t>(c->data.transfer_stream));
+    if(hrc2!=cudaSuccess) return cuda_fail(hrc2,e,__func__,&c->data);
+    const cudaError_t hrc3=cudaMemcpyAsync(c->data.state_to_fv_pt_buffer,state_pt,
+                                           static_cast<size_t>(need_bytes),
+                                           cudaMemcpyHostToDevice,
+                                           static_cast<cudaStream_t>(c->data.transfer_stream));
+    if(hrc3!=cudaSuccess) return cuda_fail(hrc3,e,__func__,&c->data);
+    const cudaError_t hrc4=cudaMemcpyAsync(c->data.state_to_fv_pkz_buffer,state_pkz,
+                                           static_cast<size_t>(need_bytes),
+                                           cudaMemcpyHostToDevice,
+                                           static_cast<cudaStream_t>(c->data.transfer_stream));
+    if(hrc4!=cudaSuccess) return cuda_fail(hrc4,e,__func__,&c->data);
+    const cudaError_t hrc5=cudaMemcpyAsync(c->data.state_to_fv_dz_buffer,state_dz,
+                                           static_cast<size_t>(need_bytes),
+                                           cudaMemcpyHostToDevice,
+                                           static_cast<cudaStream_t>(c->data.transfer_stream));
+    if(hrc5!=cudaSuccess) return cuda_fail(hrc5,e,__func__,&c->data);
+  }
+  {auto z=order_after(c->data.transfer_stream,c->data.compute_stream,c->data.event_transfer_done);
+   if(z!=cudaSuccess){ return cuda_fail(z,e,__func__,&c->data); }}
+
+  /* FV_StateMod.F90:2604 pe(:,:,:)=tiny_number; :2652 delp(:,:,:)=
+   * tiny_number; :2668 pt(:,:,:)=tiny_number -- full FieldRegistry
+   * buffer fills, in this exact order, strictly before the kernel
+   * below, all on the SAME compute_stream (see this function's header
+   * comment). */
+  {
+    const auto *v_pe=c->data.state.registry.find(FieldId::pe);
+    const auto *v_delp=c->data.state.registry.find(FieldId::delp);
+    const auto *v_pt=c->data.state.registry.find(FieldId::pt);
+    if(!v_pe||!v_delp||!v_pt)
+      return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"pe/delp/pt FieldRegistry views not found");
+    const uint64_t pe_bytes=static_cast<uint64_t>(v_pe->element_bytes)*v_pe->extent[0]*v_pe->extent[1]*v_pe->extent[2];
+    const uint64_t delp_bytes=static_cast<uint64_t>(v_delp->element_bytes)*v_delp->extent[0]*v_delp->extent[1]*v_delp->extent[2];
+    const uint64_t pt_bytes=static_cast<uint64_t>(v_pt->element_bytes)*v_pt->extent[0]*v_pt->extent[1]*v_pt->extent[2];
+    constexpr fv_real kTinyNumber=fv_real(1e-15);
+    int frc=fv3_fill_device_constant(v_pe->data,pe_bytes,kTinyNumber,c->data.compute_stream);
+    if(frc!=static_cast<int>(cudaSuccess)) return cuda_fail(static_cast<cudaError_t>(frc),e,__func__,&c->data);
+    frc=fv3_fill_device_constant(v_delp->data,delp_bytes,kTinyNumber,c->data.compute_stream);
+    if(frc!=static_cast<int>(cudaSuccess)) return cuda_fail(static_cast<cudaError_t>(frc),e,__func__,&c->data);
+    frc=fv3_fill_device_constant(v_pt->data,pt_bytes,kTinyNumber,c->data.compute_stream);
+    if(frc!=static_cast<int>(cudaSuccess)) return cuda_fail(static_cast<cudaError_t>(frc),e,__func__,&c->data);
+  }
+#endif
+
+  c->data.dispatch_params.state_to_fv_w_buffer=c->data.state_to_fv_w_buffer;
+  c->data.dispatch_params.state_to_fv_pe_buffer=c->data.state_to_fv_pe_buffer;
+  c->data.dispatch_params.state_to_fv_pt_buffer=c->data.state_to_fv_pt_buffer;
+  c->data.dispatch_params.state_to_fv_pkz_buffer=c->data.state_to_fv_pkz_buffer;
+  c->data.dispatch_params.state_to_fv_dz_buffer=c->data.state_to_fv_dz_buffer;
+  c->data.dispatch_params.state_to_fv_ps_buffer=c->data.state_to_fv_ps_buffer;
+  rc=dispatch.state_to_fv_phase_c(x,e);
+  if(rc!=FV3_GPU_SUCCESS) return rc;
+
+#ifdef FV3_GPU_ENABLE_CUDA
+  {auto z=order_after(c->data.compute_stream,c->data.transfer_stream,c->data.event_compute_done);
+   if(z!=cudaSuccess){ return cuda_fail(z,e,__func__,&c->data); }}
+  {
+    const cudaError_t drc=cudaMemcpyAsync(ps,c->data.state_to_fv_ps_buffer,
+                                          static_cast<size_t>(need_bytes_ps),
+                                          cudaMemcpyDeviceToHost,
+                                          static_cast<cudaStream_t>(c->data.transfer_stream));
+    if(drc!=cudaSuccess) return cuda_fail(drc,e,__func__,&c->data);
+  }
+#endif
+
+  *ev=issue_event(c->data);
+  return FV3_GPU_SUCCESS;
+}
 extern "C" int fv3_gpu_event_wait(fv3_gpu_context *c,fv3_gpu_event ev,fv3_gpu_error *e){using namespace fv3::gpu;clear_error(e);if(!c||!ev||ev>c->data.last_event)return fail(e,FV3_GPU_INVALID_ARGUMENT,__func__,"unknown event");
 #ifdef FV3_GPU_ENABLE_CUDA
   /* Milestone 3A.9: wait for BOTH streams. This is the host's only blocking
@@ -2481,6 +3137,6 @@ extern "C" int fv3_gpu_get_capabilities(fv3_gpu_context*,fv3_gpu_capabilities *p
   p->precision_mask=(1u<<fv3::gpu::active_precision);p->communication_stage=1;p->feature_mask=0;return 0;}
 extern "C" int fv3_gpu_finalize(fv3_gpu_context **pc,fv3_gpu_error *e){using namespace fv3::gpu;clear_error(e);if(!pc||!*pc)return 0;auto*c=*pc;
 #ifdef FV3_GPU_ENABLE_CUDA
-  cudaSetDevice(c->data.create.device_ordinal);cudaStreamSynchronize((cudaStream_t)c->data.compute_stream);cudaStreamSynchronize((cudaStream_t)c->data.transfer_stream);for(auto &x:c->data.state.fields)cudaFree(x.device);if(c->data.workspace.allocation)cudaFree(c->data.workspace.allocation);if(c->data.heat_accum){cudaFree(c->data.heat_accum);c->data.heat_accum=nullptr;c->data.heat_accum_bytes=0;}if(c->data.event_compute_done)cudaEventDestroy((cudaEvent_t)c->data.event_compute_done);if(c->data.event_transfer_done)cudaEventDestroy((cudaEvent_t)c->data.event_transfer_done);if(c->data.dgrid_dynamics_graph_exec)cudaGraphExecDestroy((cudaGraphExec_t)c->data.dgrid_dynamics_graph_exec);cudaStreamDestroy((cudaStream_t)c->data.compute_stream);cudaStreamDestroy((cudaStream_t)c->data.transfer_stream);
+  cudaSetDevice(c->data.create.device_ordinal);cudaStreamSynchronize((cudaStream_t)c->data.compute_stream);cudaStreamSynchronize((cudaStream_t)c->data.transfer_stream);for(auto &x:c->data.state.fields)cudaFree(x.device);if(c->data.workspace.allocation)cudaFree(c->data.workspace.allocation);if(c->data.heat_accum){cudaFree(c->data.heat_accum);c->data.heat_accum=nullptr;c->data.heat_accum_bytes=0;}if(c->data.remap_q_buffer){cudaFree(c->data.remap_q_buffer);c->data.remap_q_buffer=nullptr;c->data.remap_q_buffer_bytes=0;}if(c->data.remap_pressurevars_qsphum_buffer){cudaFree(c->data.remap_pressurevars_qsphum_buffer);c->data.remap_pressurevars_qsphum_buffer=nullptr;c->data.remap_pressurevars_qsphum_buffer_bytes=0;}if(c->data.remap_pressurevars_cappa_buffer){cudaFree(c->data.remap_pressurevars_cappa_buffer);c->data.remap_pressurevars_cappa_buffer=nullptr;c->data.remap_pressurevars_cappa_buffer_bytes=0;}if(c->data.state_to_fv_u_buffer){cudaFree(c->data.state_to_fv_u_buffer);c->data.state_to_fv_u_buffer=nullptr;c->data.state_to_fv_u_buffer_bytes=0;}if(c->data.state_to_fv_v_buffer){cudaFree(c->data.state_to_fv_v_buffer);c->data.state_to_fv_v_buffer=nullptr;c->data.state_to_fv_v_buffer_bytes=0;}if(c->data.state_to_fv_w_buffer){cudaFree(c->data.state_to_fv_w_buffer);c->data.state_to_fv_w_buffer=nullptr;c->data.state_to_fv_w_buffer_bytes=0;}if(c->data.state_to_fv_pe_buffer){cudaFree(c->data.state_to_fv_pe_buffer);c->data.state_to_fv_pe_buffer=nullptr;c->data.state_to_fv_pe_buffer_bytes=0;}if(c->data.state_to_fv_pt_buffer){cudaFree(c->data.state_to_fv_pt_buffer);c->data.state_to_fv_pt_buffer=nullptr;c->data.state_to_fv_pt_buffer_bytes=0;}if(c->data.state_to_fv_pkz_buffer){cudaFree(c->data.state_to_fv_pkz_buffer);c->data.state_to_fv_pkz_buffer=nullptr;c->data.state_to_fv_pkz_buffer_bytes=0;}if(c->data.state_to_fv_dz_buffer){cudaFree(c->data.state_to_fv_dz_buffer);c->data.state_to_fv_dz_buffer=nullptr;c->data.state_to_fv_dz_buffer_bytes=0;}if(c->data.state_to_fv_ps_buffer){cudaFree(c->data.state_to_fv_ps_buffer);c->data.state_to_fv_ps_buffer=nullptr;c->data.state_to_fv_ps_buffer_bytes=0;}if(c->data.event_compute_done)cudaEventDestroy((cudaEvent_t)c->data.event_compute_done);if(c->data.event_transfer_done)cudaEventDestroy((cudaEvent_t)c->data.event_transfer_done);if(c->data.dgrid_dynamics_graph_exec)cudaGraphExecDestroy((cudaGraphExec_t)c->data.dgrid_dynamics_graph_exec);cudaStreamDestroy((cudaStream_t)c->data.compute_stream);cudaStreamDestroy((cudaStream_t)c->data.transfer_stream);
 #endif
   delete c;*pc=nullptr;return 0;}

@@ -60,10 +60,18 @@ module fv3_gpu_dyncore_bridge
 
    public :: fv3_gpu_bridge_init
    public :: fv3_gpu_backend_enabled
+   public :: fv3_gpu_device_count
    public :: fv3_gpu_interface_step_dyn
    public :: fv3_gpu_interface_pe_halo
    public :: fv3_gpu_interface_pt_delz_remap
+   public :: fv3_gpu_interface_remap_uv
+   public :: fv3_gpu_interface_remap_q
+   public :: fv3_gpu_interface_remap_pressurevars
+   public :: fv3_gpu_interface_state_to_fv_phase_a
+   public :: fv3_gpu_interface_state_to_fv_phase_c
+   public :: fv3_gpu_interface_fv_tp_2d_hord8
    public :: fv3_gpu_bridge_final
+   public :: env_flag_enabled
 
    ! ---- persistent per-rank state ---------------------------------------------
 
@@ -72,6 +80,13 @@ module fv3_gpu_dyncore_bridge
    integer,     save :: bridge_comm  = MPI_COMM_NULL
    integer,     save :: bridge_tile  = 0
    integer(c_int64_t), save :: model_step = 0
+
+   ! Process-local CUDA device count (cudaGetDeviceCount, so it already
+   ! respects CUDA_VISIBLE_DEVICES), cached once in fv3_gpu_bridge_init from
+   ! the fv3_gpu_get_capabilities call it already makes. Exposed read-only so
+   ! callers (e.g. State_To_FV's density-aware default selector) do not need
+   ! their own ABI call. 0 until the bridge has initialized.
+   integer, save :: cached_device_count = 0
 
    ! The registered descriptors must outlive fv3_gpu_initialize_state only as
    ! data, but the ARRAYS they point at must outlive the context, so the registry
@@ -99,6 +114,13 @@ contains
       fv3_gpu_backend_enabled = bridge_ready
    end function fv3_gpu_backend_enabled
 
+   ! Process-local CUDA device count visible to this rank (see
+   ! cached_device_count above). Returns 0 if the bridge never initialized
+   ! (backend disabled, or init failed before the capabilities query).
+   integer function fv3_gpu_device_count()
+      fv3_gpu_device_count = cached_device_count
+   end function fv3_gpu_device_count
+
 ! =============================================================================
 ! Initialization
 ! =============================================================================
@@ -124,8 +146,11 @@ contains
       integer(c_int32_t)             :: rank_of_tile(6)
       integer(c_int32_t)             :: mpi_transport_kind
       integer :: crc, ierr, comm_rank, comm_size, dev
+      integer :: local_rank, local_size, split_ierr
       integer :: fail_fid, fail_aux
       character(len=256) :: msg
+      character(len=MPI_MAX_PROCESSOR_NAME) :: procname
+      integer :: namelen
 
       rc = 0
       if (.not. enable) return
@@ -140,6 +165,14 @@ contains
               'requires exactly 6 ranks with one cubed-sphere tile per rank')
       endif
 
+      ! ---- node-local rank, for GPU binding on multi-node allocations -----------
+      call fv3_gpu_node_local_rank(comm, local_rank, local_size, split_ierr)
+      if (split_ierr /= 0) then
+         call mpp_error(FATAL, 'fv3_gpu_bridge_init: failed to derive a '// &
+              'node-local rank via MPI_Comm_split_type(MPI_COMM_TYPE_SHARED); '// &
+              'refusing to guess a GPU binding')
+      endif
+
       ! ---- capabilities, and which device this rank drives ---------------------
       caps%abi_version  = FV3_GPU_ABI_VERSION
       caps%struct_bytes = int(storage_size(caps)/8, c_int32_t)
@@ -152,9 +185,27 @@ contains
          call mpp_error(FATAL, 'fv3_gpu_bridge_init: no CUDA device is visible '// &
               'to this rank')
       endif
-      ! Six ranks share whatever GPUs the node exposes; the Prompt 15 transport
-      ! is a single-node design and its test carries the same assumption.
-      dev = mod(comm_rank, int(caps%device_count))
+      ! Device binding uses the rank's position within its own node (Prompt 107),
+      ! not its global rank, so multi-node allocations bind correctly even when
+      ! global rank is not congruent to node-local rank mod device_count. On a
+      ! single node local_rank == comm_rank, so this preserves prior behavior
+      ! exactly. The halo-transport topology below still uses the global
+      ! communicator/rank unchanged -- only device selection is node-local.
+      dev = mod(local_rank, int(caps%device_count))
+      cached_device_count = int(caps%device_count)
+
+      if (env_flag_enabled('RUN_CUDA_FV3_LOG_GPU_BINDING')) then
+         call MPI_Get_processor_name(procname, namelen, ierr)
+         write(msg,'(a,a,a,i0,a,i0,a,i0,a,i0,a,i0)') &
+              'FV3_GPU_BIND host=', trim(procname(1:namelen)), &
+              ' global=', comm_rank, ' local=', local_rank, '/', local_size, &
+              ' devices=', int(caps%device_count), ' selected=', dev
+         ! mpp_error(NOTE,...) only prints from the FMS root PE by default --
+         ! write(0,...) is the existing per-rank diagnostic pattern in this
+         ! codebase (see FV_StateMod.F90's P99_EXIT_DUMP), used here so every
+         ! rank's binding line actually reaches the log, not just PE 0's.
+         write(0,'(A)') trim(msg)
+      endif
 
       ! ---- create -------------------------------------------------------------
       cd%abi_version        = FV3_GPU_ABI_VERSION
@@ -404,13 +455,23 @@ contains
    ! one-host-wait-per-call shape as fv3_gpu_interface_step_dyn above, for the
    ! same reason: everything after this point in Lagrangian_to_Eulerian reads
    ! the Fortran arrays.
-   subroutine fv3_gpu_interface_pt_delz_remap(rc)
+   ! Prompt 65: cuda_owns_pt (default .true., preserving all pre-existing
+   ! call sites/behavior unchanged) selects between the original CUDA_PT_DELZ
+   ! mode (both fields' H2D+D2H, mask unchanged) and the new hybrid
+   ! CUDA_DELZ_FORTRAN_PT mode (.false.): H2D still uses the full 9-field
+   ! mask (the kernel requires a valid device pt to read, even though this
+   ! mode never uses its own pt/pkz output), but D2H uses the 8-field
+   ! delz-only mask so host `pt` is left untouched for fv_mapz.F90's own,
+   ! immediately-following Fortran map_scalar call to consume.
+   subroutine fv3_gpu_interface_pt_delz_remap(rc, cuda_owns_pt)
       integer, intent(out) :: rc
+      logical, intent(in), optional :: cuda_owns_pt
 
-      type(fv3_gpu_field_mask) :: mask
+      type(fv3_gpu_field_mask) :: mask_h2d, mask_d2h
       type(fv3_gpu_error)      :: err
       integer(c_int64_t)       :: ev_h2d, ev_kernel, ev_d2h
       integer :: crc
+      logical :: owns_pt
 
       rc = 0
       if (.not. bridge_ready) then
@@ -418,9 +479,17 @@ contains
               'fv3_gpu_bridge_init succeeded')
       endif
 
-      call pt_delz_remap_state_mask(mask)
+      owns_pt = .true.
+      if (present(cuda_owns_pt)) owns_pt = cuda_owns_pt
 
-      crc = fv3_gpu_sync_from_host(ctx, mask, ev_h2d, err)
+      call pt_delz_remap_state_mask(mask_h2d)
+      if (owns_pt) then
+         mask_d2h = mask_h2d
+      else
+         call pt_delz_remap_state_mask_delz_only_d2h(mask_d2h)
+      endif
+
+      crc = fv3_gpu_sync_from_host(ctx, mask_h2d, ev_h2d, err)
       call check(crc, err, 'fv3_gpu_sync_from_host')
 
       crc = fv3_gpu_pt_delz_remap(ctx, ev_h2d, ev_kernel, err)
@@ -432,13 +501,500 @@ contains
       ! so this is correctly ordered after it without needing ev_kernel
       ! threaded through explicitly -- same mechanism
       ! fv3_gpu_interface_step_dyn relies on for its own D2H.
-      crc = fv3_gpu_sync_to_host(ctx, mask, ev_d2h, err)
+      crc = fv3_gpu_sync_to_host(ctx, mask_d2h, ev_d2h, err)
       call check(crc, err, 'fv3_gpu_sync_to_host')
 
       crc = fv3_gpu_event_wait(ctx, ev_d2h, err)
       call check(crc, err, 'fv3_gpu_event_wait')
 
    end subroutine fv3_gpu_interface_pt_delz_remap
+
+! =============================================================================
+! fv_mapz_mod production u/v vertical remap (Prompt 71, REMAP_UV)
+! =============================================================================
+
+   ! Called from Lagrangian_to_Eulerian in place of the Fortran u/v
+   ! map_scalar path, ONLY for the validated production subset (iv=-1,
+   ! kord_mt==9, R8) -- gating that subset is the CALLER's responsibility
+   ! (fv_mapz.F90), not this subroutine's; this entry trusts it has already
+   ! been checked, exactly as launch_remap_uv_ctx's own header comment
+   ! documents.
+   !
+   ! MUST be called AFTER fv3_gpu_interface_pt_delz_remap within the same
+   ! dyn_core call: REMAP_UV reads pe only after PT/DELZ's own closing
+   ! update has finished it (see fv3_remap_uv.cu's header comment). Unlike
+   ! pt_delz_remap, there is no partial-ownership hybrid mode here -- u and
+   ! v are always both read and written, so a single combined H2D/D2H mask
+   ! suffices (no owns_pt-style split).
+   subroutine fv3_gpu_interface_remap_uv(rc)
+      integer, intent(out) :: rc
+
+      type(fv3_gpu_field_mask) :: mask
+      type(fv3_gpu_error)      :: err
+      integer(c_int64_t)       :: ev_h2d, ev_kernel, ev_d2h
+      integer :: crc
+
+      rc = 0
+      if (.not. bridge_ready) then
+         call mpp_error(FATAL, 'fv3_gpu_interface_remap_uv: called before '// &
+              'fv3_gpu_bridge_init succeeded')
+      endif
+
+      call remap_uv_state_mask(mask)
+
+      crc = fv3_gpu_sync_from_host(ctx, mask, ev_h2d, err)
+      call check(crc, err, 'fv3_gpu_sync_from_host')
+
+      crc = fv3_gpu_remap_uv(ctx, ev_h2d, ev_kernel, err)
+      call check(crc, err, 'fv3_gpu_remap_uv')
+
+      crc = fv3_gpu_sync_to_host(ctx, mask, ev_d2h, err)
+      call check(crc, err, 'fv3_gpu_sync_to_host')
+
+      crc = fv3_gpu_event_wait(ctx, ev_d2h, err)
+      call check(crc, err, 'fv3_gpu_event_wait')
+
+   end subroutine fv3_gpu_interface_remap_uv
+
+! =============================================================================
+! fv_mapz_mod production tracer vertical remap (Prompt 85, REMAP_Q)
+! =============================================================================
+
+   ! Called from Lagrangian_to_Eulerian in place of the Fortran mapn_tracer
+   ! path, ONLY for the validated production subset (nq==2, kord_tr(1)==9
+   ! [sphum], cld_amt's own kord==9, R8) -- gating that subset is the
+   ! CALLER's responsibility (fv_mapz.F90), not this subroutine's; this
+   ! entry trusts it has already been checked, exactly as
+   ! launch_remap_q_ctx's own header comment documents. (Prompt 86B: an
+   ! earlier version of this comment read "kord_tr(1)==9 per this
+   ! codebase's established '+1' kord convention" -- a copy-paste error from
+   ! the neighboring PT_DELZ/REMAP_UV blocks, which DO use that convention;
+   ! REMAP_Q's own selector has always checked kord_tr(1) directly, with no
+   ! offset. Prompt 87 found the real Fortran value of kord_tr(1) is 9, not
+   ! the 8 Prompts 85/86A/86B assumed -- FV_StateMod.F90:563 unconditionally
+   ! overrides fv_arrays.F90:333's bare default -- so kord_tr(1)==9 is now
+   ! correct here for a genuinely different reason than the "+1" convention
+   ! this comment previously (correctly) disclaimed; see
+   ! docs/performance/p87_remap_q_actual_kord9_production_2026-09-25.md.)
+   !
+   ! MUST be called AFTER fv3_gpu_interface_pt_delz_remap within the same
+   ! dyn_core call: REMAP_Q reads pe only after PT/DELZ's own closing
+   ! update has finished it (same ordering constraint as REMAP_UV; see
+   ! fv3_remap_q.cu's header comment). Unlike pt_delz_remap/remap_uv, q has
+   ! no FieldRegistry identity, so there is no mask/sync_from_host/
+   ! sync_to_host pair here -- fv3_gpu_remap_q owns its own single H2D
+   ! (before the kernel) and single D2H (after) directly against the `q`
+   ! actual argument, via a persistent context-owned device buffer.
+   ! `q_elements` must equal (ied-isd+1)*(jed-jsd+1)*km*nq for this tile's
+   ! current bounds, matching fv3_gpu_remap_q's own contract -- the call
+   ! fails closed (FV3_GPU_INVALID_ARGUMENT) on any mismatch. `nq`/`kord1`/
+   ! `kord2` are passed through as literal 2/9/9 (Prompt 86B/87 -- corrected
+   ! from the originally assumed 2/8/9) -- the only validated production
+   ! schedule; fv3_gpu_remap_q itself re-validates this as defense-in-depth.
+   ! `dependency`
+   ! is passed as 0: unlike pt_delz_remap/remap_uv (whose dependency is the
+   ! caller's own external sync_from_host event), q's H2D is internal to
+   ! fv3_gpu_remap_q itself, and both it and the kernel launch are enqueued
+   ! on this context's existing transfer/compute streams in call order, so
+   ! single-stream issue ordering already sequences this correctly after
+   ! PT/DELZ's kernel and after any prior call's D2H of the same buffer --
+   ! no separate host-visible event needs to be threaded through.
+   !
+   ! `q` is plain `real` (the caller's build-native kind, R4 or R8) rather
+   ! than real(c_double), matching fv3_gpu_interface_fv_tp_2d_hord8's own
+   ! precedent (fv3_gpu_api.h's fv_tp_2d_hord8 comment) -- this keeps this
+   ! subroutine's explicit interface compile-clean in an R4 build too (this
+   ! repo's own build_r4 target), even though the caller (fv_mapz.F90's
+   ! use_cuda_remap_q gate) only ever DISPATCHES to this call in an R8
+   ! build. The local q_d conversion below is therefore a no-op value copy
+   ! whenever this actually runs (R8 in, real(c_double) kind=8 out, same
+   ! bit layout) -- one bulk array assignment each way, not the per-field
+   ! scalar marshaling loop Prompt 82 found responsible for the TRACER_2D
+   ! regression.
+   !
+   ! Prompt 88B: `fill` is the caller's flagstruct%fill (logical), converted
+   ! to the plain 0/1 integer fv3_gpu_remap_q's C ABI expects. Applied
+   ! identically to both tracers by fv3_gpu_remap_q/launch_remap_q_ctx --
+   ! there is no per-tracer fill argument here because flagstruct%fill is
+   ! one global value, not per-tracer (see fv3_remap_q.cuh header comment).
+   subroutine fv3_gpu_interface_remap_q(rc, q, q_elements, fill)
+      integer, intent(out) :: rc
+      real, intent(inout)            :: q(*)
+      integer(c_int64_t), intent(in) :: q_elements
+      logical, intent(in)            :: fill
+
+      real(c_double), allocatable :: q_d(:)
+      type(fv3_gpu_error) :: err
+      integer(c_int64_t)  :: ev_kernel
+      integer(c_int32_t)  :: fill_flag
+      integer :: crc
+
+      rc = 0
+      if (.not. bridge_ready) then
+         call mpp_error(FATAL, 'fv3_gpu_interface_remap_q: called before '// &
+              'fv3_gpu_bridge_init succeeded')
+      endif
+
+      allocate(q_d(q_elements))
+      q_d = real(q(1:q_elements), c_double)
+
+      fill_flag = 0_c_int32_t
+      if (fill) fill_flag = 1_c_int32_t
+
+      crc = fv3_gpu_remap_q(ctx, 0_c_int64_t, q_d, q_elements, &
+                            2_c_int32_t, 9_c_int32_t, 9_c_int32_t, fill_flag, &
+                            ev_kernel, err)
+      call check(crc, err, 'fv3_gpu_remap_q')
+
+      crc = fv3_gpu_event_wait(ctx, ev_kernel, err)
+      call check(crc, err, 'fv3_gpu_event_wait')
+
+      q(1:q_elements) = real(q_d, kind(q))
+      deallocate(q_d)
+
+   end subroutine fv3_gpu_interface_remap_q
+
+! =============================================================================
+! fv_mapz_mod production pressure-variable vertical remap
+! (Prompt 92, REMAP_PRESSUREVARS)
+! =============================================================================
+
+   ! Called from Lagrangian_to_Eulerian in place of the Fortran
+   ! pe2/pn2/pk2 recompute + delp/cappa/pkz block (fv_mapz.F90:1239-1516,
+   ! timer 'Remap_PressureVars') -- gating the validated production subset
+   ! (nwat==0, R8) is the CALLER's responsibility (fv_mapz.F90), not this
+   ! subroutine's; this entry trusts it has already been checked, exactly
+   ! as launch_remap_pressurevars_ctx's own header comment documents.
+   !
+   ! MUST be called AFTER fv3_gpu_interface_pt_delz_remap (and, when both
+   ! run, after fv3_gpu_interface_remap_uv/fv3_gpu_interface_remap_q)
+   ! within the same dyn_core call: this entry reads pe only after PT/
+   ! DELZ's own closing update has finished it (see
+   ! fv3_remap_pressurevars.cu's header comment).
+   !
+   ! q(sphum)/cappa have no FieldRegistry identity (like remap_q's q), so
+   ! fv3_gpu_remap_pressurevars owns their own H2D (q_sphum read-only,
+   ! cappa round-tripped) and cappa's own D2H directly against the actual
+   ! arguments below, via two persistent context-owned device buffers --
+   ! there is no mask/sync_from_host/sync_to_host pair for THOSE two
+   ! fields. pe/peln/pk/delp/pkz/pt/delz/ak/bk remain ordinary
+   ! FieldRegistry fields and DO go through the usual mask/sync_from_host/
+   ! sync_to_host pair here, split into a narrower H2D-only mask (ak, bk,
+   ! pe, pt, delz -- the fields this kernel reads as input) and a
+   ! narrower D2H-only mask (pe, peln, pk, pkz, delp -- the fields this
+   ! kernel writes), rather than one combined mask covering all 9: pt and
+   ! delz are read-only here (never rewritten by this kernel) and pkz is
+   ! write-only (never read), so a combined mask would move bytes neither
+   ! direction needs, contrary to project_architecture.md's "avoid
+   ! unnecessary full-state host/device transfers".
+   !
+   ! `q_sphum`/`cappa` are plain `real` (the caller's build-native kind,
+   ! R4 or R8), matching fv3_gpu_interface_remap_q's own precedent -- this
+   ! keeps this subroutine's explicit interface compile-clean in an R4
+   ! build too, even though the caller only ever dispatches to this call
+   ! in an R8 build. `elements` must equal (ied-isd+1)*(jed-jsd+1)*npz for
+   ! this tile's current bounds; the call fails closed
+   ! (FV3_GPU_INVALID_ARGUMENT) on any mismatch.
+   subroutine fv3_gpu_interface_remap_pressurevars(rc, q_sphum, cappa, elements)
+      integer, intent(out) :: rc
+      real, intent(in)               :: q_sphum(*)
+      real, intent(inout)            :: cappa(*)
+      integer(c_int64_t), intent(in) :: elements
+
+      real(c_double), allocatable :: q_sphum_d(:), cappa_d(:)
+      type(fv3_gpu_field_mask) :: mask_h2d, mask_d2h
+      type(fv3_gpu_error)      :: err
+      integer(c_int64_t)       :: ev_h2d, ev_kernel, ev_d2h
+      integer :: crc
+
+      rc = 0
+      if (.not. bridge_ready) then
+         call mpp_error(FATAL, 'fv3_gpu_interface_remap_pressurevars: '// &
+              'called before fv3_gpu_bridge_init succeeded')
+      endif
+
+      allocate(q_sphum_d(elements), cappa_d(elements))
+      q_sphum_d = real(q_sphum(1:elements), c_double)
+      cappa_d   = real(cappa(1:elements),   c_double)
+
+      call pressurevars_state_mask_h2d(mask_h2d)
+      call pressurevars_state_mask_d2h(mask_d2h)
+
+      crc = fv3_gpu_sync_from_host(ctx, mask_h2d, ev_h2d, err)
+      call check(crc, err, 'fv3_gpu_sync_from_host')
+
+      crc = fv3_gpu_remap_pressurevars(ctx, ev_h2d, q_sphum_d, cappa_d, &
+                                       elements, ev_kernel, err)
+      call check(crc, err, 'fv3_gpu_remap_pressurevars')
+
+      crc = fv3_gpu_sync_to_host(ctx, mask_d2h, ev_d2h, err)
+      call check(crc, err, 'fv3_gpu_sync_to_host')
+
+      crc = fv3_gpu_event_wait(ctx, ev_d2h, err)
+      call check(crc, err, 'fv3_gpu_event_wait')
+
+      ! ev_kernel is not separately waited on: it orders cappa's own D2H
+      ! (inside fv3_gpu_remap_pressurevars) after the kernel on the same
+      ! compute/transfer stream pair, and ev_d2h above (the FieldRegistry
+      ! D2H for pe/peln/pk/pkz/delp) is issued and waited on strictly after
+      ! that call returns -- same reliance on single-stream issue order as
+      ! fv3_gpu_interface_remap_q's own ev_kernel handling.
+      cappa(1:elements) = real(cappa_d, kind(cappa))
+      deallocate(q_sphum_d, cappa_d)
+
+   end subroutine fv3_gpu_interface_remap_pressurevars
+
+! =============================================================================
+! FV_StateMod.F90 production State_To_FV, Phase A/C halves (Prompt 99)
+! =============================================================================
+
+   ! Called from FV_StateMod.F90's State_To_FV in place of the Fortran
+   ! u(:,:,:)=tiny_number / v(:,:,:)=tiny_number full-buffer fills and the
+   ! FV_Atm(1)%u(isc:iec,jsc:jec,:)=STATE%VARS%U / v(...)=STATE%VARS%V
+   ! interior copies (FV_StateMod.F90:2571-2588, the grid_type<4 production
+   ! branch) -- gating that production subset (grid_type<4, R8,
+   ! ADJUST_SPLITS=.false. -- see below) is the CALLER's responsibility, not
+   ! this subroutine's.
+   !
+   ! This entry does NOT call mpp_get_boundary or perform the nbuffer/
+   ! ebuffer edge-row scatter -- those stay verbatim, host-side, in
+   ! FV_StateMod.F90. This entry's own D2H (below) is what makes the
+   ! UNCHANGED mpp_get_boundary call able to read this kernel's output: it
+   ! brings the just-computed FV_Atm(1)%u/v interior values to the host,
+   ! exactly where the Fortran source's own assignment would have left
+   ! them. The caller must call mpp_get_boundary/do the edge scatter on
+   ! FV_Atm(1)%u/v (host) immediately after this call returns, and then
+   ! call fv3_gpu_interface_state_to_fv_phase_c (which brings the halo-
+   ! updated host u/v back to the device as ITS first action) before
+   ! continuing.
+   !
+   ! ADJUST_SPLITS SCOPE NOTE: FV_StateMod.F90:2685-2694 calls
+   ! adjust_fv3_splits(...) using FV_Atm(1)%u/v/w/delz directly as HOST
+   ! arrays, AFTER Phase C would normally leave w/delz device-resident
+   ! only (see fv3_gpu_interface_state_to_fv_phase_c below). Neither this
+   ! entry nor Phase C perform the D2H adjust_fv3_splits would need. The
+   ! CUDA selector in FV_StateMod.F90 MUST reject ADJUST_SPLITS=.true.
+   ! (fall back to Fortran) rather than silently feeding adjust_fv3_splits
+   ! stale host w/delz -- ADJUST_SPLITS defaults to .false. and is absent
+   ! from the production first-run configuration project_architecture.md
+   ! documents, so this is a real but narrow scope boundary, not a defect.
+   !
+   ! `state_u`/`state_v` are plain `real` (build-native kind), matching
+   ! fv3_gpu_interface_remap_q's own precedent. `elements` must equal
+   ! (ie-is+1)*(je-js+1)*npz for this tile's current bounds; the call
+   ! fails closed (FV3_GPU_INVALID_ARGUMENT) on any mismatch.
+   subroutine fv3_gpu_interface_state_to_fv_phase_a(rc, state_u, state_v, elements)
+      integer, intent(out) :: rc
+      real, intent(in)               :: state_u(*), state_v(*)
+      integer(c_int64_t), intent(in) :: elements
+
+      real(c_double), allocatable :: state_u_d(:), state_v_d(:)
+      type(fv3_gpu_field_mask) :: mask_uv
+      type(fv3_gpu_error)      :: err
+      integer(c_int64_t)       :: ev_kernel, ev_d2h
+      integer :: crc
+
+      rc = 0
+      if (.not. bridge_ready) then
+         call mpp_error(FATAL, 'fv3_gpu_interface_state_to_fv_phase_a: '// &
+              'called before fv3_gpu_bridge_init succeeded')
+      endif
+
+      allocate(state_u_d(elements), state_v_d(elements))
+      state_u_d = real(state_u(1:elements), c_double)
+      state_v_d = real(state_v(1:elements), c_double)
+
+      crc = fv3_gpu_state_to_fv_phase_a(ctx, 0_c_int64_t, state_u_d, state_v_d, &
+                                        elements, ev_kernel, err)
+      call check(crc, err, 'fv3_gpu_state_to_fv_phase_a')
+
+      call state_to_fv_uv_mask(mask_uv)
+      crc = fv3_gpu_sync_to_host(ctx, mask_uv, ev_d2h, err)
+      call check(crc, err, 'fv3_gpu_sync_to_host')
+
+      crc = fv3_gpu_event_wait(ctx, ev_d2h, err)
+      call check(crc, err, 'fv3_gpu_event_wait')
+
+      deallocate(state_u_d, state_v_d)
+
+   end subroutine fv3_gpu_interface_state_to_fv_phase_a
+
+   ! Called from FV_StateMod.F90's State_To_FV immediately after the
+   ! caller's own UNCHANGED mpp_get_boundary call and edge-row scatter (see
+   ! fv3_gpu_interface_state_to_fv_phase_a above), in place of the Fortran
+   ! w interior copy (hydrostatic-gated), the pe(:,:,:)=tiny_number fill +
+   ! full pe transpose/peln/pk recompute over all km+1 levels, the ps pack,
+   ! the delp(:,:,:)=tiny_number fill + recompute, the pt(:,:,:)=
+   ! tiny_number fill + recompute, and the delz/pkz interior copies
+   ! (FV_StateMod.F90:2604-2680, the SW_DYNAMICS=.false. production
+   ! branch).
+   !
+   ! This entry's FIRST action is fv3_gpu_sync_from_host on the u/v-only
+   ! mask -- bringing the host u/v the caller's mpp_get_boundary call just
+   ! updated back onto the device, closing the device -> host -> device
+   ! round trip Phase A's header comment documents. Phase C's own kernel
+   ! does not read u/v; this exists solely so the FieldRegistry's device-
+   ! resident u/v stay consistent with the host before fv_dynamics() (the
+   ! next production call) consumes them from the device.
+   !
+   ! w/pe/peln/pk/delp/pt/delz/pkz are left DEVICE-RESIDENT ONLY after this
+   ! call -- no D2H for them here, by design: their consumer is the
+   ! already-GPU-resident fv_dynamics() CUDA path, not host code (see
+   ! docs/performance/p98_state_to_fv_cuda_port_plan_2026-09-28.md's
+   ! residency-direction finding). See fv3_gpu_interface_state_to_fv_
+   ! phase_a's ADJUST_SPLITS scope note above -- the CUDA selector must
+   ! reject ADJUST_SPLITS=.true., which is the one host consumer of w/delz
+   ! this design does not serve.
+   !
+   ! `state_w`/`state_pe`/`state_pt`/`state_pkz`/`state_dz` are plain
+   ! `real`. `elements` must equal (ie-is+1)*(je-js+1)*npz and
+   ! `elements_pe` must equal (ie-is+1)*(je-js+1)*(npz+1); the call fails
+   ! closed (FV3_GPU_INVALID_ARGUMENT) on any mismatch. `ps` is returned to
+   ! the caller directly (sized elements_pe - elements == (ie-is+1)*
+   ! (je-js+1), the one contiguous D2H fv3_gpu_state_to_fv_phase_c's own
+   ! ABI comment documents).
+   subroutine fv3_gpu_interface_state_to_fv_phase_c(rc, state_w, state_pe, state_pt, &
+                                                     state_pkz, state_dz, ps, &
+                                                     elements, elements_pe)
+      integer, intent(out) :: rc
+      real, intent(in)               :: state_w(*), state_pe(*), state_pt(*), &
+                                         state_pkz(*), state_dz(*)
+      real, intent(out)              :: ps(*)
+      integer(c_int64_t), intent(in) :: elements, elements_pe
+
+      real(c_double), allocatable :: state_w_d(:), state_pe_d(:), state_pt_d(:), &
+                                      state_pkz_d(:), state_dz_d(:), ps_d(:)
+      type(fv3_gpu_field_mask) :: mask_uv
+      type(fv3_gpu_error)      :: err
+      integer(c_int64_t)       :: ev_h2d_uv, ev_kernel
+      integer(c_int64_t)       :: elements_ps
+      integer :: crc
+
+      rc = 0
+      if (.not. bridge_ready) then
+         call mpp_error(FATAL, 'fv3_gpu_interface_state_to_fv_phase_c: '// &
+              'called before fv3_gpu_bridge_init succeeded')
+      endif
+
+      call state_to_fv_uv_mask(mask_uv)
+      crc = fv3_gpu_sync_from_host(ctx, mask_uv, ev_h2d_uv, err)
+      call check(crc, err, 'fv3_gpu_sync_from_host')
+
+      crc = fv3_gpu_event_wait(ctx, ev_h2d_uv, err)
+      call check(crc, err, 'fv3_gpu_event_wait')
+
+      elements_ps = elements_pe - elements
+
+      allocate(state_w_d(elements), state_pe_d(elements_pe), state_pt_d(elements), &
+               state_pkz_d(elements), state_dz_d(elements), ps_d(elements_ps))
+
+      state_w_d   = real(state_w(1:elements),     c_double)
+      state_pe_d  = real(state_pe(1:elements_pe), c_double)
+      state_pt_d  = real(state_pt(1:elements),    c_double)
+      state_pkz_d = real(state_pkz(1:elements),   c_double)
+      state_dz_d  = real(state_dz(1:elements),    c_double)
+
+      crc = fv3_gpu_state_to_fv_phase_c(ctx, 0_c_int64_t, state_w_d, state_pe_d, &
+                                        state_pt_d, state_pkz_d, state_dz_d, ps_d, &
+                                        elements, elements_pe, ev_kernel, err)
+      call check(crc, err, 'fv3_gpu_state_to_fv_phase_c')
+
+      crc = fv3_gpu_event_wait(ctx, ev_kernel, err)
+      call check(crc, err, 'fv3_gpu_event_wait')
+
+      ps(1:elements_ps) = real(ps_d, kind(ps))
+
+      deallocate(state_w_d, state_pe_d, state_pt_d, state_pkz_d, state_dz_d, ps_d)
+
+   end subroutine fv3_gpu_interface_state_to_fv_phase_c
+
+   !==========================================================================
+   ! Prompt 77: single (k, iq) tracer-transport slice for
+   ! fv_tracer2d.F90::tracer_2d_1L's nsplt==1 fv_tp_2d call site. Context-free
+   ! and FieldRegistry-free, mirroring fv3_gpu_fv_tp_2d_hord8's own design
+   ! (fv3_gpu_api.h:210-249) -- no ctx argument, no fv3_gpu_create/finalize
+   ! interaction; tracer temporaries have no FieldRegistry identity.
+   !
+   ! Dummy arguments use plain `real` (the caller's build-native kind, R4 or
+   ! R8) and shapes matching fv_tp_2d's own dummy-argument bounds exactly
+   ! (tp_core.F90:109-138), so a caller can substitute this call one-for-one.
+   ! Every array is converted to real(c_double) before crossing the ABI
+   ! (fixed at double regardless of build precision -- see fv3_gpu_api.h's
+   ! fv3_gpu_fv_tp_2d_hord8 comment) and fx/fy are converted back on return.
+   ! This subroutine does not itself gate on build precision or hord; the
+   ! caller (fv_tracer2d.F90's use_cuda_tp2d selector) is responsible for
+   ! calling this only when eligible.
+   subroutine fv3_gpu_interface_fv_tp_2d_hord8( &
+         is, ie, js, je, isd, ied, jsd, jed, npx, npy, hord, &
+         cubed_sphere, nested, west_edge, east_edge, south_edge, north_edge, &
+         sw_corner, se_corner, ne_corner, nw_corner, &
+         q, crx, cry, xfx, yfx, mfx, mfy, ra_x, ra_y, area, dxa, dya, fx, fy)
+      integer, intent(in) :: is, ie, js, je, isd, ied, jsd, jed, npx, npy, hord
+      logical, intent(in) :: cubed_sphere, nested
+      logical, intent(in) :: west_edge, east_edge, south_edge, north_edge
+      logical, intent(in) :: sw_corner, se_corner, ne_corner, nw_corner
+      real,    intent(inout) :: q(isd:ied, jsd:jed)
+      real,    intent(in)    :: crx(is:ie+1, jsd:jed), xfx(is:ie+1, jsd:jed)
+      real,    intent(in)    :: cry(isd:ied, js:je+1), yfx(isd:ied, js:je+1)
+      real,    intent(in)    :: mfx(is:ie+1, js:je), mfy(is:ie, js:je+1)
+      real,    intent(in)    :: ra_x(is:ie, jsd:jed), ra_y(isd:ied, js:je)
+      real,    intent(in)    :: area(isd:ied, jsd:jed), dxa(isd:ied, jsd:jed), dya(isd:ied, jsd:jed)
+      real,    intent(out)   :: fx(is:ie+1, js:je), fy(is:ie, js:je+1)
+
+      real(c_double) :: q_d(isd:ied, jsd:jed)
+      real(c_double) :: crx_d(is:ie+1, jsd:jed), xfx_d(is:ie+1, jsd:jed)
+      real(c_double) :: cry_d(isd:ied, js:je+1), yfx_d(isd:ied, js:je+1)
+      real(c_double) :: mfx_d(is:ie+1, js:je), mfy_d(is:ie, js:je+1)
+      real(c_double) :: ra_x_d(is:ie, jsd:jed), ra_y_d(isd:ied, js:je)
+      real(c_double) :: area_d(isd:ied, jsd:jed), dxa_d(isd:ied, jsd:jed), dya_d(isd:ied, jsd:jed)
+      real(c_double) :: fx_d(is:ie+1, js:je), fy_d(is:ie, js:je+1)
+
+      type(fv3_gpu_tracer_transport_bounds) :: b
+      type(fv3_gpu_error) :: err
+      integer :: crc
+
+      if (.not. bridge_ready) then
+         call mpp_error(FATAL, 'fv3_gpu_interface_fv_tp_2d_hord8: called before '// &
+              'fv3_gpu_bridge_init succeeded')
+      endif
+
+      b%abi_version  = FV3_GPU_ABI_VERSION
+      b%struct_bytes = int(storage_size(b)/8, c_int32_t)
+      b%is  = int(is,  c_int64_t); b%ie  = int(ie,  c_int64_t)
+      b%js  = int(js,  c_int64_t); b%je  = int(je,  c_int64_t)
+      b%isd = int(isd, c_int64_t); b%ied = int(ied, c_int64_t)
+      b%jsd = int(jsd, c_int64_t); b%jed = int(jed, c_int64_t)
+      b%npx = int(npx, c_int64_t); b%npy = int(npy, c_int64_t)
+      b%hord = int(hord, c_int32_t)
+      b%cubed_sphere = merge(1_c_int32_t, 0_c_int32_t, cubed_sphere)
+      b%nested       = merge(1_c_int32_t, 0_c_int32_t, nested)
+      b%west_edge  = merge(1_c_int32_t, 0_c_int32_t, west_edge)
+      b%east_edge  = merge(1_c_int32_t, 0_c_int32_t, east_edge)
+      b%south_edge = merge(1_c_int32_t, 0_c_int32_t, south_edge)
+      b%north_edge = merge(1_c_int32_t, 0_c_int32_t, north_edge)
+      b%sw_corner = merge(1_c_int32_t, 0_c_int32_t, sw_corner)
+      b%se_corner = merge(1_c_int32_t, 0_c_int32_t, se_corner)
+      b%ne_corner = merge(1_c_int32_t, 0_c_int32_t, ne_corner)
+      b%nw_corner = merge(1_c_int32_t, 0_c_int32_t, nw_corner)
+
+      q_d    = real(q,    c_double)
+      crx_d  = real(crx,  c_double); xfx_d = real(xfx, c_double)
+      cry_d  = real(cry,  c_double); yfx_d = real(yfx, c_double)
+      mfx_d  = real(mfx,  c_double); mfy_d = real(mfy, c_double)
+      ra_x_d = real(ra_x, c_double); ra_y_d = real(ra_y, c_double)
+      area_d = real(area, c_double)
+      dxa_d  = real(dxa,  c_double); dya_d = real(dya, c_double)
+
+      crc = fv3_gpu_fv_tp_2d_hord8(b, q_d, crx_d, cry_d, xfx_d, yfx_d, &
+                                   mfx_d, mfy_d, ra_x_d, ra_y_d, &
+                                   area_d, dxa_d, dya_d, fx_d, fy_d, err)
+      call check(crc, err, 'fv3_gpu_fv_tp_2d_hord8')
+
+      q  = real(q_d,  kind(q))
+      fx = real(fx_d, kind(fx))
+      fy = real(fy_d, kind(fy))
+
+   end subroutine fv3_gpu_interface_fv_tp_2d_hord8
 
    !==========================================================================
    ! Complete pe's one halo ring at the dyn_core exit boundary.
@@ -778,6 +1334,101 @@ contains
       end do
    end subroutine pt_delz_remap_state_mask
 
+   ! Prompt 65: D2H-only companion mask for the CUDA-delz/Fortran-pt hybrid
+   ! mode -- identical to pt_delz_remap_state_mask above MINUS FV3_FID_PT.
+   ! The kernel still needs a valid on-device pt to read as H2D input (it
+   ! internally computes a pt pretransform/remap it never returns to the
+   ! host in this mode), but that device-side pt result must never be
+   ! copied back: fv_mapz.F90's own Fortran map_scalar call for pt runs
+   ! immediately after this dispatch and requires host `pt` to still hold
+   ! the pre-remap (pretransformed) value it wrote before the dispatch, not
+   ! whatever the kernel's own (thrown-away) remap produced. Omitting PT
+   ! from the D2H mask is the correctness mechanism, not a convenience --
+   ! see fv_mapz.F90's cuda_owns_pt comments.
+   subroutine pt_delz_remap_state_mask_delz_only_d2h(mask)
+      type(fv3_gpu_field_mask), intent(out) :: mask
+      integer, parameter :: ids(8) = &
+           (/ FV3_FID_PE, FV3_FID_PELN, FV3_FID_DELZ, FV3_FID_DELP, &
+              FV3_FID_PK, FV3_FID_PKZ, FV3_FID_AK, FV3_FID_BK /)
+      integer :: k
+      mask%abi_version  = FV3_GPU_ABI_VERSION
+      mask%struct_bytes = int(storage_size(mask)/8, c_int32_t)
+      mask%words = 0_c_int64_t
+      do k = 1, size(ids)
+         mask%words(ids(k)/64 + 1) = ibset(mask%words(ids(k)/64 + 1), mod(ids(k), 64))
+      end do
+   end subroutine pt_delz_remap_state_mask_delz_only_d2h
+
+   ! Narrow combined H2D/D2H mask for fv3_gpu_interface_remap_uv -- exactly
+   ! the 5 fields launch_remap_uv_ctx reads/writes (fv3_remap_uv.cu).
+   subroutine remap_uv_state_mask(mask)
+      type(fv3_gpu_field_mask), intent(out) :: mask
+      integer, parameter :: ids(5) = &
+           (/ FV3_FID_U, FV3_FID_V, FV3_FID_PE, FV3_FID_AK, FV3_FID_BK /)
+      integer :: k
+      mask%abi_version  = FV3_GPU_ABI_VERSION
+      mask%struct_bytes = int(storage_size(mask)/8, c_int32_t)
+      mask%words = 0_c_int64_t
+      do k = 1, size(ids)
+         mask%words(ids(k)/64 + 1) = ibset(mask%words(ids(k)/64 + 1), mod(ids(k), 64))
+      end do
+   end subroutine remap_uv_state_mask
+
+   ! H2D-only mask for fv3_gpu_interface_remap_pressurevars -- the 5 fields
+   ! launch_remap_pressurevars_ctx reads as input (fv3_remap_pressurevars.cu):
+   ! ak/bk (level coefficients), pe (surface pressure at k=npz+1, plus
+   ! boundary pe(1)/pe(npz+1) pass-through), pt/delz (pkz's inputs). None of
+   ! these need their PRE-kernel host value copied back, so they are absent
+   ! from the D2H mask below.
+   subroutine pressurevars_state_mask_h2d(mask)
+      type(fv3_gpu_field_mask), intent(out) :: mask
+      integer, parameter :: ids(5) = &
+           (/ FV3_FID_AK, FV3_FID_BK, FV3_FID_PE, FV3_FID_PT, FV3_FID_DELZ /)
+      integer :: k
+      mask%abi_version  = FV3_GPU_ABI_VERSION
+      mask%struct_bytes = int(storage_size(mask)/8, c_int32_t)
+      mask%words = 0_c_int64_t
+      do k = 1, size(ids)
+         mask%words(ids(k)/64 + 1) = ibset(mask%words(ids(k)/64 + 1), mod(ids(k), 64))
+      end do
+   end subroutine pressurevars_state_mask_h2d
+
+   ! D2H-only mask for fv3_gpu_interface_remap_pressurevars -- the 5 fields
+   ! launch_remap_pressurevars_ctx writes (fv3_remap_pressurevars.cu): pe/
+   ! peln/pk (Pass 1's pe2/pn2/pk2 recompute) and delp/pkz (Pass 2). pt/
+   ! delz/ak/bk are read-only in this kernel and are therefore absent here
+   ! -- copying them back would move bytes the caller never changed.
+   subroutine pressurevars_state_mask_d2h(mask)
+      type(fv3_gpu_field_mask), intent(out) :: mask
+      integer, parameter :: ids(5) = &
+           (/ FV3_FID_PE, FV3_FID_PELN, FV3_FID_PK, FV3_FID_PKZ, FV3_FID_DELP /)
+      integer :: k
+      mask%abi_version  = FV3_GPU_ABI_VERSION
+      mask%struct_bytes = int(storage_size(mask)/8, c_int32_t)
+      mask%words = 0_c_int64_t
+      do k = 1, size(ids)
+         mask%words(ids(k)/64 + 1) = ibset(mask%words(ids(k)/64 + 1), mod(ids(k), 64))
+      end do
+   end subroutine pressurevars_state_mask_d2h
+
+   ! u/v-only mask for the host halo round trip between
+   ! fv3_gpu_interface_state_to_fv_phase_a (D2H, before the caller's
+   ! UNCHANGED mpp_get_boundary call and edge-row scatter) and
+   ! fv3_gpu_interface_state_to_fv_phase_c (H2D, immediately after) --
+   ! see fv3_gpu_state_to_fv_phase_a's ABI header comment
+   ! (fv3_gpu_api.h) for the full contract this mask serves.
+   subroutine state_to_fv_uv_mask(mask)
+      type(fv3_gpu_field_mask), intent(out) :: mask
+      integer, parameter :: ids(2) = (/ FV3_FID_U, FV3_FID_V /)
+      integer :: k
+      mask%abi_version  = FV3_GPU_ABI_VERSION
+      mask%struct_bytes = int(storage_size(mask)/8, c_int32_t)
+      mask%words = 0_c_int64_t
+      do k = 1, size(ids)
+         mask%words(ids(k)/64 + 1) = ibset(mask%words(ids(k)/64 + 1), mod(ids(k), 64))
+      end do
+   end subroutine state_to_fv_uv_mask
+
    subroutine build_rank_of_tile(comm, comm_rank, tile, rank_of_tile)
       integer,            intent(in)  :: comm, comm_rank, tile
       integer(c_int32_t), intent(out) :: rank_of_tile(6)
@@ -810,5 +1461,42 @@ contains
               'disagrees with this rank''s own tile')
       endif
    end subroutine build_rank_of_tile
+
+   ! Derive this rank's position among the ranks that share its physical node
+   ! (memory domain), independent of its position in the global/model
+   ! communicator. Used solely to pick a node-local GPU index -- it does not
+   ! change tile ownership, halo topology, or any MPI communication path.
+   ! On a single-node run local_rank == the rank's index in comm, so callers
+   ! that previously used comm_rank directly for device selection see no
+   ! change in behavior.
+   subroutine fv3_gpu_node_local_rank(comm, local_rank, local_size, ierr)
+      integer, intent(in)  :: comm
+      integer, intent(out) :: local_rank, local_size, ierr
+      integer :: local_comm, split_ierr, rank_ierr, size_ierr, free_ierr
+
+      local_rank = -1
+      local_size = -1
+      ierr = 0
+
+      call MPI_Comm_split_type(comm, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &
+           local_comm, split_ierr)
+      if (split_ierr /= MPI_SUCCESS) then
+         ierr = split_ierr
+         return
+      endif
+
+      call MPI_Comm_rank(local_comm, local_rank, rank_ierr)
+      call MPI_Comm_size(local_comm, local_size, size_ierr)
+      call MPI_Comm_free(local_comm, free_ierr)
+
+      if (rank_ierr /= MPI_SUCCESS .or. size_ierr /= MPI_SUCCESS) then
+         ierr = merge(rank_ierr, size_ierr, rank_ierr /= MPI_SUCCESS)
+         return
+      endif
+      if (free_ierr /= MPI_SUCCESS) then
+         ierr = free_ierr
+         return
+      endif
+   end subroutine fv3_gpu_node_local_rank
 
 end module fv3_gpu_dyncore_bridge

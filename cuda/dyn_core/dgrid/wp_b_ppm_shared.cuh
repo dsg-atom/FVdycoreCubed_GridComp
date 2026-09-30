@@ -31,6 +31,41 @@ __device__ __forceinline__ fv_real ppm_c3() { return fv_real(5.0 / 14.0); }
 // nh_utils.F90:280 damping threshold.
 __device__ __forceinline__ fv_real damp_threshold() { return fv_real(1.0e-5); }
 
+// --- hord==8 PPM constants (tp_core.F90:62,84) ---------------------------
+// Separate named constants from ppm_c1/c2/c3 above even though s11 happens
+// to equal c2 (11/14): the Fortran keeps r3/s11/s14/s15 as distinct module
+// parameters used only by the iord>=7 dm/al slope and panel-edge bl/br
+// construction (tp_core.F90:566-581, 640-678), an unrelated formula from the
+// mord<7 one-sided al reconstruction that c1/c2/c3 serve.
+__device__ __forceinline__ fv_real hord8_r3() { return fv_real(1.0 / 3.0); }
+__device__ __forceinline__ fv_real hord8_s11() { return fv_real(11.0 / 14.0); }
+__device__ __forceinline__ fv_real hord8_s14() { return fv_real(4.0 / 7.0); }
+__device__ __forceinline__ fv_real hord8_s15() { return fv_real(3.0 / 14.0); }
+
+// pert_ppm(iv=1) (tp_core.F90:1201-1260, the iv/=0 "else" branch at
+// :1238-1252 -- the iv=0 positive-definite branch is out of scope, only
+// iv=1 is reachable from the hord==8 path). The Fortran loop body has no
+// cross-i coupling for iv=1: every branch reads/writes only al(i)/ar(i), so
+// applying it to one (al, ar) pair at a time is exact, not an approximation
+// of the Fortran's single pert_ppm(im, ...) call over a multi-cell im.
+__device__ __forceinline__ void pert_ppm_iv1(fv_real &al, fv_real &ar) {
+  if (al * ar < fv_real(0)) {
+    const fv_real da1 = al - ar;
+    const fv_real da2 = da1 * da1;
+    const fv_real a6da = fv_real(3) * (al + ar) * da1;
+    // abs(a6da) > da2 --> 3.*abs(al+ar) > abs(al-ar)
+    if (a6da < -da2) {
+      ar = fv_real(-2) * al;
+    } else if (a6da > da2) {
+      al = fv_real(-2) * ar;
+    }
+  } else {
+    // effect of dm=0 included here
+    al = fv_real(0);
+    ar = fv_real(0);
+  }
+}
+
 struct Launch2D {
   dim3 block, grid;
 };

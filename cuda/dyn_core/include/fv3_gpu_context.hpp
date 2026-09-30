@@ -121,6 +121,68 @@ struct ContextData {
    * runtime/fv3_gpu_heat_accumulator.hpp for the full contract. */
   fv_real *heat_accum = nullptr;
   uint64_t heat_accum_bytes = 0;
+  /* Prompt 85. The persistent device buffer for REMAP_Q's tracer array q
+   * (mapn_tracer, nq=1). q has no FieldRegistry identity (see
+   * vertical/fv3_remap_q.cuh's header comment), so it cannot ride the
+   * ordinary field-registry residency path pt/delz/u/v use; this is its own
+   * dedicated, grow-only, context-owned allocation instead -- same
+   * persistent-residency rule as heat_accum above, and for the same reason:
+   * a per-call cudaMalloc would defeat the whole point of a "one contiguous
+   * H2D + one contiguous D2H per call" transfer design (Stage 3/4). Sized to
+   * the full isd:ied x jsd:jed x km memory domain (fv3::gpu::vertical::
+   * remap_q_buffer_elements), grown (never shrunk) by fv3_gpu_remap_q
+   * (fv3_gpu_runtime.cpp) on first use and on any later call whose domain is
+   * larger than the current allocation -- freed at finalize alongside
+   * heat_accum/halo_send/halo_recv. */
+  fv_real *remap_q_buffer = nullptr;
+  uint64_t remap_q_buffer_bytes = 0;
+  /* Prompt 92. The persistent device buffers for REMAP_PRESSUREVARS's
+   * q(sphum) (read-only input) and cappa (written for is:ie x js:je,
+   * round-tripped H2D+D2H so halo bytes outside that range pass through
+   * unchanged) -- same rationale/lifecycle as remap_q_buffer above: neither
+   * field can ride the ordinary FieldRegistry residency path here (see
+   * vertical/fv3_remap_pressurevars.cuh's header comment), so each gets its
+   * own dedicated, grow-only, context-owned allocation instead. Sized to
+   * the full isd:ied x jsd:jed x km memory domain, grown (never shrunk) by
+   * fv3_gpu_remap_pressurevars (fv3_gpu_runtime.cpp) on first use and on
+   * any later call whose domain is larger than the current allocation --
+   * freed at finalize alongside remap_q_buffer/heat_accum/halo_send/
+   * halo_recv. */
+  fv_real *remap_pressurevars_qsphum_buffer = nullptr;
+  uint64_t remap_pressurevars_qsphum_buffer_bytes = 0;
+  fv_real *remap_pressurevars_cappa_buffer = nullptr;
+  uint64_t remap_pressurevars_cappa_buffer_bytes = 0;
+  /* Prompt 99. Persistent device buffers for FV_StateMod.F90's
+   * State_To_FV: the STATE%VARS%U/V/W/PT/PKZ/PE/DZ inputs (no
+   * FieldRegistry identity -- MAPL State fields, not FV_Atm fields; see
+   * vertical/fv3_state_to_fv.cuh's header comment) and the ps output
+   * (also no FieldRegistry identity, and unlike the inputs, no
+   * downstream device consumer). Same rationale/lifecycle as
+   * remap_q_buffer/remap_pressurevars_*_buffer above: each is its own
+   * dedicated, grow-only, context-owned allocation. Sized to the plain
+   * interior compute domain is:ie x js:je x (km or km+1) -- STATE%VARS%*
+   * arrays carry no halo at all, unlike remap_q/remap_pressurevars's
+   * isd:ied x jsd:jed sizing -- grown (never shrunk) by
+   * fv3_gpu_state_to_fv_phase_a/_phase_c (fv3_gpu_runtime.cpp) on first
+   * use and on any later call whose domain is larger than the current
+   * allocation -- freed at finalize alongside remap_pressurevars_*_
+   * buffer/remap_q_buffer/heat_accum/halo_send/halo_recv. */
+  fv_real *state_to_fv_u_buffer = nullptr;
+  uint64_t state_to_fv_u_buffer_bytes = 0;
+  fv_real *state_to_fv_v_buffer = nullptr;
+  uint64_t state_to_fv_v_buffer_bytes = 0;
+  fv_real *state_to_fv_w_buffer = nullptr;
+  uint64_t state_to_fv_w_buffer_bytes = 0;
+  fv_real *state_to_fv_pe_buffer = nullptr;
+  uint64_t state_to_fv_pe_buffer_bytes = 0;
+  fv_real *state_to_fv_pt_buffer = nullptr;
+  uint64_t state_to_fv_pt_buffer_bytes = 0;
+  fv_real *state_to_fv_pkz_buffer = nullptr;
+  uint64_t state_to_fv_pkz_buffer_bytes = 0;
+  fv_real *state_to_fv_dz_buffer = nullptr;
+  uint64_t state_to_fv_dz_buffer_bytes = 0;
+  fv_real *state_to_fv_ps_buffer = nullptr;
+  uint64_t state_to_fv_ps_buffer_bytes = 0;
   uint64_t next_event = 1;
   uint64_t last_event = 0;
   ContextPhase phase = ContextPhase::created;

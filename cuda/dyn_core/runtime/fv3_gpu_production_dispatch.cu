@@ -3,6 +3,10 @@
 #include "../cgrid/fv3_cgrid.hpp"
 #include "../vertical/fv3_vertical_kernels.cuh"
 #include "../vertical/fv3_pt_delz_remap.cuh"
+#include "../vertical/fv3_remap_uv.cuh"
+#include "../vertical/fv3_remap_q.cuh"
+#include "../vertical/fv3_remap_pressurevars.cuh"
+#include "../vertical/fv3_state_to_fv.cuh"
 #include "../operators/wp_d_contract_cuda.hpp"
 #include "../operators/wp_d_contract.hpp"
 #include "../dgrid/wp_b_contract_cuda.hpp"
@@ -210,6 +214,22 @@ int fv3_build_production_dispatch(NumericalDispatch &out, fv3_gpu_error *e) noex
   // translation unit's fv3_wp_c_vertical link becoming a reverse dependency
   // of fv3_dyn_core_gpu.
   d.pt_delz_remap = &fv3::gpu::vertical::launch_pt_delz_remap_ctx;
+  // Prompt 71: fv_mapz_mod production u/v remap. Same link-cycle rationale
+  // as pt_delz_remap immediately above.
+  d.remap_uv = &fv3::gpu::vertical::launch_remap_uv_ctx;
+  // Prompt 85: fv_mapz_mod production tracer remap (REMAP_Q, mapn_tracer
+  // nq=1). Same link-cycle rationale as pt_delz_remap/remap_uv immediately
+  // above.
+  d.remap_q = &fv3::gpu::vertical::launch_remap_q_ctx;
+  // Prompt 92: fv_mapz_mod production pressure-variable remap
+  // (REMAP_PRESSUREVARS). Same link-cycle rationale as pt_delz_remap/
+  // remap_uv/remap_q immediately above.
+  d.remap_pressurevars = &fv3::gpu::vertical::launch_remap_pressurevars_ctx;
+  // Prompt 99: FV_StateMod.F90 production State_To_FV, Phase A/C halves.
+  // Same link-cycle rationale as pt_delz_remap/remap_uv/remap_q/
+  // remap_pressurevars immediately above.
+  d.state_to_fv_phase_a = &fv3::gpu::vertical::launch_state_to_fv_phase_a_ctx;
+  d.state_to_fv_phase_c = &fv3::gpu::vertical::launch_state_to_fv_phase_c_ctx;
   out = d;
   return FV3_GPU_SUCCESS;
 }

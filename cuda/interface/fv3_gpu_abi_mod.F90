@@ -190,6 +190,21 @@ module fv3_gpu_abi_mod
       integer(c_int8_t)  :: fuse_halo_edges
    end type fv3_gpu_numerical_config
 
+   ! Prompt 77: bounds/topology for fv3_gpu_fv_tp_2d_hord8, member-for-member
+   ! image of fv3_gpu_tracer_transport_bounds (fv3_gpu_api.h:197-208).
+   type, bind(C), public :: fv3_gpu_tracer_transport_bounds
+      integer(c_int32_t) :: abi_version
+      integer(c_int32_t) :: struct_bytes
+      integer(c_int64_t) :: is, ie, js, je
+      integer(c_int64_t) :: isd, ied, jsd, jed
+      integer(c_int64_t) :: npx, npy
+      integer(c_int32_t) :: hord
+      integer(c_int32_t) :: cubed_sphere
+      integer(c_int32_t) :: nested
+      integer(c_int32_t) :: west_edge, east_edge, south_edge, north_edge
+      integer(c_int32_t) :: sw_corner, se_corner, ne_corner, nw_corner
+   end type fv3_gpu_tracer_transport_bounds
+
    ! ---- field identifiers -----------------------------------------------------
    !
    ! Identity map over fv3::gpu::FieldId (fv3_gpu_internal.hpp:23-59), in the
@@ -320,6 +335,12 @@ module fv3_gpu_abi_mod
    public :: fv3_gpu_dyn_core_step
    public :: fv3_gpu_sync_to_host
    public :: fv3_gpu_pt_delz_remap
+   public :: fv3_gpu_remap_uv
+   public :: fv3_gpu_remap_q
+   public :: fv3_gpu_remap_pressurevars
+   public :: fv3_gpu_state_to_fv_phase_a
+   public :: fv3_gpu_state_to_fv_phase_c
+   public :: fv3_gpu_fv_tp_2d_hord8
    public :: fv3_gpu_event_wait
    public :: fv3_gpu_get_capabilities
    public :: fv3_gpu_set_cuda_graph_mode
@@ -420,6 +441,197 @@ module fv3_gpu_abi_mod
          integer(c_int64_t), intent(out)    :: ev
          type(fv3_gpu_error), intent(inout) :: err
       end function fv3_gpu_pt_delz_remap
+
+      ! Prompt 71: fv_mapz_mod's production u/v vertical remap (REMAP_UV).
+      ! Same shape as fv3_gpu_pt_delz_remap above; runs once per dyn_core
+      ! call at fv_mapz.F90's Lagrangian_to_Eulerian call site (timer
+      ! 'Remap_UV'), AFTER fv3_gpu_pt_delz_remap in the same call. `ev` is
+      ! the kernel-completion event; the caller must still
+      ! fv3_gpu_sync_to_host (mask covering u, v, pe, ak, bk) and wait on
+      ! THAT event.
+      integer(c_int) function fv3_gpu_remap_uv(ctx, dependency, ev, err) &
+                              bind(C, name="fv3_gpu_remap_uv")
+         import :: c_int, c_int64_t, c_ptr, fv3_gpu_error
+         type(c_ptr), value                 :: ctx
+         integer(c_int64_t), value          :: dependency
+         integer(c_int64_t), intent(out)    :: ev
+         type(fv3_gpu_error), intent(inout) :: err
+      end function fv3_gpu_remap_uv
+
+      ! Prompt 85/86B/87: fv_mapz_mod's production tracer vertical remap
+      ! (REMAP_Q, mapn_tracer nq=2: sphum kord=9, cld_amt kord=9 --
+      ! corrected by Prompt 87 from the originally assumed kord=[8,9];
+      ! FV_StateMod.F90:563 unconditionally forces flagstruct%kord_tr=9 in
+      ! every GEOS-integrated runtime). Runs once per dyn_core call at
+      ! fv_mapz.F90's Lagrangian_to_Eulerian call site (timer 'Remap_Q'),
+      ! AFTER fv3_gpu_pt_delz_remap in the same call.
+      ! Unlike fv3_gpu_pt_delz_remap/fv3_gpu_remap_uv, q has no FieldRegistry
+      ! identity -- this call, not a separate fv3_gpu_sync_from_host/
+      ! fv3_gpu_sync_to_host pair, owns the one H2D (before both kernels) and
+      ! one D2H (after both) that move the FULL nq-tracer block. `q` is
+      ! assumed-size c_double, matching fv3_gpu_remap_q's plain double*
+      ! signature exactly -- the caller is responsible for supplying true
+      ! 8-byte doubles (R8-only; do not call from an R4 build). `q_elements`
+      ! must equal (ied-isd+1)*(jed-jsd+1)*npz*nq for this context's current
+      ! bounds. `nq`/`kord1`/`kord2` must be exactly 2/9/9 -- the only
+      ! validated production schedule -- or the call fails closed. `ev` is
+      ! the kernel-completion event; the caller must fv3_gpu_event_wait on
+      ! it before reading `q` again.
+      ! Prompt 88B: `fill` is flagstruct%fill as a plain 0/1 integer (not
+      ! logical, matching this ABI's existing int-flag convention) --
+      ! FV_StateMod.F90:568 unconditionally forces this to .true. in every
+      ! GEOS-integrated runtime (confirmed universal, see
+      ! docs/performance/p88a_remap_q_fill_semantics_2026-09-25.md). Applied
+      ! identically to both tracers. Both 0 and 1 are valid/accepted.
+      integer(c_int) function fv3_gpu_remap_q(ctx, dependency, q, q_elements, &
+                                              nq, kord1, kord2, fill, ev, err) &
+                              bind(C, name="fv3_gpu_remap_q")
+         import :: c_int, c_int32_t, c_int64_t, c_ptr, c_double, fv3_gpu_error
+         type(c_ptr), value                 :: ctx
+         integer(c_int64_t), value          :: dependency
+         real(c_double), intent(inout)      :: q(*)
+         integer(c_int64_t), value          :: q_elements
+         integer(c_int32_t), value          :: nq, kord1, kord2, fill
+         integer(c_int64_t), intent(out)    :: ev
+         type(fv3_gpu_error), intent(inout) :: err
+      end function fv3_gpu_remap_q
+
+      ! Prompt 92: fv_mapz_mod's production pressure-variable vertical remap
+      ! (REMAP_PRESSUREVARS: pe2/pn2/pk2 recompute + delp/cappa/pkz).  Runs
+      ! once per dyn_core call at fv_mapz.F90's Lagrangian_to_Eulerian call
+      ! site (timer 'Remap_PressureVars'), AFTER fv3_gpu_pt_delz_remap (and,
+      ! when both are dispatched, after fv3_gpu_remap_uv/fv3_gpu_remap_q) in
+      ! the same call -- this entry reads pe only after PT/DELZ's own
+      ! closing update has finished it (see fv3_remap_pressurevars.cu's
+      ! header comment).
+      ! Like fv3_gpu_remap_q, q(sphum) and cappa have no FieldRegistry
+      ! identity here -- this call, not a separate fv3_gpu_sync_from_host/
+      ! fv3_gpu_sync_to_host pair, owns their transfers directly: ONE H2D
+      ! each for q_sphum (read-only input) and cappa (round-tripped so halo
+      ! bytes this kernel never touches pass through unchanged), then ONE
+      ! D2H for cappa only after the kernel. pe/peln/pk/delp/pkz/pt/delz/ak/
+      ! bk remain ordinary FieldRegistry fields -- the caller still owns
+      ! their own fv3_gpu_sync_from_host/fv3_gpu_sync_to_host pair (mask
+      ! covering ak, bk, pe, pt, delz for H2D; pe, peln, pk, pkz, delp for
+      ! D2H) around this call, exactly as fv3_gpu_pt_delz_remap/
+      ! fv3_gpu_remap_uv already do.
+      ! `q_sphum`/`cappa` are assumed-size c_double (R8-only; do not call
+      ! from an R4 build), each sized `elements` == (ied-isd+1)*(jed-jsd+1)*
+      ! npz for this context's current bounds -- the call fails closed
+      ! (FV3_GPU_INVALID_ARGUMENT) on any mismatch. `ev` is the kernel-
+      ! completion event; the caller must fv3_gpu_event_wait on it before
+      ! reading `cappa` again (q_sphum is never written back).
+      integer(c_int) function fv3_gpu_remap_pressurevars(ctx, dependency, &
+                                              q_sphum, cappa, elements, ev, err) &
+                              bind(C, name="fv3_gpu_remap_pressurevars")
+         import :: c_int, c_int64_t, c_ptr, c_double, fv3_gpu_error
+         type(c_ptr), value                 :: ctx
+         integer(c_int64_t), value          :: dependency
+         real(c_double), intent(in)         :: q_sphum(*)
+         real(c_double), intent(inout)      :: cappa(*)
+         integer(c_int64_t), value          :: elements
+         integer(c_int64_t), intent(out)    :: ev
+         type(fv3_gpu_error), intent(inout) :: err
+      end function fv3_gpu_remap_pressurevars
+
+      ! Prompt 99: FV_StateMod.F90's production State_To_FV, Phase A half
+      ! (u/v tiny_number full-buffer fill + isc:iec,jsc:jec interior copy
+      ! from STATE%VARS%U/V, BEFORE the source's one mpp_get_boundary
+      ! call). Runs once per k_split sub-iteration, immediately before
+      ! fv_dynamics() -- NOT part of fv3_gpu_dyn_core_step.
+      !
+      ! `state_u`/`state_v` have no FieldRegistry identity (MAPL State
+      ! fields) -- this call owns their own ONE-contiguous-H2D-each
+      ! transfer, same convention as fv3_gpu_remap_q's `q`. Each must be
+      ! sized `elements` == (ie-is+1)*(je-js+1)*npz for this context's
+      ! current bounds, laid out as Fortran's own STATE%VARS%U/V(isc:iec,
+      ! jsc:jec,km) (i fastest, then j, then k -- NO halo). The call fails
+      ! closed (FV3_GPU_INVALID_ARGUMENT) on any mismatch.
+      !
+      ! This entry does NOT perform mpp_get_boundary or the nbuffer/
+      ! ebuffer edge-row scatter -- the caller
+      ! (fv3_gpu_interface_state_to_fv_phase_a, fv3_gpu_dyncore_bridge.F90)
+      ! is responsible for following this call with fv3_gpu_event_wait,
+      ! then fv3_gpu_sync_to_host (u/v-only mask) to bring u/v to the host
+      ! for the UNCHANGED Fortran mpp_get_boundary call and edge scatter,
+      ! then fv3_gpu_sync_from_host (same mask) before calling
+      ! fv3_gpu_state_to_fv_phase_c. R8-only; do not call from an R4 build.
+      integer(c_int) function fv3_gpu_state_to_fv_phase_a(ctx, dependency, &
+                                              state_u, state_v, elements, ev, err) &
+                              bind(C, name="fv3_gpu_state_to_fv_phase_a")
+         import :: c_int, c_int64_t, c_ptr, c_double, fv3_gpu_error
+         type(c_ptr), value                 :: ctx
+         integer(c_int64_t), value          :: dependency
+         real(c_double), intent(in)         :: state_u(*), state_v(*)
+         integer(c_int64_t), value          :: elements
+         integer(c_int64_t), intent(out)    :: ev
+         type(fv3_gpu_error), intent(inout) :: err
+      end function fv3_gpu_state_to_fv_phase_a
+
+      ! Prompt 99: FV_StateMod.F90's production State_To_FV, Phase C half
+      ! (w interior copy [hydrostatic=false required], pe tiny_number
+      ! fill + full pe transpose/peln/pk recompute over all km+1 levels,
+      ! ps pack, delp tiny_number fill + recompute, pt tiny_number fill +
+      ! recompute, delz/pkz interior copies -- AFTER mpp_get_boundary).
+      ! Runs immediately after the caller's post-mpp_get_boundary
+      ! fv3_gpu_sync_from_host (u/v-only mask) described at
+      ! fv3_gpu_state_to_fv_phase_a above, still before fv_dynamics().
+      !
+      ! `state_w`/`state_pe`/`state_pt`/`state_pkz`/`state_dz` have no
+      ! FieldRegistry identity -- this call owns their own ONE-
+      ! contiguous-H2D-each transfer. state_w/state_pt/state_pkz/state_dz
+      ! are sized `elements` == (ie-is+1)*(je-js+1)*npz; state_pe is sized
+      ! `elements_pe` == (ie-is+1)*(je-js+1)*(npz+1) (one extra level),
+      ! all laid out as Fortran's own STATE%VARS%*(isc:iec,jsc:jec,km[+1])
+      ! (i fastest, then j, then k -- no halo). The call fails closed
+      ! (FV3_GPU_INVALID_ARGUMENT) on any mismatch.
+      !
+      ! `ps` also has no FieldRegistry identity and no downstream device
+      ! consumer -- this call packs it into its own persistent scratch
+      ! buffer and D2H's it directly, ONE contiguous transfer, sized
+      ! implicitly to (ie-is+1)*(je-js+1) host doubles (i fastest, then
+      ! j) -- no separate element-count argument for `ps`. `ev` is the
+      ! kernel-completion event; the caller must fv3_gpu_event_wait on it
+      ! before reading `ps` again. R8-only; do not call from an R4 build.
+      integer(c_int) function fv3_gpu_state_to_fv_phase_c(ctx, dependency, &
+                                              state_w, state_pe, state_pt, state_pkz, &
+                                              state_dz, ps, elements, elements_pe, ev, err) &
+                              bind(C, name="fv3_gpu_state_to_fv_phase_c")
+         import :: c_int, c_int64_t, c_ptr, c_double, fv3_gpu_error
+         type(c_ptr), value                 :: ctx
+         integer(c_int64_t), value          :: dependency
+         real(c_double), intent(in)         :: state_w(*), state_pe(*), state_pt(*), &
+                                                state_pkz(*), state_dz(*)
+         real(c_double), intent(out)        :: ps(*)
+         integer(c_int64_t), value          :: elements, elements_pe
+         integer(c_int64_t), intent(out)    :: ev
+         type(fv3_gpu_error), intent(inout) :: err
+      end function fv3_gpu_state_to_fv_phase_c
+
+      ! Prompt 77: single (k, iq) tracer-transport slice, reusing the
+      ! validated fv3::gpu::dgrid::launch_fv_tp_2d_cuda kernel (hord==6/8).
+      ! Context-free and FieldRegistry-free -- no ctx argument, no
+      ! fv3_gpu_create/finalize interaction. q is intent(inout) (copy_corners
+      ! mutates ghost/corner cells in place, matching fv_tp_2d itself);
+      ! fx_out/fy_out are intent(out). Every array is assumed-size c_double,
+      ! matching fv_tp_2d_hord8.h's plain double* signature exactly -- the
+      ! caller is responsible for supplying true 8-byte doubles regardless of
+      ! the Fortran build's own real kind (see fv3_gpu_interface_fv_tp_2d_hord8
+      ! in fv3_gpu_dyncore_bridge.F90, which performs that conversion).
+      integer(c_int) function fv3_gpu_fv_tp_2d_hord8(b, q, crx, cry, xfx, yfx, &
+                                                     mfx, mfy, ra_x, ra_y, &
+                                                     area, dxa, dya, fx_out, &
+                                                     fy_out, err) &
+                              bind(C, name="fv3_gpu_fv_tp_2d_hord8")
+         import :: c_int, c_double, fv3_gpu_tracer_transport_bounds, fv3_gpu_error
+         type(fv3_gpu_tracer_transport_bounds), intent(in) :: b
+         real(c_double), intent(inout) :: q(*)
+         real(c_double), intent(in)    :: crx(*), cry(*), xfx(*), yfx(*)
+         real(c_double), intent(in)    :: mfx(*), mfy(*), ra_x(*), ra_y(*)
+         real(c_double), intent(in)    :: area(*), dxa(*), dya(*)
+         real(c_double), intent(out)   :: fx_out(*), fy_out(*)
+         type(fv3_gpu_error), intent(inout) :: err
+      end function fv3_gpu_fv_tp_2d_hord8
 
       integer(c_int) function fv3_gpu_event_wait(ctx, ev, err) &
                               bind(C, name="fv3_gpu_event_wait")

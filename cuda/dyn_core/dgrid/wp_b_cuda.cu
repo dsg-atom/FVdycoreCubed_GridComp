@@ -282,6 +282,254 @@ __device__ __forceinline__ fv_real yppm_face_flux(View3<const fv_real> q,
   return (smt5_m1 || smt5_0) ? donor + fx1 : donor;
 }
 
+// --- hord==8 x/y face flux (tp_core.F90:567-581, 640-678, 697-705) -------
+// iord>=7, iord==8 sub-branch ("Lin's PPM fast monotone constraint"). Kept
+// fully separate from al_x_at/al_y_at/xppm_face_flux/yppm_face_flux above --
+// no hord==6 code is touched. dm has no panel-edge special case (tp_core.F90
+// :566-570/977-982); al's interior formula (:573-574/985-987) is likewise
+// unconditional -- only bl/br get a one-sided replacement at the three
+// boundary-adjacent cells nearest a real panel edge.
+struct BlBr8 {
+  fv_real bl, br;
+};
+
+__device__ __forceinline__ fv_real dm8_x_at(View3<const fv_real> q, int64_t i, int64_t j,
+                                            int64_t k) {
+  const fv_real qm = q(i - 1, j, k), q0 = q(i, j, k), qp = q(i + 1, j, k);
+  const fv_real xt = fv_real(0.25) * (qp - qm);
+  const fv_real lo = fmin(fmin(qm, q0), qp);
+  const fv_real hi = fmax(fmax(qm, q0), qp);
+  const fv_real mag = fmin(fabs(xt), fmin(hi - q0, q0 - lo));
+  return copysign(mag, xt);
+}
+
+__device__ __forceinline__ fv_real dm8_y_at(View3<const fv_real> q, int64_t i, int64_t j,
+                                            int64_t k) {
+  const fv_real qm = q(i, j - 1, k), q0 = q(i, j, k), qp = q(i, j + 1, k);
+  const fv_real xt = fv_real(0.25) * (qp - qm);
+  const fv_real lo = fmin(fmin(qm, q0), qp);
+  const fv_real hi = fmax(fmax(qm, q0), qp);
+  const fv_real mag = fmin(fabs(xt), fmin(hi - q0, q0 - lo));
+  return copysign(mag, xt);
+}
+
+// al(i) = 0.5*(q1(i-1)+q1(i)) + r3*(dm(i-1)-dm(i)), tp_core.F90:573-574 /
+// 985-987 -- unconditional, no panel-edge branch (verified: the boundary
+// block below never overwrites an al() value, it only reuses al(3) /
+// al(npx-2) computed by this same formula).
+__device__ __forceinline__ fv_real al8_x_at(View3<const fv_real> q, int64_t i, int64_t j,
+                                            int64_t k) {
+  return fv_real(0.5) * (q(i - 1, j, k) + q(i, j, k)) +
+         hord8_r3() * (dm8_x_at(q, i - 1, j, k) - dm8_x_at(q, i, j, k));
+}
+
+__device__ __forceinline__ fv_real al8_y_at(View3<const fv_real> q, int64_t i, int64_t j,
+                                            int64_t k) {
+  return fv_real(0.5) * (q(i, j - 1, k) + q(i, j, k)) +
+         hord8_r3() * (dm8_y_at(q, i, j - 1, k) - dm8_y_at(q, i, j, k));
+}
+
+__device__ __forceinline__ BlBr8 bl_br8_x_at(View3<const fv_real> q,
+                                             View2<const fv_real> dxa, int64_t i, int64_t j,
+                                             int64_t k, const TransportBounds &b) {
+  const int64_t npx = b.npx;
+  const bool seam = b.cubed_sphere && !b.nested;
+  BlBr8 r;
+  if (seam && b.west_edge && i >= 0 && i <= 2) {
+    // tp_core.F90:641-652.
+    const fv_real xt_a_raw =
+        fv_real(0.5) *
+        (((fv_real(2) * dxa(0, j) + dxa(-1, j)) * q(0, j, k) - dxa(0, j) * q(-1, j, k)) /
+             (dxa(-1, j) + dxa(0, j)) +
+         ((fv_real(2) * dxa(1, j) + dxa(2, j)) * q(1, j, k) - dxa(1, j) * q(2, j, k)) /
+             (dxa(1, j) + dxa(2, j)));
+    const fv_real lo4 =
+        fmin(fmin(q(-1, j, k), q(0, j, k)), fmin(q(1, j, k), q(2, j, k)));
+    const fv_real hi4 =
+        fmax(fmax(q(-1, j, k), q(0, j, k)), fmax(q(1, j, k), q(2, j, k)));
+    fv_real xt_a = fmax(xt_a_raw, lo4);
+    xt_a = fmin(xt_a, hi4);
+    const fv_real xt_b = hord8_s15() * q(1, j, k) + hord8_s11() * q(2, j, k) -
+                         hord8_s14() * dm8_x_at(q, 2, j, k);
+    if (i == 0) {
+      fv_real bl0 = hord8_s14() * dm8_x_at(q, -1, j, k) +
+                    hord8_s11() * (q(-1, j, k) - q(0, j, k));
+      fv_real br0 = xt_a - q(0, j, k);
+      pert_ppm_iv1(bl0, br0);
+      r.bl = bl0; r.br = br0;
+    } else if (i == 1) {
+      fv_real bl1 = xt_a - q(1, j, k);
+      fv_real br1 = xt_b - q(1, j, k);
+      pert_ppm_iv1(bl1, br1);
+      r.bl = bl1; r.br = br1;
+    } else {
+      fv_real bl2 = xt_b - q(2, j, k);
+      fv_real br2 = al8_x_at(q, 3, j, k) - q(2, j, k);
+      pert_ppm_iv1(bl2, br2);
+      r.bl = bl2; r.br = br2;
+    }
+    return r;
+  }
+  if (seam && b.east_edge && i >= npx - 2 && i <= npx) {
+    // tp_core.F90:657-668.
+    const fv_real xt_a = hord8_s15() * q(npx - 1, j, k) + hord8_s11() * q(npx - 2, j, k) +
+                         hord8_s14() * dm8_x_at(q, npx - 2, j, k);
+    const fv_real lo4 = fmin(fmin(q(npx - 2, j, k), q(npx - 1, j, k)),
+                             fmin(q(npx, j, k), q(npx + 1, j, k)));
+    const fv_real hi4 = fmax(fmax(q(npx - 2, j, k), q(npx - 1, j, k)),
+                             fmax(q(npx, j, k), q(npx + 1, j, k)));
+    const fv_real xt_b_raw =
+        fv_real(0.5) *
+        (((fv_real(2) * dxa(npx - 1, j) + dxa(npx - 2, j)) * q(npx - 1, j, k) -
+          dxa(npx - 1, j) * q(npx - 2, j, k)) /
+             (dxa(npx - 2, j) + dxa(npx - 1, j)) +
+         ((fv_real(2) * dxa(npx, j) + dxa(npx + 1, j)) * q(npx, j, k) -
+          dxa(npx, j) * q(npx + 1, j, k)) /
+             (dxa(npx, j) + dxa(npx + 1, j)));
+    fv_real xt_b = fmax(xt_b_raw, lo4);
+    xt_b = fmin(xt_b, hi4);
+    if (i == npx - 2) {
+      fv_real bl = al8_x_at(q, npx - 2, j, k) - q(npx - 2, j, k);
+      fv_real br = xt_a - q(npx - 2, j, k);
+      pert_ppm_iv1(bl, br);
+      r.bl = bl; r.br = br;
+    } else if (i == npx - 1) {
+      fv_real bl = xt_a - q(npx - 1, j, k);
+      fv_real br = xt_b - q(npx - 1, j, k);
+      pert_ppm_iv1(bl, br);
+      r.bl = bl; r.br = br;
+    } else {
+      fv_real bl = xt_b - q(npx, j, k);
+      fv_real br = hord8_s11() * (q(npx + 1, j, k) - q(npx, j, k)) -
+                   hord8_s14() * dm8_x_at(q, npx + 1, j, k);
+      pert_ppm_iv1(bl, br);
+      r.bl = bl; r.br = br;
+    }
+    return r;
+  }
+  // Interior formula, tp_core.F90:576-581.
+  const fv_real dmi = dm8_x_at(q, i, j, k);
+  const fv_real ali = al8_x_at(q, i, j, k);
+  const fv_real alip1 = al8_x_at(q, i + 1, j, k);
+  const fv_real xt = fv_real(2) * dmi;
+  r.bl = -copysign(fmin(fabs(xt), fabs(ali - q(i, j, k))), xt);
+  r.br = copysign(fmin(fabs(xt), fabs(alip1 - q(i, j, k))), xt);
+  return r;
+}
+
+__device__ __forceinline__ BlBr8 bl_br8_y_at(View3<const fv_real> q,
+                                             View2<const fv_real> dya, int64_t i, int64_t j,
+                                             int64_t k, const TransportBounds &b) {
+  const int64_t npy = b.npy;
+  const bool seam = b.cubed_sphere && !b.nested;
+  BlBr8 r;
+  if (seam && b.south_edge && j >= 0 && j <= 2) {
+    const fv_real xt_a_raw =
+        fv_real(0.5) *
+        (((fv_real(2) * dya(i, 0) + dya(i, -1)) * q(i, 0, k) - dya(i, 0) * q(i, -1, k)) /
+             (dya(i, -1) + dya(i, 0)) +
+         ((fv_real(2) * dya(i, 1) + dya(i, 2)) * q(i, 1, k) - dya(i, 1) * q(i, 2, k)) /
+             (dya(i, 1) + dya(i, 2)));
+    const fv_real lo4 =
+        fmin(fmin(q(i, -1, k), q(i, 0, k)), fmin(q(i, 1, k), q(i, 2, k)));
+    const fv_real hi4 =
+        fmax(fmax(q(i, -1, k), q(i, 0, k)), fmax(q(i, 1, k), q(i, 2, k)));
+    fv_real xt_a = fmax(xt_a_raw, lo4);
+    xt_a = fmin(xt_a, hi4);
+    const fv_real xt_b = hord8_s15() * q(i, 1, k) + hord8_s11() * q(i, 2, k) -
+                         hord8_s14() * dm8_y_at(q, i, 2, k);
+    if (j == 0) {
+      fv_real bl0 = hord8_s14() * dm8_y_at(q, i, -1, k) +
+                    hord8_s11() * (q(i, -1, k) - q(i, 0, k));
+      fv_real br0 = xt_a - q(i, 0, k);
+      pert_ppm_iv1(bl0, br0);
+      r.bl = bl0; r.br = br0;
+    } else if (j == 1) {
+      fv_real bl1 = xt_a - q(i, 1, k);
+      fv_real br1 = xt_b - q(i, 1, k);
+      pert_ppm_iv1(bl1, br1);
+      r.bl = bl1; r.br = br1;
+    } else {
+      fv_real bl2 = xt_b - q(i, 2, k);
+      fv_real br2 = al8_y_at(q, i, 3, k) - q(i, 2, k);
+      pert_ppm_iv1(bl2, br2);
+      r.bl = bl2; r.br = br2;
+    }
+    return r;
+  }
+  if (seam && b.north_edge && j >= npy - 2 && j <= npy) {
+    const fv_real xt_a = hord8_s15() * q(i, npy - 1, k) + hord8_s11() * q(i, npy - 2, k) +
+                         hord8_s14() * dm8_y_at(q, i, npy - 2, k);
+    const fv_real lo4 = fmin(fmin(q(i, npy - 2, k), q(i, npy - 1, k)),
+                             fmin(q(i, npy, k), q(i, npy + 1, k)));
+    const fv_real hi4 = fmax(fmax(q(i, npy - 2, k), q(i, npy - 1, k)),
+                             fmax(q(i, npy, k), q(i, npy + 1, k)));
+    const fv_real xt_b_raw =
+        fv_real(0.5) *
+        (((fv_real(2) * dya(i, npy - 1) + dya(i, npy - 2)) * q(i, npy - 1, k) -
+          dya(i, npy - 1) * q(i, npy - 2, k)) /
+             (dya(i, npy - 2) + dya(i, npy - 1)) +
+         ((fv_real(2) * dya(i, npy) + dya(i, npy + 1)) * q(i, npy, k) -
+          dya(i, npy) * q(i, npy + 1, k)) /
+             (dya(i, npy) + dya(i, npy + 1)));
+    fv_real xt_b = fmax(xt_b_raw, lo4);
+    xt_b = fmin(xt_b, hi4);
+    if (j == npy - 2) {
+      fv_real bl = al8_y_at(q, i, npy - 2, k) - q(i, npy - 2, k);
+      fv_real br = xt_a - q(i, npy - 2, k);
+      pert_ppm_iv1(bl, br);
+      r.bl = bl; r.br = br;
+    } else if (j == npy - 1) {
+      fv_real bl = xt_a - q(i, npy - 1, k);
+      fv_real br = xt_b - q(i, npy - 1, k);
+      pert_ppm_iv1(bl, br);
+      r.bl = bl; r.br = br;
+    } else {
+      fv_real bl = xt_b - q(i, npy, k);
+      fv_real br = hord8_s11() * (q(i, npy + 1, k) - q(i, npy, k)) -
+                   hord8_s14() * dm8_y_at(q, i, npy + 1, k);
+      pert_ppm_iv1(bl, br);
+      r.bl = bl; r.br = br;
+    }
+    return r;
+  }
+  const fv_real dmj = dm8_y_at(q, i, j, k);
+  const fv_real alj = al8_y_at(q, i, j, k);
+  const fv_real aljp1 = al8_y_at(q, i, j + 1, k);
+  const fv_real xt = fv_real(2) * dmj;
+  r.bl = -copysign(fmin(fabs(xt), fabs(alj - q(i, j, k))), xt);
+  r.br = copysign(fmin(fabs(xt), fabs(aljp1 - q(i, j, k))), xt);
+  return r;
+}
+
+// Shared final flux formula, iord>=7 and iord != 7, tp_core.F90:697-705 /
+// 1136-1144.
+__device__ __forceinline__ fv_real xppm_face_flux_hord8(View3<const fv_real> q,
+                                                         View2<const fv_real> dxa, int64_t i,
+                                                         int64_t j, int64_t k, fv_real c,
+                                                         const TransportBounds &b) {
+  if (c > fv_real(0)) {
+    const BlBr8 m1 = bl_br8_x_at(q, dxa, i - 1, j, k, b);
+    return q(i - 1, j, k) + (fv_real(1) - c) * (m1.br - c * (m1.bl + m1.br));
+  } else {
+    const BlBr8 c0 = bl_br8_x_at(q, dxa, i, j, k, b);
+    return q(i, j, k) + (fv_real(1) + c) * (c0.bl + c * (c0.bl + c0.br));
+  }
+}
+
+__device__ __forceinline__ fv_real yppm_face_flux_hord8(View3<const fv_real> q,
+                                                         View2<const fv_real> dya, int64_t i,
+                                                         int64_t j, int64_t k, fv_real c,
+                                                         const TransportBounds &b) {
+  if (c > fv_real(0)) {
+    const BlBr8 m1 = bl_br8_y_at(q, dya, i, j - 1, k, b);
+    return q(i, j - 1, k) + (fv_real(1) - c) * (m1.br - c * (m1.bl + m1.br));
+  } else {
+    const BlBr8 c0 = bl_br8_y_at(q, dya, i, j, k, b);
+    return q(i, j, k) + (fv_real(1) + c) * (c0.bl + c * (c0.bl + c0.br));
+  }
+}
+
 // --- fv_tp_2d passes -----------------------------------------------------
 __global__ void xppm_pass_kernel(TransportBounds b, LevelFilter lf, bool negative,
                                  int64_t lo_i, int64_t hi_i, int64_t lo_j, int64_t hi_j,
@@ -305,6 +553,34 @@ __global__ void yppm_pass_kernel(TransportBounds b, LevelFilter lf, bool negativ
   if (i > hi_i || j > hi_j || k >= b.nk) return;
   if (!level_active(lf, k)) return;
   flux(i, j, k) = yppm_face_flux(q, dya, i, j, k, cry(i, j, k), b, negative);
+}
+
+// hord==8 pass kernels -- brand-new, additive; the hord==6 kernels above are
+// byte-for-byte unchanged. No `negative` parameter: iord>=7 has no al
+// positivity clamp in the Fortran (tp_core.F90:388 gates it inside the
+// iord<7 branch only).
+__global__ void xppm_pass_kernel_hord8(TransportBounds b, LevelFilter lf, int64_t lo_i,
+                                       int64_t hi_i, int64_t lo_j, int64_t hi_j,
+                                       View3<const fv_real> q, View2<const fv_real> dxa,
+                                       View3<const fv_real> crx, View3<fv_real> flux) {
+  const int64_t i = lo_i + blockIdx.x * blockDim.x + threadIdx.x;
+  const int64_t j = lo_j + blockIdx.y * blockDim.y + threadIdx.y;
+  const int64_t k = blockIdx.z;
+  if (i > hi_i || j > hi_j || k >= b.nk) return;
+  if (!level_active(lf, k)) return;
+  flux(i, j, k) = xppm_face_flux_hord8(q, dxa, i, j, k, crx(i, j, k), b);
+}
+
+__global__ void yppm_pass_kernel_hord8(TransportBounds b, LevelFilter lf, int64_t lo_i,
+                                       int64_t hi_i, int64_t lo_j, int64_t hi_j,
+                                       View3<const fv_real> q, View2<const fv_real> dya,
+                                       View3<const fv_real> cry, View3<fv_real> flux) {
+  const int64_t i = lo_i + blockIdx.x * blockDim.x + threadIdx.x;
+  const int64_t j = lo_j + blockIdx.y * blockDim.y + threadIdx.y;
+  const int64_t k = blockIdx.z;
+  if (i > hi_i || j > hi_j || k >= b.nk) return;
+  if (!level_active(lf, k)) return;
+  flux(i, j, k) = yppm_face_flux_hord8(q, dya, i, j, k, cry(i, j, k), b);
 }
 
 // tp_core.F90:168-177: q_i = (q*area + fyy(j) - fyy(j+1)) / ra_y with
@@ -727,6 +1003,8 @@ fv3_gpu_status launch_fv_tp_2d_cuda(const TransportBounds &b, int32_t hord,
   const int64_t isd = is - h, ied = ie + h, jsd = js - h, jed = je + h;
   auto s = static_cast<cudaStream_t>(stream);
   const bool neg = hord < 0;
+  const int32_t mord = hord >= 0 ? hord : -hord;
+  const bool hord8 = mord == 8;  // hord==6 path below is untouched either way.
   View3<const fv_real> qc = as_const(q);
 
   // copy_corners(q, dir = 2)
@@ -736,8 +1014,13 @@ fv3_gpu_status launch_fv_tp_2d_cuda(const TransportBounds &b, int32_t hord,
   // yppm(fy2, q, cry_adv) on isd..ied x js..je+1
   {
     Launch2D p = plan2d(ied - isd + 1, je + 1 - js + 1, b.nk);
-    yppm_pass_kernel<<<p.grid, p.block, 0, s>>>(b, lf, neg, isd, ied, js, je + 1, qc, dya,
-                                                cry_adv, fy2);
+    if (hord8) {
+      yppm_pass_kernel_hord8<<<p.grid, p.block, 0, s>>>(b, lf, isd, ied, js, je + 1, qc,
+                                                        dya, cry_adv, fy2);
+    } else {
+      yppm_pass_kernel<<<p.grid, p.block, 0, s>>>(b, lf, neg, isd, ied, js, je + 1, qc, dya,
+                                                  cry_adv, fy2);
+    }
   }
   {
     Launch2D p = plan2d(ied - isd + 1, je - js + 1, b.nk);
@@ -747,8 +1030,13 @@ fv3_gpu_status launch_fv_tp_2d_cuda(const TransportBounds &b, int32_t hord,
   // xppm(fx, q_i, crx_adv) on is..ie+1 x js..je
   {
     Launch2D p = plan2d(ie + 1 - is + 1, je - js + 1, b.nk);
-    xppm_pass_kernel<<<p.grid, p.block, 0, s>>>(b, lf, neg, is, ie + 1, js, je,
-                                                as_const(q_i), dxa, crx_adv, fx);
+    if (hord8) {
+      xppm_pass_kernel_hord8<<<p.grid, p.block, 0, s>>>(b, lf, is, ie + 1, js, je,
+                                                        as_const(q_i), dxa, crx_adv, fx);
+    } else {
+      xppm_pass_kernel<<<p.grid, p.block, 0, s>>>(b, lf, neg, is, ie + 1, js, je,
+                                                  as_const(q_i), dxa, crx_adv, fx);
+    }
   }
 
   // copy_corners(q, dir = 1)
@@ -758,8 +1046,13 @@ fv3_gpu_status launch_fv_tp_2d_cuda(const TransportBounds &b, int32_t hord,
   // xppm(fx2, q, crx_adv) on is..ie+1 x jsd..jed
   {
     Launch2D p = plan2d(ie + 1 - is + 1, jed - jsd + 1, b.nk);
-    xppm_pass_kernel<<<p.grid, p.block, 0, s>>>(b, lf, neg, is, ie + 1, jsd, jed, qc, dxa,
-                                                crx_adv, fx2);
+    if (hord8) {
+      xppm_pass_kernel_hord8<<<p.grid, p.block, 0, s>>>(b, lf, is, ie + 1, jsd, jed, qc,
+                                                        dxa, crx_adv, fx2);
+    } else {
+      xppm_pass_kernel<<<p.grid, p.block, 0, s>>>(b, lf, neg, is, ie + 1, jsd, jed, qc, dxa,
+                                                  crx_adv, fx2);
+    }
   }
   {
     Launch2D p = plan2d(ie - is + 1, jed - jsd + 1, b.nk);
@@ -769,8 +1062,13 @@ fv3_gpu_status launch_fv_tp_2d_cuda(const TransportBounds &b, int32_t hord,
   // yppm(fy, q_j, cry_adv) on is..ie x js..je+1
   {
     Launch2D p = plan2d(ie - is + 1, je + 1 - js + 1, b.nk);
-    yppm_pass_kernel<<<p.grid, p.block, 0, s>>>(b, lf, neg, is, ie, js, je + 1,
-                                                as_const(q_j), dya, cry_adv, fy);
+    if (hord8) {
+      yppm_pass_kernel_hord8<<<p.grid, p.block, 0, s>>>(b, lf, is, ie, js, je + 1,
+                                                        as_const(q_j), dya, cry_adv, fy);
+    } else {
+      yppm_pass_kernel<<<p.grid, p.block, 0, s>>>(b, lf, neg, is, ie, js, je + 1,
+                                                  as_const(q_j), dya, cry_adv, fy);
+    }
   }
 
   {
@@ -1086,10 +1384,10 @@ fv3_gpu_status launch_scalar_transport_cuda(
   // Reject BEFORE launching anything: an unsupported configuration must not
   // leave q half-rotated or fx/fy half-written.
   const int32_t mord = opt.hord >= 0 ? opt.hord : -opt.hord;
-  if (mord != 6) return FV3_GPU_UNSUPPORTED_CONFIGURATION;
+  if (mord != 6 && mord != 8) return FV3_GPU_UNSUPPORTED_CONFIGURATION;
   // tp_core.F90:145-146: ord_in = 8 when hord == 10, else hord. abs(hord) == 6
-  // excludes hord == 10, so ord_in == ord_ou == hord holds and the single-hord
-  // launch_fv_tp_2d_cuda signature is faithful here.
+  // or 8 both exclude hord == 10, so ord_in == ord_ou == hord holds and the
+  // single-hord launch_fv_tp_2d_cuda signature is faithful for both.
   const bool deln = opt.deln_flux_enabled != 0;
   const bool deln_per_level = deln && opt.per_level_deln != 0;
   if (deln && !deln_nord_supported(b, deln_per_level ? opt.nord_cap : opt.nord))

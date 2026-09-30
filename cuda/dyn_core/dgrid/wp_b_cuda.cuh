@@ -382,10 +382,10 @@ struct ScalarTransportOptions {
 // divergence, pt/w/q_con are mass-weighted, zh is renormalised by the swept
 // area).
 //
-// Returns FV3_GPU_UNSUPPORTED_CONFIGURATION when abs(hord) != 6 (only the
-// order-6 PPM path is ported) or when nord is outside [0, ng-1] with damping
-// enabled, and does so BEFORE launching any kernel, so model state is never
-// partially mutated by a rejected configuration.
+// Returns FV3_GPU_UNSUPPORTED_CONFIGURATION when abs(hord) is not 6 or 8
+// (only the order-6 and order-8 PPM paths are ported) or when nord is outside
+// [0, ng-1] with damping enabled, and does so BEFORE launching any kernel, so
+// model state is never partially mutated by a rejected configuration.
 fv3_gpu_status launch_scalar_transport_cuda(
     const TransportBounds &b, const ScalarTransportOptions &opt, const LevelFilter &lf,
     View3<fv_real> q, View3<const fv_real> mass, View3<const fv_real> crx_adv,

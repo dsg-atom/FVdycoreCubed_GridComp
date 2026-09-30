@@ -43,6 +43,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <string>
 #include <vector>
@@ -296,6 +297,256 @@ static fv_real h_yppm(const A3 &q, const A2 &dya, int64_t i, int64_t j, int64_t 
   return (sm || s0) ? donor + fx1 : donor;
 }
 
+// --- hord==8 host reference (Prompt 76 Stage 5) ---------------------------
+//
+// Mirrors dgrid::{dm8_x_at, al8_x_at, bl_br8_x_at, xppm_face_flux_hord8} in
+// wp_b_cuda.cu line-for-line (same operand order, same fmin/fmax/copysign
+// call shape) rather than reusing tests/host/test_fv_tp_2d_hord8_hostharness.cpp's
+// row-based transcription: a bitwise CUDA-vs-host check demands the same
+// operation order the device code actually executes, not just an
+// independently-authoritative one. hord==8's tp_core.F90 branch has no al
+// positivity clamp (:388 gates `neg` inside iord<7 only), so unlike h_al_x
+// there is no `neg` parameter here.
+static const fv_real HORD8_R3 = fv_real(1.0 / 3.0);
+static const fv_real HORD8_S11 = fv_real(11.0 / 14.0);
+static const fv_real HORD8_S14 = fv_real(4.0 / 7.0);
+static const fv_real HORD8_S15 = fv_real(3.0 / 14.0);
+
+// Host-only mirror of dgrid::BlBr8 (wp_b_cuda.cu) -- that struct is defined
+// inside the .cu translation unit, not exposed via wp_b_cuda.cuh, so it is
+// not visible to this .cpp test file.
+struct BlBr8 {
+  fv_real bl, br;
+};
+
+static void h_pert_ppm_iv1(fv_real &al, fv_real &ar) {
+  if (al * ar < fv_real(0)) {
+    const fv_real da1 = al - ar;
+    const fv_real da2 = da1 * da1;
+    const fv_real a6da = fv_real(3) * (al + ar) * da1;
+    if (a6da < -da2) {
+      ar = fv_real(-2) * al;
+    } else if (a6da > da2) {
+      al = fv_real(-2) * ar;
+    }
+  } else {
+    al = fv_real(0);
+    ar = fv_real(0);
+  }
+}
+
+static fv_real h_dm8_x(const A3 &q, int64_t i, int64_t j, int64_t k) {
+  const fv_real qm = q(i - 1, j, k), q0 = q(i, j, k), qp = q(i + 1, j, k);
+  const fv_real xt = fv_real(0.25) * (qp - qm);
+  const fv_real lo = std::fmin(std::fmin(qm, q0), qp);
+  const fv_real hi = std::fmax(std::fmax(qm, q0), qp);
+  const fv_real mag = std::fmin(std::fabs(xt), std::fmin(hi - q0, q0 - lo));
+  return std::copysign(mag, xt);
+}
+static fv_real h_dm8_y(const A3 &q, int64_t i, int64_t j, int64_t k) {
+  const fv_real qm = q(i, j - 1, k), q0 = q(i, j, k), qp = q(i, j + 1, k);
+  const fv_real xt = fv_real(0.25) * (qp - qm);
+  const fv_real lo = std::fmin(std::fmin(qm, q0), qp);
+  const fv_real hi = std::fmax(std::fmax(qm, q0), qp);
+  const fv_real mag = std::fmin(std::fabs(xt), std::fmin(hi - q0, q0 - lo));
+  return std::copysign(mag, xt);
+}
+static fv_real h_al8_x(const A3 &q, int64_t i, int64_t j, int64_t k) {
+  return fv_real(0.5) * (q(i - 1, j, k) + q(i, j, k)) +
+         HORD8_R3 * (h_dm8_x(q, i - 1, j, k) - h_dm8_x(q, i, j, k));
+}
+static fv_real h_al8_y(const A3 &q, int64_t i, int64_t j, int64_t k) {
+  return fv_real(0.5) * (q(i, j - 1, k) + q(i, j, k)) +
+         HORD8_R3 * (h_dm8_y(q, i, j - 1, k) - h_dm8_y(q, i, j, k));
+}
+
+static BlBr8 h_bl_br8_x(const A3 &q, const A2 &dxa, int64_t i, int64_t j, int64_t k,
+                        const TransportBounds &b) {
+  const int64_t npx = b.npx;
+  const bool seam = b.cubed_sphere && !b.nested;
+  BlBr8 r{};
+  if (seam && b.west_edge && i >= 0 && i <= 2) {
+    const fv_real xt_a_raw =
+        fv_real(0.5) *
+        (((fv_real(2) * dxa(0, j) + dxa(-1, j)) * q(0, j, k) - dxa(0, j) * q(-1, j, k)) /
+             (dxa(-1, j) + dxa(0, j)) +
+         ((fv_real(2) * dxa(1, j) + dxa(2, j)) * q(1, j, k) - dxa(1, j) * q(2, j, k)) /
+             (dxa(1, j) + dxa(2, j)));
+    const fv_real lo4 = std::fmin(std::fmin(q(-1, j, k), q(0, j, k)),
+                                  std::fmin(q(1, j, k), q(2, j, k)));
+    const fv_real hi4 = std::fmax(std::fmax(q(-1, j, k), q(0, j, k)),
+                                  std::fmax(q(1, j, k), q(2, j, k)));
+    fv_real xt_a = std::fmax(xt_a_raw, lo4);
+    xt_a = std::fmin(xt_a, hi4);
+    const fv_real xt_b = HORD8_S15 * q(1, j, k) + HORD8_S11 * q(2, j, k) -
+                        HORD8_S14 * h_dm8_x(q, 2, j, k);
+    if (i == 0) {
+      fv_real bl0 = HORD8_S14 * h_dm8_x(q, -1, j, k) + HORD8_S11 * (q(-1, j, k) - q(0, j, k));
+      fv_real br0 = xt_a - q(0, j, k);
+      h_pert_ppm_iv1(bl0, br0);
+      r.bl = bl0; r.br = br0;
+    } else if (i == 1) {
+      fv_real bl1 = xt_a - q(1, j, k);
+      fv_real br1 = xt_b - q(1, j, k);
+      h_pert_ppm_iv1(bl1, br1);
+      r.bl = bl1; r.br = br1;
+    } else {
+      fv_real bl2 = xt_b - q(2, j, k);
+      fv_real br2 = h_al8_x(q, 3, j, k) - q(2, j, k);
+      h_pert_ppm_iv1(bl2, br2);
+      r.bl = bl2; r.br = br2;
+    }
+    return r;
+  }
+  if (seam && b.east_edge && i >= npx - 2 && i <= npx) {
+    const fv_real xt_a = HORD8_S15 * q(npx - 1, j, k) + HORD8_S11 * q(npx - 2, j, k) +
+                        HORD8_S14 * h_dm8_x(q, npx - 2, j, k);
+    const fv_real lo4 = std::fmin(std::fmin(q(npx - 2, j, k), q(npx - 1, j, k)),
+                                  std::fmin(q(npx, j, k), q(npx + 1, j, k)));
+    const fv_real hi4 = std::fmax(std::fmax(q(npx - 2, j, k), q(npx - 1, j, k)),
+                                  std::fmax(q(npx, j, k), q(npx + 1, j, k)));
+    const fv_real xt_b_raw =
+        fv_real(0.5) *
+        (((fv_real(2) * dxa(npx - 1, j) + dxa(npx - 2, j)) * q(npx - 1, j, k) -
+          dxa(npx - 1, j) * q(npx - 2, j, k)) /
+             (dxa(npx - 2, j) + dxa(npx - 1, j)) +
+         ((fv_real(2) * dxa(npx, j) + dxa(npx + 1, j)) * q(npx, j, k) -
+          dxa(npx, j) * q(npx + 1, j, k)) /
+             (dxa(npx, j) + dxa(npx + 1, j)));
+    fv_real xt_b = std::fmax(xt_b_raw, lo4);
+    xt_b = std::fmin(xt_b, hi4);
+    if (i == npx - 2) {
+      fv_real bl = h_al8_x(q, npx - 2, j, k) - q(npx - 2, j, k);
+      fv_real br = xt_a - q(npx - 2, j, k);
+      h_pert_ppm_iv1(bl, br);
+      r.bl = bl; r.br = br;
+    } else if (i == npx - 1) {
+      fv_real bl = xt_a - q(npx - 1, j, k);
+      fv_real br = xt_b - q(npx - 1, j, k);
+      h_pert_ppm_iv1(bl, br);
+      r.bl = bl; r.br = br;
+    } else {
+      fv_real bl = xt_b - q(npx, j, k);
+      fv_real br = HORD8_S11 * (q(npx + 1, j, k) - q(npx, j, k)) -
+                  HORD8_S14 * h_dm8_x(q, npx + 1, j, k);
+      h_pert_ppm_iv1(bl, br);
+      r.bl = bl; r.br = br;
+    }
+    return r;
+  }
+  const fv_real dmi = h_dm8_x(q, i, j, k);
+  const fv_real ali = h_al8_x(q, i, j, k);
+  const fv_real alip1 = h_al8_x(q, i + 1, j, k);
+  const fv_real xt = fv_real(2) * dmi;
+  r.bl = -std::copysign(std::fmin(std::fabs(xt), std::fabs(ali - q(i, j, k))), xt);
+  r.br = std::copysign(std::fmin(std::fabs(xt), std::fabs(alip1 - q(i, j, k))), xt);
+  return r;
+}
+
+static BlBr8 h_bl_br8_y(const A3 &q, const A2 &dya, int64_t i, int64_t j, int64_t k,
+                        const TransportBounds &b) {
+  const int64_t npy = b.npy;
+  const bool seam = b.cubed_sphere && !b.nested;
+  BlBr8 r{};
+  if (seam && b.south_edge && j >= 0 && j <= 2) {
+    const fv_real xt_a_raw =
+        fv_real(0.5) *
+        (((fv_real(2) * dya(i, 0) + dya(i, -1)) * q(i, 0, k) - dya(i, 0) * q(i, -1, k)) /
+             (dya(i, -1) + dya(i, 0)) +
+         ((fv_real(2) * dya(i, 1) + dya(i, 2)) * q(i, 1, k) - dya(i, 1) * q(i, 2, k)) /
+             (dya(i, 1) + dya(i, 2)));
+    const fv_real lo4 = std::fmin(std::fmin(q(i, -1, k), q(i, 0, k)),
+                                  std::fmin(q(i, 1, k), q(i, 2, k)));
+    const fv_real hi4 = std::fmax(std::fmax(q(i, -1, k), q(i, 0, k)),
+                                  std::fmax(q(i, 1, k), q(i, 2, k)));
+    fv_real xt_a = std::fmax(xt_a_raw, lo4);
+    xt_a = std::fmin(xt_a, hi4);
+    const fv_real xt_b = HORD8_S15 * q(i, 1, k) + HORD8_S11 * q(i, 2, k) -
+                        HORD8_S14 * h_dm8_y(q, i, 2, k);
+    if (j == 0) {
+      fv_real bl0 = HORD8_S14 * h_dm8_y(q, i, -1, k) + HORD8_S11 * (q(i, -1, k) - q(i, 0, k));
+      fv_real br0 = xt_a - q(i, 0, k);
+      h_pert_ppm_iv1(bl0, br0);
+      r.bl = bl0; r.br = br0;
+    } else if (j == 1) {
+      fv_real bl1 = xt_a - q(i, 1, k);
+      fv_real br1 = xt_b - q(i, 1, k);
+      h_pert_ppm_iv1(bl1, br1);
+      r.bl = bl1; r.br = br1;
+    } else {
+      fv_real bl2 = xt_b - q(i, 2, k);
+      fv_real br2 = h_al8_y(q, i, 3, k) - q(i, 2, k);
+      h_pert_ppm_iv1(bl2, br2);
+      r.bl = bl2; r.br = br2;
+    }
+    return r;
+  }
+  if (seam && b.north_edge && j >= npy - 2 && j <= npy) {
+    const fv_real xt_a = HORD8_S15 * q(i, npy - 1, k) + HORD8_S11 * q(i, npy - 2, k) +
+                        HORD8_S14 * h_dm8_y(q, i, npy - 2, k);
+    const fv_real lo4 = std::fmin(std::fmin(q(i, npy - 2, k), q(i, npy - 1, k)),
+                                  std::fmin(q(i, npy, k), q(i, npy + 1, k)));
+    const fv_real hi4 = std::fmax(std::fmax(q(i, npy - 2, k), q(i, npy - 1, k)),
+                                  std::fmax(q(i, npy, k), q(i, npy + 1, k)));
+    const fv_real xt_b_raw =
+        fv_real(0.5) *
+        (((fv_real(2) * dya(i, npy - 1) + dya(i, npy - 2)) * q(i, npy - 1, k) -
+          dya(i, npy - 1) * q(i, npy - 2, k)) /
+             (dya(i, npy - 2) + dya(i, npy - 1)) +
+         ((fv_real(2) * dya(i, npy) + dya(i, npy + 1)) * q(i, npy, k) -
+          dya(i, npy) * q(i, npy + 1, k)) /
+             (dya(i, npy) + dya(i, npy + 1)));
+    fv_real xt_b = std::fmax(xt_b_raw, lo4);
+    xt_b = std::fmin(xt_b, hi4);
+    if (j == npy - 2) {
+      fv_real bl = h_al8_y(q, i, npy - 2, k) - q(i, npy - 2, k);
+      fv_real br = xt_a - q(i, npy - 2, k);
+      h_pert_ppm_iv1(bl, br);
+      r.bl = bl; r.br = br;
+    } else if (j == npy - 1) {
+      fv_real bl = xt_a - q(i, npy - 1, k);
+      fv_real br = xt_b - q(i, npy - 1, k);
+      h_pert_ppm_iv1(bl, br);
+      r.bl = bl; r.br = br;
+    } else {
+      fv_real bl = xt_b - q(i, npy, k);
+      fv_real br = HORD8_S11 * (q(i, npy + 1, k) - q(i, npy, k)) -
+                  HORD8_S14 * h_dm8_y(q, i, npy + 1, k);
+      h_pert_ppm_iv1(bl, br);
+      r.bl = bl; r.br = br;
+    }
+    return r;
+  }
+  const fv_real dmj = h_dm8_y(q, i, j, k);
+  const fv_real alj = h_al8_y(q, i, j, k);
+  const fv_real aljp1 = h_al8_y(q, i, j + 1, k);
+  const fv_real xt = fv_real(2) * dmj;
+  r.bl = -std::copysign(std::fmin(std::fabs(xt), std::fabs(alj - q(i, j, k))), xt);
+  r.br = std::copysign(std::fmin(std::fabs(xt), std::fabs(aljp1 - q(i, j, k))), xt);
+  return r;
+}
+
+static fv_real h_xppm8(const A3 &q, const A2 &dxa, int64_t i, int64_t j, int64_t k, fv_real c,
+                       const TransportBounds &b) {
+  if (c > fv_real(0)) {
+    const BlBr8 m1 = h_bl_br8_x(q, dxa, i - 1, j, k, b);
+    return q(i - 1, j, k) + (fv_real(1) - c) * (m1.br - c * (m1.bl + m1.br));
+  } else {
+    const BlBr8 c0 = h_bl_br8_x(q, dxa, i, j, k, b);
+    return q(i, j, k) + (fv_real(1) + c) * (c0.bl + c * (c0.bl + c0.br));
+  }
+}
+static fv_real h_yppm8(const A3 &q, const A2 &dya, int64_t i, int64_t j, int64_t k, fv_real c,
+                       const TransportBounds &b) {
+  if (c > fv_real(0)) {
+    const BlBr8 m1 = h_bl_br8_y(q, dya, i, j - 1, k, b);
+    return q(i, j - 1, k) + (fv_real(1) - c) * (m1.br - c * (m1.bl + m1.br));
+  } else {
+    const BlBr8 c0 = h_bl_br8_y(q, dya, i, j, k, b);
+    return q(i, j, k) + (fv_real(1) + c) * (c0.bl + c * (c0.bl + c0.br));
+  }
+}
+
 // tp_core.F90:255-318. All four corners, in the Fortran's order. The eight
 // regions are pairwise disjoint (every source block has an INTERIOR second
 // index, every destination block a HALO second index), so the order is in fact
@@ -354,6 +605,8 @@ static TpResult h_fv_tp_2d(const Inputs &in, int32_t hord, bool mass_weighting) 
   const TransportBounds &b = in.b;
   const int64_t is = b.is, ie = b.ie, js = b.js, je = b.je, ng = b.ng;
   const int64_t isd = is - ng, ied = ie + ng, jsd = js - ng, jed = je + ng;
+  const int32_t mord = hord >= 0 ? hord : -hord;
+  const bool hord8 = mord == 8;
   const bool neg = hord < 0;
   const A2 &dxa = in.dxa, &dya = in.dya;
 
@@ -371,7 +624,8 @@ static TpResult h_fv_tp_2d(const Inputs &in, int32_t hord, bool mass_weighting) 
   for (int64_t k = 0; k < b.nk; ++k) {
     for (int64_t j = js; j <= je + 1; ++j)                            // yppm, :161
       for (int64_t i = isd; i <= ied; ++i)
-        r.fy2(i, j, k) = h_yppm(q, dya, i, j, k, in.cry(i, j, k), b, neg);
+        r.fy2(i, j, k) = hord8 ? h_yppm8(q, dya, i, j, k, in.cry(i, j, k), b)
+                               : h_yppm(q, dya, i, j, k, in.cry(i, j, k), b, neg);
     for (int64_t j = js; j <= je; ++j)                                // q_i, :168-177
       for (int64_t i = isd; i <= ied; ++i) {
         const fv_real fyy_j = in.yfx(i, j, k) * r.fy2(i, j, k);
@@ -380,14 +634,16 @@ static TpResult h_fv_tp_2d(const Inputs &in, int32_t hord, bool mass_weighting) 
       }
     for (int64_t j = js; j <= je; ++j)                                // xppm(q_i), :180
       for (int64_t i = is; i <= ie + 1; ++i)
-        r.fx(i, j, k) = h_xppm(r.q_i, dxa, i, j, k, in.crx(i, j, k), b, neg);
+        r.fx(i, j, k) = hord8 ? h_xppm8(r.q_i, dxa, i, j, k, in.crx(i, j, k), b)
+                              : h_xppm(r.q_i, dxa, i, j, k, in.crx(i, j, k), b, neg);
   }
 
   h_copy_corners(q, 1, b);                                            // :183
   for (int64_t k = 0; k < b.nk; ++k) {
     for (int64_t j = jsd; j <= jed; ++j)                              // xppm(q), :186
       for (int64_t i = is; i <= ie + 1; ++i)
-        r.fx2(i, j, k) = h_xppm(q, dxa, i, j, k, in.crx(i, j, k), b, neg);
+        r.fx2(i, j, k) = hord8 ? h_xppm8(q, dxa, i, j, k, in.crx(i, j, k), b)
+                               : h_xppm(q, dxa, i, j, k, in.crx(i, j, k), b, neg);
     for (int64_t j = jsd; j <= jed; ++j)                              // q_j, :186-193
       for (int64_t i = is; i <= ie; ++i) {
         const fv_real fx1_i = in.xfx(i, j, k) * r.fx2(i, j, k);
@@ -396,7 +652,8 @@ static TpResult h_fv_tp_2d(const Inputs &in, int32_t hord, bool mass_weighting) 
       }
     for (int64_t j = js; j <= je + 1; ++j)                            // yppm(q_j), :196
       for (int64_t i = is; i <= ie; ++i)
-        r.fy(i, j, k) = h_yppm(r.q_j, dya, i, j, k, in.cry(i, j, k), b, neg);
+        r.fy(i, j, k) = hord8 ? h_yppm8(r.q_j, dya, i, j, k, in.cry(i, j, k), b)
+                              : h_yppm(r.q_j, dya, i, j, k, in.cry(i, j, k), b, neg);
   }
 
   // :205-234. Only the weight differs between the two branches.
@@ -1533,7 +1790,8 @@ static bool part_k() {
     const char *name;
     ScalarTransportOptions opt;
   } cases[] = {
-      {"K hord=8 rejected", {8, 0, 0, 0, fv_real(0), fv_real(0)}},
+      // hord=8 is supported as of Prompt 76 (see Part L); only hord magnitudes
+      // that remain genuinely unimplemented are rejected here now.
       {"K hord=10 rejected", {10, 0, 0, 0, fv_real(0), fv_real(0)}},
       {"K hord=0 rejected", {0, 0, 0, 0, fv_real(0), fv_real(0)}},
       {"K nord=3 rejected", {6, 0, 1, 3, fv_real(0.05), (fv_real)GRID_DA_MIN}},
@@ -1561,6 +1819,152 @@ static bool part_k() {
   return ok;
 }
 
+// ---------------------------------------------------------------------- Part L
+//
+// hord==8 (Prompt 76): interior, all-four-seam, and corner check_against_reference
+// coverage, seeded with the 11 named Prompt-75 fixture *shapes*
+// (tests/host/test_fv_tp_2d_hord8_hostharness.cpp) broadcast across j and k --
+// that harness is row-based/1D and does not share this file's 3D Box/A3
+// convention, so it cannot be reused directly, but its fixture patterns
+// (constant, linear_gradient, smooth_curved, sharp_front, local_max, local_min,
+// near_zero_positive, sign_changing, high_courant_valid,
+// boundary_edge_is1_and_npx, c512_like_slice) are reproduced here as the
+// x-varying q(i)/crx patterns that each fixture actually exercises.
+// check_against_reference itself compares fully against h_fv_tp_2d(hord=8),
+// which now dispatches to the bitwise device-mirroring h_xppm8/h_yppm8/
+// h_bl_br8_x/h_bl_br8_y added above -- so a PASS here is a bitwise (not just
+// round-off) claim unless compare_box's TOL is actually exercised.
+
+static void set_fixture_x(Inputs &in, int64_t imid, fv_real c,
+                          const std::function<double(int64_t)> &qshape) {
+  const Box &box = in.box;
+  const int64_t i0 = box.loi(), i1 = box.ie + box.ng;
+  const int64_t j0 = box.loj(), j1 = box.je + box.ng;
+  for (int64_t k = 0; k < box.nk; ++k)
+    for (int64_t j = j0; j <= j1; ++j)
+      for (int64_t i = i0; i <= i1; ++i) {
+        in.q(i, j, k) = (fv_real)qshape(i);
+        in.crx(i, j, k) = c;
+      }
+  (void)imid;
+}
+
+static bool part_l() {
+  printf("Part L: hord=8 interior/seam/corner fv_tp_2d (Prompt 76 Stage 5)\n");
+  bool ok = true;
+
+  // L1 -- interior (no panel edge), 9 of the 11 Prompt-75 fixture shapes that
+  // do not specifically target a panel edge / production-shape slice.
+  {
+    Box box;
+    box.is = 9;
+    box.ie = 20;
+    box.js = 9;
+    box.je = 20;
+    box.nk = 4;
+    TransportBounds b = interior_bounds(box, 33, 33);
+    const int64_t imid = (box.is + box.ie) / 2;
+    struct Fixture {
+      const char *name;
+      fv_real c;
+      std::function<double(int64_t)> q;
+    } fixtures[] = {
+        {"L1 constant", fv_real(0.35), [](int64_t) { return 5.0; }},
+        {"L1 linear_gradient", fv_real(0.35), [](int64_t i) { return 1.0 + 0.5 * i; }},
+        {"L1 smooth_curved", fv_real(0.35),
+         [](int64_t i) { return 3.0 + std::sin(0.3 * i); }},
+        {"L1 sharp_front", fv_real(0.35),
+         [imid](int64_t i) { return i < imid ? 1.0 : 10.0; }},
+        {"L1 local_max", fv_real(0.35),
+         [imid](int64_t i) { return i == imid ? 20.0 : 2.0; }},
+        {"L1 local_min", fv_real(0.35),
+         [imid](int64_t i) { return i == imid ? -5.0 : 2.0; }},
+        {"L1 near_zero_positive", fv_real(0.2),
+         [](int64_t i) { return 1.0e-12 + 1.0e-14 * i; }},
+        {"L1 sign_changing", fv_real(-0.4),
+         [](int64_t i) { return std::sin(0.5 * i) * 4.0; }},
+        {"L1 high_courant_valid", fv_real(0.9), [](int64_t i) { return 1.0 + 0.3 * i; }},
+    };
+    for (const Fixture &f : fixtures) {
+      Inputs in = make_inputs(box, b);
+      set_fixture_x(in, imid, f.c, f.q);
+      ok &= check_against_reference(f.name, in, ScalarTransportOptions{8, 0, 0, 0,
+                                                                       fv_real(0),
+                                                                       fv_real(0)});
+    }
+  }
+
+  // L2 -- all four panel-edge seams (Prompt-75 "boundary_edge_is1_and_npx").
+  {
+    Box box;
+    box.is = 1;
+    box.ie = 12;
+    box.js = 1;
+    box.je = 12;
+    box.nk = 3;
+    TransportBounds b = interior_bounds(box, 13, 13);
+    if (!(b.west_edge && b.east_edge && b.south_edge && b.north_edge)) {
+      printf("    fixture FAIL: expected all four panel edges\n");
+      ok = false;
+    } else {
+      Inputs in = make_inputs(box, b);
+      set_fixture_x(in, 0, fv_real(0.3), [](int64_t i) { return 1.0 + 0.4 * i; });
+      ok &= check_against_reference("L2 boundary_edge_is1_and_npx", in,
+                                    ScalarTransportOptions{8, 0, 0, 0, fv_real(0),
+                                                            fv_real(0)});
+    }
+  }
+
+  // L3 -- all four corners, "c512_like_slice" (smooth field + small
+  // deterministic perturbation, standing in for the fixture's noise term --
+  // a real RNG would make the test non-reproducible).
+  {
+    Box box;
+    box.is = 1;
+    box.ie = 12;
+    box.js = 1;
+    box.je = 12;
+    box.nk = 3;
+    TransportBounds b = interior_bounds(box, 13, 13);
+    b.sw_corner = b.se_corner = b.ne_corner = b.nw_corner = 1;
+    Inputs in = make_inputs(box, b);
+    set_fixture_x(in, 0, fv_real(0.42), [](int64_t i) {
+      return 250.0 + 5.0 * std::sin(0.2 * i) + 0.01 * std::sin(12.9898 * i);
+    });
+    ok &= check_against_reference("L3 c512_like_slice", in,
+                                  ScalarTransportOptions{8, 0, 0, 0, fv_real(0),
+                                                          fv_real(0)});
+  }
+
+  // L4 -- hord=8 is genuinely dispatched (not silently falling back to the
+  // mord==6 kernel or a CPU path): fx must actually change vs. hord=6 on the
+  // same interior fixture, mirroring Part B's "seam is live" check.
+  {
+    Box box;
+    box.is = 9;
+    box.ie = 20;
+    box.js = 9;
+    box.je = 20;
+    box.nk = 4;
+    TransportBounds b = interior_bounds(box, 33, 33);
+    Inputs in = make_inputs(box, b);
+    GpuRun g6 = run_gpu(in, ScalarTransportOptions{6, 0, 0, 0, fv_real(0), fv_real(0)});
+    GpuRun g8 = run_gpu(in, ScalarTransportOptions{8, 0, 0, 0, fv_real(0), fv_real(0)});
+    ok &= (g6.status == FV3_GPU_SUCCESS) && (g8.status == FV3_GPU_SUCCESS);
+    const size_t nd = count_diff(g6.fx, g8.fx, box.is, box.ie + 1, box.js, box.je, box.nk);
+    if (nd == 0) {
+      printf("    %-28s FAIL (hord=8 fx identical to hord=6 -- not dispatched?)\n",
+             "L4 hord8 is live");
+      ok = false;
+    } else {
+      printf("    %-28s ok   (%zu of %zu fx cells differ from hord=6)\n", "L4 hord8 is live",
+             nd, (size_t)(box.ie + 2 - box.is) * (box.je + 1 - box.js) * box.nk);
+    }
+  }
+
+  return ok;
+}
+
 // ---------------------------------------------------------------------------
 
 int main() {
@@ -1582,7 +1986,7 @@ int main() {
     bool (*fn)();
   } parts[] = {{"A", part_a}, {"B", part_b}, {"C", part_c}, {"D", part_d}, {"E", part_e},
                {"F", part_f}, {"G", part_g}, {"H", part_h}, {"I", part_i}, {"J", part_j},
-               {"K", part_k}};
+               {"K", part_k}, {"L", part_l}};
 
   int failed = 0;
   std::string failed_names;

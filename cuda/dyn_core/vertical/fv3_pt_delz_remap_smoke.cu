@@ -228,9 +228,15 @@ int main() {
     CUDA_CHECK(cudaMemcpy(d_delz, delz_h.data(), km * sizeof(fv_real),
                           cudaMemcpyHostToDevice));
 
+    // Prompt 55: pe/peln are now accessed as .at(i,k,j) (2nd positional arg
+    // = k), matching their real (i,k,j) registry axis order -- see
+    // fv3_pt_delz_remap.cu's read-loop comment. This single-column view's
+    // stride-1 ("the k axis") slot must therefore sit at s1, not s2, or
+    // every k>0 access silently collapses to offset 0 (i=j=0 always here,
+    // so s0/s2 staying 0 is harmless; only which slot equals 1 matters).
     PtDelzRemapArgs a{};
-    a.pe = RiemViewC3{d_pe, 0, 0, 0, 0, 0, 1};
-    a.peln = RiemViewC3{d_peln, 0, 0, 0, 0, 0, 1};
+    a.pe = RiemViewC3{d_pe, 0, 0, 0, 0, 1, 0};
+    a.peln = RiemViewC3{d_peln, 0, 0, 0, 0, 1, 0};
     a.pt = RiemViewC3{d_pt, 0, 0, 0, 0, 0, 1};
     a.delz = RiemViewC3{d_delz, 0, 0, 0, 0, 0, 1};
     a.delp = RiemViewC3{d_delp, 0, 0, 0, 0, 0, 1};

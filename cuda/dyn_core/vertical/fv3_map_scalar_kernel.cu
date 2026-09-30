@@ -45,7 +45,8 @@ __global__ void map_scalar_smoke_kernel(const double *pe1, const double *dpe1,
                                          const double *pe2, const double *dpe2,
                                          const double *q1, double *q2, int km,
                                          int kn, int iv, double qmin,
-                                         int ncols) {
+                                         int ncols, bool gmao_bot,
+                                         bool gmao_top) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= ncols) return;
   if (km > kMaxLevels || kn > kMaxLevels) return; // launcher-level reject below
@@ -63,13 +64,14 @@ __global__ void map_scalar_smoke_kernel(const double *pe1, const double *dpe1,
 
   fv3::gpu::vertical::map_scalar_column<double>(
       pe1_c, dpe1_c, pe2_c, dpe2_c, q1_c, q2_c, c2, c3, c4, gam, q, extm, km,
-      kn, iv, qmin);
+      kn, iv, qmin, gmao_bot, gmao_top);
 }
 
 struct Fixture {
   std::string name;
   int km = 0, kn = 0, iv = 0, kord = 0;
   double q_min = 0.0;
+  bool gmao_bot = false, gmao_top = false; // Prompt 61: GMAO boundary flags
   std::vector<double> pe1, pe2, q1, q2_fortran;
 };
 
@@ -96,6 +98,18 @@ bool load_fixture(const std::string &path, Fixture &f) {
     }
     if (line.rfind("# q_min=", 0) == 0) {
       f.q_min = std::atof(line.substr(line.find('=') + 1).c_str());
+      continue;
+    }
+    if (line.rfind("# gmao_bot=", 0) == 0) {
+      std::istringstream iss(line.substr(1));
+      std::string tok;
+      while (iss >> tok) {
+        auto eq = tok.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = tok.substr(0, eq), val = tok.substr(eq + 1);
+        if (key == "gmao_bot") f.gmao_bot = std::atoi(val.c_str()) != 0;
+        else if (key == "gmao_top") f.gmao_top = std::atoi(val.c_str()) != 0;
+      }
       continue;
     }
     if (line.rfind("# k  pe1", 0) == 0) { section = 1; continue; }
@@ -132,6 +146,11 @@ int main() {
       "case3_local_extrema.txt",          "case4_near_uniform.txt",
       "case5_variable_layer_thickness.txt", "case6_limiter_activating.txt",
       "case7_realistic_c512_profile.txt", "case8_positive_definite_iv0.txt",
+      "case9_gmao_boundary_conditions.txt",
+      // Prompt 71 Stage 2: iv=-1 (winds, REMAP_UV) boundary-clamp coverage.
+      "case10_wind_uniform_sign_iv_neg1.txt", "case11_wind_top_sign_reversal.txt",
+      "case12_wind_bottom_sign_reversal.txt",
+      "case13_wind_interior_sign_reversal.txt",
   };
 
   bool all_ok = true;
@@ -166,7 +185,8 @@ int main() {
     cudaMemcpy(d_q1, f.q1.data(), f.q1.size() * sizeof(double), cudaMemcpyHostToDevice);
 
     map_scalar_smoke_kernel<<<1, 1>>>(d_pe1, d_dpe1, d_pe2, d_dpe2, d_q1, d_q2,
-                                       f.km, f.kn, f.iv, f.q_min, 1);
+                                       f.km, f.kn, f.iv, f.q_min, 1,
+                                       f.gmao_bot, f.gmao_top);
     if (!check_cuda(cudaGetLastError(), "kernel launch") ||
         !check_cuda(cudaDeviceSynchronize(), "kernel sync"))
       return 1;
@@ -240,7 +260,8 @@ int main() {
     auto t0 = std::chrono::steady_clock::now();
     map_scalar_smoke_kernel<<<blocks, threads>>>(d_pe1, d_dpe1, d_pe2, d_dpe2,
                                                   d_q1, d_q2, f.km, f.kn, f.iv,
-                                                  f.q_min, ncols);
+                                                  f.q_min, ncols, f.gmao_bot,
+                                                  f.gmao_top);
     cudaDeviceSynchronize();
     auto t1 = std::chrono::steady_clock::now();
     const double gpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();

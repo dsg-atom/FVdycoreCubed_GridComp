@@ -108,10 +108,41 @@ if(FV3_DYN_CORE_ENABLE_CUDA)
   # gmao_remap=0, kord=9, nwat=0). Reuses map_scalar_column (Prompt 52B) and
   # the RiemCViewC3/RiemViewC3 view adapters (fv3_riem_solver_c.cuh) rather
   # than duplicating either.
+  # Prompt 71 adds vertical/fv3_remap_uv.cu: fv_mapz_mod's production u/v
+  # vertical-remap entry (Lagrangian_to_Eulerian, timer 'Remap_UV', iv=-1,
+  # kord=kord_mt=9). Reuses map_scalar_column (Prompt 52B, extended with
+  # iv=-1 branches this prompt) and the RiemViewC3/PtDelzView1 view adapters
+  # rather than duplicating either.
+  # Prompt 85 adds vertical/fv3_remap_q.cu: fv_mapz_mod's production tracer
+  # vertical-remap entry (mapn_tracer, nq=1, timer 'Remap_Q', iv=0,
+  # kord=kord_tr=8). Reuses map_scalar_column (Prompt 85, extended with the
+  # missing abs(kord)<9 branch) and the RiemViewC3/PtDelzView1 view adapters;
+  # q itself has no FieldRegistry identity (unlike pt_delz_remap/remap_uv's
+  # fields) so it is threaded through via a dedicated device buffer, not a
+  # field-registry view -- see fv3_remap_q.cuh's header comment.
+  # Prompt 92 adds vertical/fv3_remap_pressurevars.cu: fv_mapz_mod's
+  # production pressure-variable vertical-remap entry (Lagrangian_to_
+  # Eulerian, timer 'Remap_PressureVars'). A direct closed-form recompute
+  # (pe2/pn2/pk2 from ak/bk/pe(surface), then delp/cappa/pkz) -- does NOT
+  # call map_scalar_column/scalar_profile_column, unlike pt_delz_remap/
+  # remap_uv/remap_q above. q(sphum)/cappa have no FieldRegistry identity
+  # (like remap_q's q) so they are threaded through via dedicated device
+  # buffers -- see fv3_remap_pressurevars.cuh's header comment.
+  # Prompt 99 adds vertical/fv3_state_to_fv.cu: FV_StateMod.F90's production
+  # State_To_FV Phase A (u/v copy-in) and Phase C (w/pe/peln/pk/delp/pt/
+  # delz/pkz local compute) halves; Phase B (mpp_get_boundary) stays host-
+  # only per this file's own header comment. STATE%VARS%* has no
+  # FieldRegistry identity (like remap_q's q / remap_pressurevars's
+  # q(sphum)/cappa) so it is threaded through via dedicated device buffers
+  # -- see fv3_state_to_fv.cuh's header comment.
   add_library(fv3_wp_c_vertical STATIC
     vertical/fv3_vertical_kernels.cu
     vertical/fv3_riem_solver_c.cu
     vertical/fv3_pt_delz_remap.cu
+    vertical/fv3_remap_uv.cu
+    vertical/fv3_remap_q.cu
+    vertical/fv3_remap_pressurevars.cu
+    vertical/fv3_state_to_fv.cu
   )
   target_include_directories(fv3_wp_c_vertical PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -131,6 +162,62 @@ if(FV3_DYN_CORE_ENABLE_CUDA)
     fv3_wp_a_cgrid
     CUDA::cudart)
   set_target_properties(fv3_wp_c_vertical PROPERTIES CUDA_STANDARD 17)
+
+  # Prompt 64 Stage 7: disable FMA (fused-multiply-add) contraction for
+  # fv3_pt_delz_remap.cu ONLY (not fv3_riem_solver_c.cu / fv3_vertical_
+  # kernels.cu, which also live in this library but are untouched -- no
+  # Riemann-solver arithmetic changes). Root cause (Stages 0-6): nvcc's
+  # default FMA contraction in map_scalar_column/scalar_profile_column's
+  # (and the closing pe/peln/pk/delp update's) a*b+c expressions rounds
+  # differently than Fortran/ifort's -no-fma map_scalar. Diagnostic twin
+  # build (whole-library -fmad=false, fv3_wp_c_pt_delz_remap_gpu_smoke vs.
+  # a temporary nofma variant) proved this exactly: pt/delz/delp/dpeO went
+  # from round-off (~1e-15/1e-16 rel) to bitwise (0.0) across all 6
+  # fixtures, including case6_realistic_c512, with zero algorithm change.
+  # pkz keeps a separate, much smaller (~1e-16, 1-2 ULP) residual in 2/6
+  # cases -- a distinct, unrelated intrinsic-evaluation difference, not
+  # FMA contraction (this flag does not and should not eliminate it).
+  set_source_files_properties(vertical/fv3_pt_delz_remap.cu PROPERTIES
+    COMPILE_OPTIONS "-fmad=false")
+
+  # Prompt 71: fv3_remap_uv.cu calls the IDENTICAL map_scalar_column/
+  # scalar_profile_column arithmetic path as fv3_pt_delz_remap.cu (same
+  # a*b+c expressions the Prompt-64 diagnostic above traced the round-off
+  # to), so the same -fmad=false scoping is applied here proactively ahead
+  # of Stage 8's bitwise C32 A/B, rather than re-deriving the identical
+  # root cause a second time. Not yet independently re-confirmed with its
+  # own twin-build diagnostic against REMAP_UV's own fixtures -- if Stage 8
+  # still shows non-round-off residuals, revisit this assumption rather
+  # than assuming the flag alone suffices.
+  set_source_files_properties(vertical/fv3_remap_uv.cu PROPERTIES
+    COMPILE_OPTIONS "-fmad=false")
+
+  # Prompt 85: fv3_remap_q.cu calls the IDENTICAL map_scalar_column/
+  # scalar_profile_column arithmetic path as fv3_pt_delz_remap.cu/
+  # fv3_remap_uv.cu (same a*b+c expressions the Prompt-64 diagnostic traced
+  # the round-off to), so the same -fmad=false scoping is applied here
+  # proactively ahead of Stage 7's bitwise fixture comparison, rather than
+  # re-deriving the identical root cause a third time.
+  set_source_files_properties(vertical/fv3_remap_q.cu PROPERTIES
+    COMPILE_OPTIONS "-fmad=false")
+
+  # Prompt 92: fv3_remap_pressurevars.cu does not call map_scalar_column,
+  # but it has the same a*b+c FMA-contraction-prone shape the Prompt-64
+  # diagnostic traced the round-off to (pe2 = ak + bk*pe_old_km; cappa's
+  # rdgas/(rdgas + cv_air/(1+r_vir*q)); pkz's exp(cappa*log(...))), so the
+  # same -fmad=false scoping is applied here proactively ahead of Stage 8's
+  # bitwise/round-off fixture classification, rather than re-deriving the
+  # identical root cause a fourth time.
+  set_source_files_properties(vertical/fv3_remap_pressurevars.cu PROPERTIES
+    COMPILE_OPTIONS "-fmad=false")
+
+  # Prompt 99: fv3_state_to_fv.cu's Phase C peln=log(pe)/pk=exp(akap*peln)
+  # pair has the same FMA-contraction-prone shape (exp(cappa*log(...))) as
+  # fv3_remap_pressurevars.cu's pkz, so the same -fmad=false scoping is
+  # applied here proactively ahead of Stage 9's fixture classification,
+  # rather than re-deriving the identical root cause a fifth time.
+  set_source_files_properties(vertical/fv3_state_to_fv.cu PROPERTIES
+    COMPILE_OPTIONS "-fmad=false")
 
   # WP-D operators CUDA sources
   add_library(fv3_wp_d_cuda STATIC operators/wp_d_cuda.cu operators/wp_d_contract_cuda.cpp)
@@ -154,7 +241,8 @@ if(FV3_DYN_CORE_ENABLE_CUDA)
     dgrid/wp_b_divergence_cuda.cu
     dgrid/wp_b_dsw_cuda.cu
     dgrid/wp_b_contract_cuda.cpp
-    dgrid/wp_b_dsw_contract_cuda.cpp)
+    dgrid/wp_b_dsw_contract_cuda.cpp
+    dgrid/fv3_tracer_transport_bridge.cu)
   target_include_directories(fv3_wp_b_cuda PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/dgrid
@@ -297,6 +385,113 @@ if(BUILD_TESTING)
     FV3_MAP_SCALAR_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../tests/fortran_baseline/fv_mapz/fixtures")
   add_test(NAME fv3_wp_c_map_scalar COMMAND fv3_wp_c_map_scalar_test)
 
+  # WP-C fv_mapz REMAP_Q (mapn_tracer, nq=1) host-path regression test
+  # (Prompt 85, Stages 1/7): reuses map_scalar_column directly with
+  # iv=0/kord=8/gmao_bot=gmao_top=false against the Prompt 84B tracer
+  # fixtures (case14-22; case23 is nq=3, out of scope). Same fixture dir as
+  # fv3_wp_c_map_scalar_test above.
+  add_executable(fv3_wp_c_remap_q_tracer_test tests/vertical/test_remap_q_tracer.cpp)
+  target_include_directories(fv3_wp_c_remap_q_tracer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vertical)
+  target_link_libraries(fv3_wp_c_remap_q_tracer_test PRIVATE fv3_dyn_core_gpu)
+  target_compile_definitions(fv3_wp_c_remap_q_tracer_test PRIVATE
+    FV3_MAP_SCALAR_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../tests/fortran_baseline/fv_mapz/fixtures")
+  add_test(NAME fv3_wp_c_remap_q_tracer COMMAND fv3_wp_c_remap_q_tracer_test)
+
+  # WP-C fv_mapz REMAP_Q nq=2 scope-proof test (Prompt 86A, Stage 8):
+  # host-only (no CUDA), synthetic production-shaped sphum-like (kord=8) +
+  # cld_amt-like (kord=9) profiles on a shared pe1/pe2 grid, checking mass
+  # conservation and positivity via the existing map_scalar_column path.
+  # Documentation-only investigation task -- see
+  # docs/performance/p86a_remap_q_nq2_scope_2026-09-25.md.
+  add_executable(fv3_wp_c_remap_q_nq2_scope_test tests/vertical/test_remap_q_nq2_scope.cpp)
+  target_include_directories(fv3_wp_c_remap_q_nq2_scope_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vertical)
+  target_link_libraries(fv3_wp_c_remap_q_nq2_scope_test PRIVATE fv3_dyn_core_gpu)
+  add_test(NAME fv3_wp_c_remap_q_nq2_scope COMMAND fv3_wp_c_remap_q_nq2_scope_test)
+
+  # WP-C fv_mapz REMAP_Q fill=true golden-reference test (Prompt 88A, Stage
+  # 6): host-only (no CUDA, no project headers -- a standalone mechanical
+  # port of the authoritative fv_fill.F90 fillz), covering fill-branch
+  # activation, no-op-on-positive-q, near-minimum q, top/interior/bottom
+  # borrow boundary behavior, the final non-local normalize-and-clip path
+  # (both its success and its documented sum0<=0 inertness), and a batched
+  # nq=2 call confirming fillz is applied identically/independently per
+  # tracer. See docs/performance/p88a_remap_q_fill_semantics_2026-09-25.md.
+  add_executable(fv3_wp_c_fillz_host_reference_test tests/vertical/test_fillz_host_reference.cpp)
+  add_test(NAME fv3_wp_c_fillz_host_reference COMMAND fv3_wp_c_fillz_host_reference_test)
+
+  # WP-C REMAP_Q fill=true CUDA device-helper vs. host-oracle bitwise
+  # comparison (Prompt 88B, Stage 5): host-compiled instantiation of the new
+  # __host__ __device__ fillz_column<T> (fv3_fillz_column.hpp) against
+  # fillz_host()'s Prompt 88A oracle, same 9 fixtures (case 8 split into two
+  # single-tracer sub-cases to match fillz_column<T>'s single-tracer
+  # signature). No project headers/CUDA runtime required -- host-only.
+  add_executable(fv3_wp_c_fillz_cuda_vs_host_test tests/vertical/test_fillz_cuda_vs_host.cpp)
+  add_test(NAME fv3_wp_c_fillz_cuda_vs_host COMMAND fv3_wp_c_fillz_cuda_vs_host_test)
+
+  # WP-C REMAP_PRESSUREVARS host-only golden-reference harness (Prompt 91,
+  # Stage 10/13): mechanical transcription of fv_mapz.F90:1239-1516's
+  # production-active branches only (hydrostatic=.false., remap_t=.true.,
+  # MOIST_CAPPA nwat=0 case-default, do_omega=.false.). Test-only
+  # transcription (Option C) because Remap_PressureVars is inline code
+  # inside Lagrangian_to_Eulerian, not a standalone callable routine. No
+  # CUDA source added/modified; host-only, same pattern as
+  # fv3_wp_c_fillz_host_reference_test above. See
+  # docs/performance/p91_remap_pressurevars_cuda_port_plan_2026-09-27.md.
+  add_executable(fv3_wp_c_remap_pressurevars_host_reference_test
+    tests/vertical/test_remap_pressurevars_host_reference.cpp)
+  add_test(NAME fv3_wp_c_remap_pressurevars_host_reference
+    COMMAND fv3_wp_c_remap_pressurevars_host_reference_test)
+
+  # WP-C REMAP_TOTALENERGYCON host-only golden-reference harness (Prompt 95,
+  # Stage 11/13/15): mechanical transcription of fv_mapz.F90:1612-1864's
+  # production-active branches only (hydrostatic=.false.,
+  # consv_te>consv_min, nwat=0 MOIST_CAPPA case-default, adiabatic=.true.
+  # post-reduction correction). Test-only transcription (Option C), same
+  # convention as fv3_wp_c_remap_pressurevars_host_reference_test above --
+  # Remap_TotalEnergyConsv is inline code inside Lagrangian_to_Eulerian, not
+  # a standalone callable routine. No CUDA source added/modified; host-only.
+  # Deliberately excludes the two mpp_global_sum reduction calls themselves
+  # (measured to dominate the timer, see the doc below) -- covers only the
+  # pre-reduction per-column compute (Unit A), the post-reduction global-
+  # scalar bridge formula, and the post-reduction per-point pt correction
+  # (Unit B). See
+  # docs/performance/p95_remap_totalenergycon_cuda_port_plan_2026-09-28.md.
+  add_executable(fv3_wp_c_remap_totalenergycon_host_reference_test
+    tests/vertical/test_remap_totalenergycon_host_reference.cpp)
+  add_test(NAME fv3_wp_c_remap_totalenergycon_host_reference
+    COMMAND fv3_wp_c_remap_totalenergycon_host_reference_test)
+
+  # WP-E/WP-C FV_To_State host-only golden-reference harness (Prompt 97,
+  # Stage 11/13): mechanical transcription of FV_StateMod.F90:2704-2780's
+  # production-active branches only (hydrostatic=.false., SW_DYNAMICS=
+  # .false.), including the inlined fv_getPKZ(pkz,pe) dry-akap formula
+  # (FV_StateMod.F90:3078-3108). Test-only transcription (Option C) because
+  # a direct call (Option A) requires a live MAPL_MetaComp/T_FVDYCORE_STATE
+  # environment; no MAPL infrastructure is tested here. No CUDA source
+  # added/modified -- host-only, same pattern as
+  # fv3_wp_c_remap_pressurevars_host_reference_test above. See
+  # docs/performance/p97_fv_to_state_cuda_port_plan_2026-09-28.md.
+  add_executable(fv3_wp_c_fv_to_state_host_reference_test
+    tests/host/test_fv_to_state_host_reference.cpp)
+  add_test(NAME fv3_wp_c_fv_to_state_host_reference
+    COMMAND fv3_wp_c_fv_to_state_host_reference_test)
+
+  # WP-E/WP-C State_To_FV host-only golden-reference harness (Prompt 98,
+  # Stage 13/14): mechanical transcription of FV_StateMod.F90:2519-2702's
+  # production-active branches only (grid_type=0 interior-only scope,
+  # hydrostatic=.false., SW_DYNAMICS=.false.), including the derived
+  # peln/pk/ps/delp fields. Test-only transcription (Option C), same
+  # rationale as fv3_wp_c_fv_to_state_host_reference_test above -- a direct
+  # call (Option A) requires a live MAPL_MetaComp/T_FVDYCORE_STATE
+  # environment; no MAPL infrastructure is tested here. mpp_get_boundary
+  # (Category D communication) is out of scope -- only the interior U/V
+  # copy is transcribed. No CUDA source added/modified -- host-only. See
+  # docs/performance/p98_state_to_fv_cuda_port_plan_2026-09-28.md.
+  add_executable(fv3_wp_c_state_to_fv_host_reference_test
+    tests/host/test_state_to_fv_host_reference.cpp)
+  add_test(NAME fv3_wp_c_state_to_fv_host_reference
+    COMMAND fv3_wp_c_state_to_fv_host_reference_test)
+
   # WP-C fv_mapz GPU smoke test (Prompt 52B, Stage 15): the same
   # map_scalar_column/scalar_profile_column device functions launched from a
   # real __global__ kernel on a real GPU. GPU-execution + bitwise sanity
@@ -333,6 +528,140 @@ if(BUILD_TESTING)
   target_link_libraries(fv3_wp_c_pt_delz_remap_gpu_smoke PRIVATE fv3_dyn_core_gpu fv3_wp_c_vertical)
   target_compile_definitions(fv3_wp_c_pt_delz_remap_gpu_smoke PRIVATE
     FV3_PT_DELZ_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../tests/fortran_baseline/fv_mapz/pt_delz_fixtures")
+
+  # WP-C fv_mapz pt/delz PRODUCTION-SHAPE GPU smoke test (Prompt 55, Stage 8):
+  # unlike the single-column test above, this builds multi-dimensional
+  # RiemViewC3 views with the SAME lower/stride layout the real
+  # fv3_gpu_field_registry.F90 registration produces for a C32-shaped tile
+  # (pe/peln with a 1-cell halo and (i,k,j) physical axis order; pt/delz/delp
+  # with the real 3-cell halo; pk/pkz with no halo), then launches the real
+  # 2D-grid kernel -- exactly the launch shape that triggered the Prompt 54
+  # out-of-bounds finding. GPU-execution + tolerance-comparison check only;
+  # not registered as a ctest (requires an actual GPU) -- run manually via
+  # srun, ideally under compute-sanitizer memcheck.
+  add_executable(fv3_wp_c_pt_delz_remap_prod_shape_smoke vertical/fv3_pt_delz_remap_prod_shape_smoke.cu)
+  target_include_directories(fv3_wp_c_pt_delz_remap_prod_shape_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/vertical ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(fv3_wp_c_pt_delz_remap_prod_shape_smoke PRIVATE fv3_dyn_core_gpu fv3_wp_c_vertical)
+  target_compile_definitions(fv3_wp_c_pt_delz_remap_prod_shape_smoke PRIVATE
+    FV3_PT_DELZ_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../tests/fortran_baseline/fv_mapz/pt_delz_fixtures")
+
+  # WP-C fv_mapz REMAP_UV PRODUCTION-SHAPE GPU smoke test (Prompt 71, Stage
+  # 7): same methodology as the PT/DELZ prod-shape smoke test above, but for
+  # launch_remap_uv -- multi-dimensional RiemViewC3 views matching the real
+  # fv3_gpu_field_registry.F90 registration for pe/u/v at C32 shape, launched
+  # over the real union-bounding-box 2D grid. Correctness oracle: the Prompt
+  # 71 Stage 2 iv=-1 fixtures (case10-13), reproduced exactly at every column
+  # via a broadcast pe field plus an ak=pe2/bk=0 construction. Also exercises
+  # the device-workspace path (bitwise-vs-local-scratch cross-check). GPU-
+  # execution + tolerance-comparison check only; not registered as a ctest
+  # (requires an actual GPU) -- run manually via srun, ideally under
+  # compute-sanitizer memcheck.
+  add_executable(fv3_wp_c_remap_uv_prod_shape_smoke vertical/fv3_remap_uv_prod_shape_smoke.cu)
+  target_include_directories(fv3_wp_c_remap_uv_prod_shape_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/vertical ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(fv3_wp_c_remap_uv_prod_shape_smoke PRIVATE fv3_dyn_core_gpu fv3_wp_c_vertical)
+  target_compile_definitions(fv3_wp_c_remap_uv_prod_shape_smoke PRIVATE
+    FV3_MAP_SCALAR_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../tests/fortran_baseline/fv_mapz/fixtures")
+
+  # WP-C fv_mapz REMAP_Q PRODUCTION-SHAPE GPU smoke test (Prompt 85, Stage
+  # 9): same methodology as the REMAP_UV prod-shape smoke test above, but for
+  # launch_remap_q -- pe/ak/bk views matching the real
+  # fv3_gpu_field_registry.F90 registration for pe at C32 shape, plus a
+  # dedicated device buffer for q (which has no FieldRegistry view of its
+  # own), launched over the plain interior is:ie x js:je grid. Correctness
+  # oracle: the Prompt 84B mapn_tracer fixtures (case14-22), reproduced
+  # exactly at every column via a broadcast pe field plus an ak=pe2/bk=0
+  # construction. Also exercises the device-workspace path (bitwise-vs-
+  # local-scratch cross-check). GPU-execution + tolerance-comparison check
+  # only; not registered as a ctest (requires an actual GPU) -- run manually
+  # via srun, ideally under compute-sanitizer memcheck.
+  add_executable(fv3_wp_c_remap_q_prod_shape_smoke vertical/fv3_remap_q_prod_shape_smoke.cu)
+  target_include_directories(fv3_wp_c_remap_q_prod_shape_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/vertical ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(fv3_wp_c_remap_q_prod_shape_smoke PRIVATE fv3_dyn_core_gpu fv3_wp_c_vertical)
+  target_compile_definitions(fv3_wp_c_remap_q_prod_shape_smoke PRIVATE
+    FV3_MAP_SCALAR_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../tests/fortran_baseline/fv_mapz/fixtures")
+
+  # WP-C fv_mapz REMAP_Q nq=2 production-SHAPE GPU smoke test (Prompt 86B,
+  # Stage 7; kord corrected by Prompt 87): extends the nq=1 smoke test
+  # above to the real production nq=2 schedule (sphum kord=9, cld_amt
+  # kord=9) via two sequential
+  # launch_remap_q calls sharing one H2D/D2H over a contiguous 2-tracer-
+  # plane buffer -- exactly launch_remap_q_ctx's Stage 4 mechanism.
+  # Correctness oracle: test_remap_q_nq2_scope.cpp's synthetic sphum-like/
+  # cld_amt-like profiles via the same host map_scalar_column path. GPU-
+  # execution + tolerance-comparison check only; not registered as a ctest
+  # (requires an actual GPU) -- run manually via srun, ideally under
+  # compute-sanitizer memcheck.
+  add_executable(fv3_wp_c_remap_q_nq2_prod_shape_smoke vertical/fv3_remap_q_nq2_prod_shape_smoke.cu)
+  target_include_directories(fv3_wp_c_remap_q_nq2_prod_shape_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/vertical ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(fv3_wp_c_remap_q_nq2_prod_shape_smoke PRIVATE fv3_dyn_core_gpu fv3_wp_c_vertical)
+
+  # WP-C fv_mapz REMAP_PRESSUREVARS PRODUCTION-SHAPE GPU smoke test (Prompt
+  # 92, Stage 3/8/9): same broadcast methodology as the REMAP_UV/REMAP_Q
+  # prod-shape smoke tests above, but for launch_remap_pressurevars --
+  # hand-built RiemViewC3/PtDelzView1/PressureVarsPlaneView views over a
+  # 3-cell-halo C32-ish tile, launched over the plain interior is:ie x
+  # js:je grid spanning multiple thread blocks. Correctness oracle: the
+  # exact 10 fixtures from test_remap_pressurevars_host_reference.cpp
+  # (Prompt 91), duplicated into this file (no header-level export exists
+  # to share them from). GPU-execution + bitwise/round-off-tolerance
+  # comparison check only; not registered as a ctest (requires an actual
+  # GPU) -- run manually via srun, ideally under compute-sanitizer memcheck.
+  add_executable(fv3_wp_c_remap_pressurevars_prod_shape_smoke
+    vertical/fv3_remap_pressurevars_prod_shape_smoke.cu)
+  target_include_directories(fv3_wp_c_remap_pressurevars_prod_shape_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/vertical ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(fv3_wp_c_remap_pressurevars_prod_shape_smoke PRIVATE
+    fv3_dyn_core_gpu fv3_wp_c_vertical)
+
+  # WP-C/WP-E FV_StateMod.F90 State_To_FV PRODUCTION-SHAPE GPU smoke test
+  # (Prompt 99, Stage 9): same broadcast/tile methodology as the
+  # REMAP_PRESSUREVARS prod-shape smoke test above, but for
+  # launch_state_to_fv_phase_a/_phase_c -- hand-built RiemViewC3/
+  # StateInputView/PsPackView views over a 3-cell-halo tile sized to match
+  # test_state_to_fv_host_reference.cpp's fixtures (ni=6, nj=5, npz=10)
+  # exactly. Correctness oracle: the exact 8 fixtures from that file
+  # (Prompt 98), duplicated into this file (no header-level export exists
+  # to share them from), including the mandatory
+  # sentinel_layout_transposition_check fixture. GPU-execution +
+  # bitwise/round-off-tolerance comparison check only; not registered as a
+  # ctest (requires an actual GPU) -- run manually via srun, ideally under
+  # compute-sanitizer memcheck.
+  add_executable(fv3_wp_c_state_to_fv_prod_shape_smoke
+    vertical/fv3_state_to_fv_prod_shape_smoke.cu)
+  target_include_directories(fv3_wp_c_state_to_fv_prod_shape_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/vertical ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(fv3_wp_c_state_to_fv_prod_shape_smoke PRIVATE
+    fv3_dyn_core_gpu fv3_wp_c_vertical)
+
+  # WP-C fv_fill_mod fillz dedicated device-kernel GPU smoke test (Prompt
+  # 88B, Stage 6): GPU-executes the exact fillz_column<T> template (already
+  # host-bitwise-validated by fv3_wp_c_fillz_cuda_vs_host) from a real
+  # __global__ kernel against Prompt 88A's 9 adversarial fixtures. See the
+  # file's own header comment for why fillz's corrective branches are
+  # exercised here rather than only through the full REMAP_Q pipeline. GPU-
+  # execution + bitwise-comparison check only; not registered as a ctest
+  # (requires an actual GPU) -- run manually via srun.
+  add_executable(fv3_wp_c_fillz_device_kernel_smoke vertical/fv3_fillz_device_kernel_smoke.cu)
+  target_include_directories(fv3_wp_c_fillz_device_kernel_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/vertical)
+
+  # WP-C fv_mapz REMAP_Q nq=2/kord=(9,9)/fill=TRUE production-SHAPE GPU
+  # smoke test (Prompt 88B, Stage 6): the fv3_wp_c_remap_q_nq2_prod_shape_
+  # smoke sibling above, with RemapQArgs::fill=true, compared against a
+  # host oracle running map_scalar_column then fillz_column (the real
+  # mapn_tracer -> fillz production sequence). GPU-execution + tolerance-
+  # comparison check only; not registered as a ctest (requires an actual
+  # GPU) -- run manually via srun, ideally under compute-sanitizer memcheck.
+  add_executable(fv3_wp_c_remap_q_nq2_fill_true_prod_shape_smoke
+    vertical/fv3_remap_q_nq2_fill_true_prod_shape_smoke.cu)
+  target_include_directories(fv3_wp_c_remap_q_nq2_fill_true_prod_shape_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/vertical ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(fv3_wp_c_remap_q_nq2_fill_true_prod_shape_smoke PRIVATE
+    fv3_dyn_core_gpu fv3_wp_c_vertical)
 
   # WP-D operators tests (CPU-visible formulas)
   add_executable(fv3_wp_d_operators_test tests/operators/test_wp_d.cpp)
@@ -557,7 +886,9 @@ if(BUILD_TESTING)
     # Parts A-K: interior order-6, panel-edge PPM, corner rotation, deln_flux
     # enabled/disabled, nord dependence, the (damp_c*da_min)**(nord+1)
     # coefficient law, mass weighting and hord<0 positivity, R8/R4 precision,
-    # and unsupported-configuration rejection.
+    # and unsupported-configuration rejection. Part L (Prompt 76): hord==8
+    # interior/seam/corner fv_tp_2d against a bitwise device-mirroring host
+    # reference.
     add_executable(fv3_wp_b2_scalar_transport_test
       tests/dgrid/test_wp_b2_scalar_transport_cuda.cpp)
     target_include_directories(fv3_wp_b2_scalar_transport_test PRIVATE
@@ -573,6 +904,57 @@ if(BUILD_TESTING)
     add_test(NAME fv3_wp_b2_scalar_transport
       COMMAND fv3_wp_b2_scalar_transport_test)
     set_tests_properties(fv3_wp_b2_scalar_transport PROPERTIES
+      LABELS "gpu"
+      SKIP_RETURN_CODE 77
+    )
+
+    # Prompt 76 hord==8 fv_tp_2d CUDA extension correctness test (requires CUDA
+    # and GPU). Kept as its own executable rather than folded into
+    # fv3_wp_b2_scalar_transport_test: it exercises a NEW dispatch branch
+    # (opt.hord == 8) against an INDEPENDENT host transcription of tp_core.F90's
+    # iord>=7/hord==8 xppm/yppm branch, cross-checked by construction against
+    # both the CUDA device functions and the separate Prompt-75 host harness
+    # (tests/host/test_fv_tp_2d_hord8_hostharness.cpp).
+    # Parts A-D: interior hord==8, x-direction panel edge, y-direction panel
+    # edge, all-four-corners C512-like field. Part E: confirms the hord==6
+    # dispatch path is not perturbed by the new hord==8 branch.
+    add_executable(fv3_wp_b2_hord8_transport_test
+      tests/dgrid/test_wp_b2_hord8_transport_cuda.cpp)
+    target_include_directories(fv3_wp_b2_hord8_transport_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+      ${CMAKE_CURRENT_SOURCE_DIR}/dgrid
+    )
+    target_link_libraries(fv3_wp_b2_hord8_transport_test PRIVATE
+      fv3_dyn_core_gpu
+      fv3_wp_b_cuda
+      CUDA::cudart
+    )
+    # This test requires a GPU to run - mark as needing GPU label
+    add_test(NAME fv3_wp_b2_hord8_transport
+      COMMAND fv3_wp_b2_hord8_transport_test)
+    set_tests_properties(fv3_wp_b2_hord8_transport PROPERTIES
+      LABELS "gpu"
+      SKIP_RETURN_CODE 77
+    )
+
+    # Prompt 76 Stage 1: dedicated pert_ppm(iv=1) device-helper unit test,
+    # independent of the hord==8 face-flux fixtures above. Five named
+    # cases (monotonic, local extremum, sign change, boundary, near-flat)
+    # compared bitwise against an independent host transcription of
+    # tp_core.F90:1238-1252 (iv/=0 branch).
+    add_executable(fv3_pert_ppm_iv1_test
+      tests/dgrid/test_pert_ppm_iv1_cuda.cu)
+    target_include_directories(fv3_pert_ppm_iv1_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+      ${CMAKE_CURRENT_SOURCE_DIR}/dgrid
+    )
+    target_link_libraries(fv3_pert_ppm_iv1_test PRIVATE
+      fv3_dyn_core_gpu
+      CUDA::cudart
+    )
+    add_test(NAME fv3_pert_ppm_iv1
+      COMMAND fv3_pert_ppm_iv1_test)
+    set_tests_properties(fv3_pert_ppm_iv1 PROPERTIES
       LABELS "gpu"
       SKIP_RETURN_CODE 77
     )

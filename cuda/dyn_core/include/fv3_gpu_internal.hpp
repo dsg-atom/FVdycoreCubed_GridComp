@@ -253,6 +253,88 @@ struct DispatchParams {
   int32_t acoustic_index=0, n_split=1, k_split=1, vertical_ms=1;
   int32_t diffusion_pass=0, diffusion_passes=0;
   uint8_t init_step=0, end_step=0, last_call=0, fp_out=0, remap_step=0;
+  /* Prompt 85: REMAP_Q (mapn_tracer, nq=1) is dispatched through the same
+   * NumericalDispatch::remap_q LaunchFn slot as pt_delz_remap/remap_uv
+   * (plain (const ExecutionContext&, fv3_gpu_error*) signature, no extra
+   * parameter), but unlike pe/ak/bk, the tracer array q has no FieldRegistry
+   * identity (see fv3_remap_q.cuh's header comment) -- so there is no
+   * x.fields->find(FieldId::q) for launch_remap_q_ctx to call. Instead,
+   * fv3_gpu_remap_q (fv3_gpu_runtime.cpp) stashes the module-owned persistent
+   * device q buffer pointer here, immediately before invoking
+   * dispatch.remap_q(x, e), and launch_remap_q_ctx reads it back out of
+   * x.dispatch_params. This is the SAME "additive tail field, does not move
+   * internal_contract_version" argument as every other member above --
+   * DispatchParams is an internal C++ contract, not a cross-ABI record.
+   * nullptr here (the value for every OTHER dispatch call, which never
+   * touches this field) makes launch_remap_q_ctx refuse with
+   * FV3_GPU_UNSUPPORTED_CONFIGURATION rather than dereference garbage. */
+  fv_real *remap_q_buffer=nullptr;
+  /* Prompt 86B/87: production REMAP_Q's real tracer count/kord schedule
+   * (nq=2: tracer 1 sphum kord=9, tracer 2 cld_amt kord=9 --
+   * fv_dynamics.F90:941-944 combined with FV_StateMod.F90:563's
+   * unconditional flagstruct%kord_tr=9 override; corrected by Prompt 87
+   * from the originally assumed kord=[8,9]), stashed alongside
+   * remap_q_buffer by the same
+   * caller (fv3_gpu_remap_q) for the same reason -- launch_remap_q_ctx has
+   * no other path to a Fortran-only value. remap_q_nq==0 (the value for
+   * every OTHER dispatch call) makes launch_remap_q_ctx refuse rather than
+   * assume a tracer count. Same additive-tail-field argument as
+   * remap_q_buffer above. */
+  int32_t remap_q_nq=0, remap_q_kord1=0, remap_q_kord2=0;
+  /* Prompt 88B: production REMAP_Q's flagstruct%fill (FV_StateMod.F90:568's
+   * unconditional override to .true., confirmed universal -- see
+   * docs/performance/p88a_remap_q_fill_semantics_2026-09-25.md), stashed
+   * alongside remap_q_nq/kord1/kord2 by the same caller (fv3_gpu_remap_q)
+   * for the same reason. Unlike remap_q_nq, 0 is a VALID value here (the
+   * fill=false no-op path must keep working), so launch_remap_q_ctx does
+   * not use this field's zero-ness as a "not set" sentinel -- it is only
+   * ever read once remap_q_nq/kord1/kord2 have already validated that this
+   * dispatch call actually populated the REMAP_Q fields. Same additive-
+   * tail-field argument as remap_q_buffer/remap_q_nq above. */
+  int32_t remap_q_fill=0;
+  /* Prompt 92. REMAP_PRESSUREVARS's two fields with no FieldRegistry
+   * identity here (q(sphum), cappa -- see vertical/fv3_remap_pressurevars.
+   * cuh's header comment for why: q has none at all, and cappa's own
+   * FieldId is bound Fortran-side to an unrelated constant shadow array,
+   * not the real Lagrangian_to_Eulerian-local cappa). Same pattern as
+   * remap_q_buffer above: fv3_gpu_remap_pressurevars (fv3_gpu_runtime.cpp)
+   * stashes these dedicated persistent device-buffer pointers plus their
+   * shared isd/jsd/nih/njh addressing bounds here immediately before
+   * invoking dispatch.remap_pressurevars(x, e); launch_remap_pressurevars_
+   * ctx has no other path to either buffer. nullptr (the value for every
+   * OTHER dispatch call) makes it refuse rather than dereference garbage.
+   * Same additive-tail-field argument as every member above. */
+  fv_real *remap_pressurevars_qsphum_buffer=nullptr;
+  fv_real *remap_pressurevars_cappa_buffer=nullptr;
+  int64_t remap_pressurevars_isd=0, remap_pressurevars_jsd=0;
+  int64_t remap_pressurevars_nih=0, remap_pressurevars_njh=0;
+  /* Prompt 99: FV_StateMod.F90's State_To_FV, Phase A (u/v tiny_number
+   * fill + interior copy, before mpp_get_boundary) and Phase C (w/pe/
+   * peln/pk/ps/delp/pt/delz/pkz, after mpp_get_boundary) --
+   * fv3::gpu::vertical::launch_state_to_fv_phase_a_ctx/_phase_c_ctx. Same
+   * "no FieldRegistry identity" pattern as remap_q_buffer/
+   * remap_pressurevars_*_buffer above: STATE%VARS%U/V/W/PT/PKZ/PE/DZ are
+   * MAPL State fields, not FV_Atm fields, so fv3_gpu_state_to_fv_phase_a/
+   * _c (fv3_gpu_runtime.cpp) stash these dedicated persistent device-
+   * buffer pointers here immediately before invoking
+   * dispatch.state_to_fv_phase_a/_c(x, e); the _ctx launchers have no
+   * other path to them. ps has no FieldRegistry identity either and no
+   * downstream device consumer (see fv3_state_to_fv.cuh's header
+   * comment), so Phase C packs it into state_to_fv_ps_buffer, a
+   * dedicated scratch output the caller D2H's directly to the host `ps`
+   * pointer -- same convention as remap_pressurevars_cappa_buffer's D2H.
+   * nullptr (the value for every OTHER dispatch call) makes the _ctx
+   * launchers refuse with FV3_GPU_UNSUPPORTED_CONFIGURATION rather than
+   * dereference garbage. Same additive-tail-field argument as every
+   * member above. */
+  fv_real *state_to_fv_u_buffer=nullptr;
+  fv_real *state_to_fv_v_buffer=nullptr;
+  fv_real *state_to_fv_w_buffer=nullptr;
+  fv_real *state_to_fv_pe_buffer=nullptr;
+  fv_real *state_to_fv_pt_buffer=nullptr;
+  fv_real *state_to_fv_pkz_buffer=nullptr;
+  fv_real *state_to_fv_dz_buffer=nullptr;
+  fv_real *state_to_fv_ps_buffer=nullptr;
 };
 
 enum class WorkspaceId : uint8_t { cgrid, transport, vertical, operators, count };
@@ -425,6 +507,60 @@ struct NumericalDispatch {
    * makes fv3_gpu_pt_delz_remap refuse with FV3_GPU_UNSUPPORTED_CONFIGURATION
    * rather than affecting the acoustic loop at all. */
   LaunchFn pt_delz_remap=nullptr;
+  /* Prompt 71: fv_mapz_mod's production u/v vertical remap
+   * (fv3::gpu::vertical::launch_remap_uv_ctx). Same rationale/shape as
+   * pt_delz_remap immediately above: runs once per dyn_core call at
+   * fv_mapz.F90's Lagrangian_to_Eulerian call site (timer 'Remap_UV'),
+   * AFTER pt_delz_remap on the same compute stream (this stage reads pe
+   * only after PT/DELZ's own closing update has finished it -- see
+   * fv3_remap_uv.cu's own header comment), outside the acoustic-substep
+   * walk, and installed in this table purely so fv3_gpu_remap_uv
+   * (fv3_gpu_runtime.cpp) can reach it without the fv3_wp_c_vertical link
+   * cycle. Additive tail slot; null simply makes fv3_gpu_remap_uv refuse
+   * with FV3_GPU_UNSUPPORTED_CONFIGURATION. */
+  LaunchFn remap_uv=nullptr;
+  /* Prompt 85: fv_mapz_mod's production tracer vertical remap (REMAP_Q,
+   * mapn_tracer with nq=1) -- fv3::gpu::vertical::launch_remap_q_ctx. Same
+   * rationale/shape as pt_delz_remap/remap_uv above: runs once per
+   * dyn_core call at fv_mapz.F90's Lagrangian_to_Eulerian call site (timer
+   * 'Remap_Q'), reusing the SAME already-resident pe/ak/bk field-registry
+   * views pt_delz_remap/remap_uv use -- no extra transfer for those. Unlike
+   * pt_delz_remap/remap_uv, this stage's own field (q) is NOT in the
+   * FieldRegistry (see fv3_remap_q.cuh); the device buffer holding it is
+   * threaded through via DispatchParams::remap_q_buffer, not through
+   * x.fields, so this slot's LaunchFn signature stays identical to every
+   * other slot. Additive tail slot; null simply makes fv3_gpu_remap_q
+   * refuse with FV3_GPU_UNSUPPORTED_CONFIGURATION. */
+  LaunchFn remap_q=nullptr;
+  /* Prompt 92: fv_mapz_mod's production pressure-variable vertical remap
+   * (REMAP_PRESSUREVARS: pe/peln/pk/delp recompute + remap_t/MOIST_CAPPA
+   * cappa/pkz) -- fv3::gpu::vertical::launch_remap_pressurevars_ctx. Same
+   * rationale/shape as pt_delz_remap/remap_uv/remap_q above: runs once per
+   * dyn_core call at fv_mapz.F90's Lagrangian_to_Eulerian call site (timer
+   * 'Remap_PressureVars'), reusing the SAME already-resident pe/peln/pk/pt/
+   * delz/ak/bk field-registry views the other vertical remap stages use.
+   * Like remap_q, this stage's two fields with no FieldRegistry identity
+   * here (q(sphum), cappa) are threaded through via DispatchParams::
+   * remap_pressurevars_qsphum_buffer/remap_pressurevars_cappa_buffer, not
+   * through x.fields. Additive tail slot; null simply makes
+   * fv3_gpu_remap_pressurevars refuse with
+   * FV3_GPU_UNSUPPORTED_CONFIGURATION. */
+  LaunchFn remap_pressurevars=nullptr;
+  /* Prompt 99: FV_StateMod.F90's State_To_FV, split at its one
+   * mpp_get_boundary call into Phase A (before) and Phase C (after) --
+   * fv3::gpu::vertical::launch_state_to_fv_phase_a_ctx/_ctx for Phase C.
+   * Same rationale/shape as remap_q/remap_pressurevars above: runs once
+   * per k_split sub-iteration, immediately before fv_dynamics(), NOT
+   * inside fv3_gpu_dyn_core_step's per-substep walk. Two slots (not one)
+   * because Phase B (the real mpp_get_boundary call) is host-only and
+   * unchanged -- see fv3_state_to_fv.cuh's header comment -- so the
+   * caller (fv3_gpu_state_to_fv_phase_a, then fv3_gpu_state_to_fv_phase_c,
+   * fv3_gpu_runtime.cpp) must return to Fortran between them rather than
+   * dispatch both halves from one C++ call. Additive tail slots; null
+   * simply makes the corresponding fv3_gpu_state_to_fv_phase_a/_c refuse
+   * with FV3_GPU_UNSUPPORTED_CONFIGURATION. */
+  LaunchFn state_to_fv_phase_a=nullptr;
+  LaunchFn state_to_fv_phase_c=nullptr;
 };
 
 int validate_execution_context(const ExecutionContext &, fv3_gpu_error *) noexcept;
