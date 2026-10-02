@@ -204,7 +204,16 @@ sub_j = local_rank_within_face / layout_x
 sub_i = local_rank_within_face mod layout_x
 ```
 
-**Unverified assumption, flagged again (unchanged from Prompt 113):** FMS's
+**RESOLVED by Prompt 115 (2026-10-01):** the assumption below is now
+VERIFIED, not just assumed. A Fortran-only `layout=(2,2)`/24-rank diagnostic
+(`RUN_FV3_LOG_FMS_LAYOUT_DIAG`-gated print in `domain_decomp`) confirmed
+`local_rank_within_tile = sub_j*layout_x + sub_i` exactly, with zero
+exceptions across all 6 tiles, plus tile-major-contiguous grouping (4
+ranks/tile) and `mpp_pe()==MPI_Comm_rank()` identity. See
+`docs/performance/p115_fms_within_tile_rank_ordering_2026-10-01.md` for full
+detail. The paragraph below is retained for historical context only.
+
+~~Unverified assumption, flagged again (unchanged from Prompt 113):~~ FMS's
 actual within-tile rank ordering (row-major/x-fastest vs. column-major, and
 whether it is contiguous per-face at all under the real `mpp_domains`
 decomposition) has not been confirmed from FMS source — FMS is not vendored
@@ -216,6 +225,16 @@ decomposition metadata, which is a separate, larger task — see §11 Option A
 below).
 
 ## 11. Stage 15 — Next Task Selection
+
+**DONE (Prompt 115, 2026-10-01): Option A was executed and VERIFIED** — see
+`docs/performance/p115_fms_within_tile_rank_ordering_2026-10-01.md`.
+**DONE (Prompt 116, 2026-10-01): the resulting design task was executed** —
+see `docs/performance/p116_subtile_id_derivation_design_2026-10-01.md`
+(canonical derivation formula, C++-runtime location decision, NO new ABI
+field, exact 1×1 reduction proof, 24-rank oracle, recommended bounded next
+slice: derivation helper + 1×1 shadow-topology check + test-only oracle
+unit test — no gate relaxation). The recommendation text below is retained
+for historical context.
 
 **Recommended: Option A** — verify the real FMS within-tile rank ordering
 empirically via a Fortran-only test at `layout=(2,2)` (8 sub-tiles/face x 6
@@ -261,6 +280,6 @@ formula into one shared helper.
   a WIRES-ONLY task with no numerical-behavior change expected, but should
   not be cited as "NUMERICALLY VALIDATED" in the project's four-level
   terminology; it is GPU EXECUTED with a behavioral-neutrality smoke check.
-- The FMS within-tile rank-ordering assumption (§10) remains open; Option A
-  above is the recommended way to close it before any sub-tile topology
-  work.
+- **RESOLVED by Prompt 115** (2026-10-01): the FMS within-tile rank-ordering
+  assumption (§10) is now VERIFIED, not open — see
+  `docs/performance/p115_fms_within_tile_rank_ordering_2026-10-01.md`.

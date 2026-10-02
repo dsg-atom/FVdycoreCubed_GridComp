@@ -83,6 +83,15 @@ entirely in *layout*/*rank-within-tile*, not face id.
 
 ## 4. Rank-within-tile → (sub_i, sub_j) convention (Stage 4)
 
+**RESOLVED by Prompt 115 (2026-10-01):** the row-major/x-fastest convention
+assumed below is now empirically VERIFIED via a Fortran-only runtime
+diagnostic (`layout=(2,2)`, 24 real MPI ranks, `domain_decomp`'s own
+`is/ie/js/je` compute-domain bounds read directly), not merely assumed from
+documentation. See
+`docs/performance/p115_fms_within_tile_rank_ordering_2026-10-01.md`. The
+rest of this section is retained for historical context (it was correct,
+just previously unverified).
+
 **Not verifiable against literal FMS source in either project repository
 — FMS itself is a precompiled external dependency here** (confirmed:
 `find` for `mpp_domains*.F90` under `GEOSfvdycore_fortran_perf` returns
@@ -408,6 +417,11 @@ None of the listed stop conditions are triggered:
 | `build_rank_of_tile`'s own one-rank-per-tile gate | Not documented as a separate gate | **New**: a second, independent gate beyond the top-level `comm_size==6` check, must also be relaxed |
 | `mpp_get_layout` query API | Not evaluated | **New**: confirmed to exist and already be used elsewhere in this codebase (`fv_io.F90`), evaluated and not chosen over direct field access |
 | Row-major within-tile convention | Asserted, not source-verified | Re-confirmed still not source-verified (FMS not vendored); explicitly flagged with a mitigation (§16) rather than left silent |
+
+**RESOLVED by Prompt 115 (2026-10-01):** the row-major within-tile
+convention in the table's last row is now empirically VERIFIED via a real
+24-rank `layout=(2,2)` Fortran-only runtime diagnostic, not merely asserted
+— see `docs/performance/p115_fms_within_tile_rank_ordering_2026-10-01.md`.
 
 ---
 

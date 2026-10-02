@@ -1,16 +1,14 @@
 # Current Project State
 
-_Last updated 2026-09-30 (checkpoint: Prompt 114 — implemented Prompt
-113's bounded next task: wired `layout_x`/`layout_y` (from
-`Atm%layout(1:2)`) through the ABI/bridge/runtime, additive-only, no
-gate relaxation. Compile-verified against the REAL production fixture
-(Intel MPI `fvdycore` target); reconstructed the missing
-`build_cuda_r8_intelmpi` archive dir to reach a linked
-`StandAlone_FV3_Dycore.x`; GPU-executed clean C32 (6 ranks/1 GPU) and
-C512 (6 ranks/2 GPU/MPS) smokes, `layout=1x1` correct on every rank,
-timers within node-variance noise of pre-P114 baseline. All four
->6-rank gates re-confirmed untouched. No commit/push. Doc:
-`docs/performance/p114_fms_layout_bridge_abi_plumbing_2026-09-30.md`.
+_Last updated 2026-10-01 (checkpoint: Prompt 116 — DESIGN ONLY, no source
+changes. Designed the production `SubTileId{face,sub_i,sub_j}` derivation
+from `(mpi_rank, tile, layout_x, layout_y)` using Prompt 115's verified
+formula: **C++ runtime** location, **no new ABI field**, `pelist(1)` **not
+required**, exact 1×1 reduction, 24-rank oracle, **shadow-mode-first**
+builder migration. Recommended bounded next slice (SMALL, §9.1): pure
+derivation helper + oracle unit test + env-gated shadow-topology check — no
+ABI change, no gate relaxation, no real >6-rank run. No commit/push. Doc:
+`docs/performance/p116_subtile_id_derivation_design_2026-10-01.md`.
 Full history in `docs/agent_handoff/milestone_summary_2026-09-19.md`.
 This file holds only what the next coding agent needs to continue._
 
@@ -205,16 +203,22 @@ layout=2x2 cross-face donor; 112 fixed this by separating physical face
 bridge/gate relaxed, no corner transport, no numerical change, no
 commit/push throughout. Docs listed in §11.
 
-**Prompts 113-114 (CLOSED)**: 113 designed, 114 implemented, the FMS
+**Prompts 113-115 (CLOSED)**: 113 designed, 114 implemented, the FMS
 layout-metadata -> CUDA bridge integration. `Atm%layout(1:2)` confirmed
 authoritative; `layout_x/layout_y` now threaded additively through the
 ABI/runtime, `<=0`-defaults-to-1, GPU-executed clean at C32/C512-2GPU/MPS
 (jobs 58665460/58665576), `layout=1x1` correct every rank,
 behavior-neutral within node-variance noise. All four >6-rank gates
 re-confirmed untouched; a fifth, independent layout-consistency
-`MPI_Allgather` FATAL was added, not a relaxation. FMS within-tile rank
-ordering remains UNVERIFIED — recommended next step: Option A, a
-Fortran-only `layout=(2,2)` diagnostic (§9). Docs in §11.
+`MPI_Allgather` FATAL was added, not a relaxation. **115 VERIFIED** the
+previously-UNVERIFIED FMS within-tile rank ordering via a Fortran-only
+24-rank `layout=(2,2)` diagnostic (zero CUDA involvement):
+`local_rank_within_tile = sub_j*layout_x+sub_i` exactly, 4
+ranks/tile-contiguous, `mpp_pe()==MPI_Comm_rank()`. **116 DESIGNED**
+(no source change) the production `SubTileId` derivation: C++-runtime
+location, NO new ABI field, `pelist(1)` not required, exact 1×1
+reduction, 24-rank oracle, shadow-mode-first builder migration. See §9
+for the next step. Docs in §11.
 
 ## 6. Standalone Integration Status
 
@@ -287,30 +291,23 @@ Fortran-only `layout=(2,2)` diagnostic (§9). Docs in §11.
   `fv_restart.F90` without authorization (declined for P77).
 - **CUDA dyn_core bridge hardcodes `comm_size==6`** (one tile/rank), no
   intra-tile (same-face) halo path — the binding constraint for C1024+
-  (P102 §9: memory gap is per-rank, HIGH confidence). Architecture
-  mapped (Prompt 108); topology/donor-identification layer IMPLEMENTED +
-  GPU EXECUTED + VALIDATED for a synthetic 24-rank/2x2 layout (Prompt
-  109); Phase 5 field-data slice IMPLEMENTED (Prompt 111) then its
-  `launch_halo_transfer` blocker **FIXED and VALIDATED at real 24-rank
-  MPI scale (Prompt 112)** — the transport layer now separates physical
-  face (`.tile`, permanent 1..6) from transport peer identity (`.rank`,
-  generalized beyond 6) throughout builder/transfer/`MpiHaloTransport`.
-  **Still open**: the Fortran bridge's own `comm_size==6` gate and
-  `create_mpi_transport`'s production `comm_size==6` gate are both
-  intentionally untouched — no real >6-rank production path exists yet.
-  Bridge metadata plumbing **IMPLEMENTED by Prompt 114** (designed by
-  Prompt 113): `layout_x/layout_y`, derived from `Atm%layout(1:2)`, now
-  flow additively through the ABI/bridge/runtime, GPU-executed clean at
-  C32/C512 production scale, `layout=1x1` on every rank — WIRES ONLY, no
-  gate relaxed, no sub-tile derivation used anywhere (`p114_*.md`). The
-  second one-rank-per-tile gate inside `build_rank_of_tile`
-  (`fv3_gpu_dyncore_bridge.F90:1516`) remains unrelaxed; a new,
-  independent layout-consistency `MPI_Allgather` FATAL was added
-  alongside it. FMS within-tile rank ordering (row-major/x-fastest
-  assumption) remains UNVERIFIED — recommended next step is a
-  Fortran-only `layout=(2,2)` diagnostic (§9), before any sub-tile
-  topology-builder work. Corner transport remains metadata-only, no
-  message mechanism, separately gated.
+  (P102 §9: memory gap is per-rank, HIGH confidence). Full 108-112
+  sub-tile chain (architecture mapping -> topology/donor layer ->
+  Phase-5 wiring -> transport-peer-identity fix) is **CLOSED and
+  GPU-VALIDATED at real 24-rank MPI scale** — see §5/§11. Bridge
+  metadata plumbing (`layout_x/layout_y` from `Atm%layout(1:2)`,
+  Prompts 113-114) flows additively through ABI/bridge/runtime, WIRES
+  ONLY, no sub-tile derivation used in production. **Still open**: the
+  Fortran bridge's own `comm_size==6` gate
+  (`fv3_gpu_dyncore_bridge.F90:1516`) and `create_mpi_transport`'s
+  production `comm_size==6` gate remain intentionally untouched — no
+  real >6-rank production path exists yet. FMS within-tile rank
+  ordering is now **VERIFIED by Prompt 115** (`p115_*.md`); the
+  `SubTileId` derivation from it is now **DESIGNED by Prompt 116**
+  (`p116_*.md`, no source change) — C++-runtime location, no new ABI
+  field, no `pelist(1)` needed. See §9 for the next (implementation)
+  step before any sub-tile topology-builder work. Corner transport
+  remains metadata-only, no message mechanism, separately gated.
 
 ## 8. Critical "Do Not Repeat" Lessons
 
@@ -360,28 +357,34 @@ Fortran-only `layout=(2,2)` diagnostic (§9). Docs in §11.
 
 **Performance track (`optimization/cuda-fv3-performance`, current
 branch) — confirm scope before starting:**
-0. DONE through Prompt 112 — full detail in §5/§7 (do not reopen closed
-   CUDA-port decisions without fresh authorization). Sub-tile halo
-   chain: Prompt 108 mapped the C1024 architecture; Prompt 109
-   implemented/validated the topology/donor-identification layer;
-   Prompt 110 designed the Phase-5 wiring slice; Prompt 111 implemented
-   it and found the transfer-layer blocker; Prompt 112 fixed and
-   validated it at real 24-rank MPI scale — see §7's sub-tile bullet and
-   `p112_generalized_halo_transport_peer_ids_2026-09-30.md`.
-1. **DONE (Prompts 113-114): FMS layout metadata bridge-ABI plumbing,
-   designed then implemented.** `layout_x/layout_y` now flow through
-   the ABI/bridge/runtime, GPU-executed clean at C32/C512, all >6-rank
-   gates intact (`p114_*.md`). **Recommended next step: Option A** — a
-   Fortran-only `layout=(2,2)` diagnostic (print `Atm%layout`, each
-   rank's `(is,ie,js,je)` window, and `mpp_pe()`-relative ordering) to
-   empirically verify FMS's within-tile rank ordering before any
-   sub-tile topology-builder work is attempted; explicitly NOT Option C
-   (switching production topology construction). This remains
-   production-dispatch-adjacent and must not be attempted without
-   explicit sign-off. A C1024 run also needs its own `bdt` stability
-   search (§7). Lower priority: (a) Phase B corner-transport design
-   (deferred three times now); (b) fold Prompt 109's duplicated
-   vector-sign formula into one shared helper.
+0. DONE through Prompt 116 — full detail in §5/§7 (do not reopen closed
+   CUDA-port decisions, re-verify FMS layout ordering, or redo the
+   derivation design without fresh authorization). Sub-tile halo chain
+   (108-112): C1024 architecture mapped, topology/donor-identification
+   layer and Phase-5 field-data slice IMPLEMENTED + GPU EXECUTED +
+   VALIDATED at real 24-rank MPI scale — see §7's sub-tile bullet and
+   `p112_generalized_halo_transport_peer_ids_2026-09-30.md`. FMS layout
+   metadata bridge-ABI plumbing (113-114): `layout_x/layout_y` flow
+   through the ABI/bridge/runtime, GPU-executed clean at C32/C512, all
+   >6-rank gates intact (`p114_*.md`). FMS within-tile rank-ordering
+   verification (115): **VERIFIED** — see §5/§7/`p115_*.md`. Production
+   `SubTileId` derivation design (116): **DESIGNED, no source change** —
+   C++-runtime location, no new ABI field, no `pelist(1)` needed, exact
+   1×1 reduction, 24-rank oracle, shadow-mode-first migration strategy
+   — see §5/§7/`p116_*.md`.
+1. **Recommended next step (implementation, bounded, SMALL)**: execute
+   Prompt 116's slice — pure `subtile_id_from_rank(mpi_rank, tile,
+   layout_x, layout_y)` helper in `fv3_gpu_halo_subtile_topology.hpp` +
+   24-rank test-only oracle unit test (no MPI, no gate) + env-gated
+   (`RUN_CUDA_FV3_SHADOW_SUBTILE_TOPOLOGY`, default OFF) 1×1
+   shadow-topology equivalence check in `fv3_gpu_set_cubed_sphere_topology`
+   (FATAL-on-mismatch, debug/test only). No new ABI field, no gate
+   relaxation, no builder switch for real traffic, no real >6-rank run —
+   see `p116_*.md` §15-17 for the file list/stop-condition check. A
+   future C1024 run still needs its own `bdt` stability search (§7).
+   Lower priority: (a) Phase B corner-transport design (deferred three
+   times); (b) fold Prompt 109's duplicated vector-sign formula into one
+   shared helper.
 2. Lower priority: (a) tracer-numerics validation for the §7 cold-start
    tracer-zero limitation; (b) narrow `use_cuda_tp2d` to always-Fortran
    (hygiene); (c) `FV_DYNAMICS` non-loop residual (537.37 ms/call,
@@ -420,22 +423,22 @@ search); fix the `scratch_*.log`/stale-`EXPDIR` harness bug (§7).
   `Held_Suarez_ForcingMod.F90` (this repo's root) is referenced by the
   tracked `CMakeLists.txt`/`FV_StateMod.F90` but never committed here —
   build is broken from a fresh checkout of *this* repo until added.
-- Prompts 100-112 each added one untracked doc under `docs/performance/`
-  plus forward-pointing edits to prior docs. Prompt 111 added the
-  additive builder header + 2 new/extended test files; Prompt 112
-  modified `fv3_gpu_halo_mpi.{hpp,cpp}`, `fv3_gpu_halo_exchange.cu`,
-  `fv3_gpu_runtime.cpp` (peer-identity generalization) and added one new
-  test file (`test_halo_subtile_mpi_transport.cu`) + one
-  `CMakeLists.txt` target registration (§7's sub-tile bullet) — no
-  bridge/gate/numerical source touched by any of them. Prompt 113 added
-  one new untracked doc (`p113_*.md`, design/mapping only, zero source
-  touched) plus forward-pointing edits to `p112_*.md`, `p108_*.md`, and
-  the roadmap. Prompt 114 (edits detailed in §5) added 4 additive-only
-  source edits, one new doc, and reconstructed the previously-missing
-  `build_cuda_r8_intelmpi/` build dir (not to be committed) plus two new
-  rundirs and one sbatch script. Job scripts/rundirs live under the
-  separate `GEOSfvdycore_fortran_perf` checkout — not source, not
-  committed.
+- Prompts 100-116 each added one untracked doc under `docs/performance/`
+  plus forward-pointing edits to prior docs — no bridge/gate/numerical
+  production source touched by any doc-only prompt (113, 115, 116).
+  Prompt 111 added the additive builder header + 2 new/extended test
+  files; Prompt 112 modified `fv3_gpu_halo_mpi.{hpp,cpp}`,
+  `fv3_gpu_halo_exchange.cu`, `fv3_gpu_runtime.cpp` (peer-identity
+  generalization) + one new test file + one `CMakeLists.txt`
+  registration (§7's sub-tile bullet). Prompt 114 (detailed in §5) added
+  4 additive-only ABI/bridge/runtime source edits, one new doc, and
+  reconstructed the previously-missing `build_cuda_r8_intelmpi/` build
+  dir plus two rundirs/one sbatch script. Prompt 115 added one 2-edit,
+  env-gated diagnostic to `fv_mp_mod.F90` (`GEOSfvdycore_fortran_perf`
+  checkout only) + one doc + two rundirs. Prompt 116 added one new doc
+  only (`p116_*.md`), zero source files touched in either repo. Job
+  scripts/rundirs live under the separate `GEOSfvdycore_fortran_perf`
+  checkout — not source, not committed.
 - Untracked scratch scripts/logs/probes exist at repo root and under
   `perf_rerun_logs/`, `scratch_*/` — not source; review file-by-file
   before any future commit. Reusable tooling lives under `tools/`.
@@ -454,49 +457,27 @@ there for anything historical. Below is condensed in §5/§7/§9; read a
 file only for step-by-step detail.
 
 - `prompt_43`-`prompt_107_*` — full CUDA-aware `MpiHaloTransport`
-  bring-up through node-local multi-node GPU binding: PT/DELZ chain
-  (KEEP), REMAP_UV (production default), TRACER_2D (STOP CUDA TRACER
-  PRODUCTION OPTIMIZATION), REMAP_Q/REMAP_PRESSUREVARS (production
-  default), REMAP_TOTALENERGYCON (BLOCKED BY COMMUNICATION),
-  `FV_To_State` (KEEP ON CPU), `State_To_FV` (CUDA CONDITIONAL DEFAULT
-  at `device_count>=2`), 2-GPU C512 validation (TOTAL 1.120x/10.70%),
-  and node-local `MPI_Comm_split_type` GPU binding — all **CLOSED**,
-  fully condensed in §5/§7/§9; read the specific `p*.md` file only for
-  step-by-step numerical/job-ID detail.
-- `p108_*` — C1024 intra-tile halo-exchange architecture: 24-stage
-  design mapping the `comm_size==6` generalization (target 2x2
-  ranks/face, 24 ranks). **DESIGN/MAPPING ONLY, CLOSED** (header, §5,
-  §7, §9).
-- `p109_*` — Phases 1-4 of the above: sub-tile topology/donor
-  identification IMPLEMENTED/GPU EXECUTED/VALIDATED for a synthetic
-  24-rank layout; includes the `cubed_sphere_neighbor`
-  device-callability fix. **CLOSED** (header, §5, §7, §9).
-- `p110_*` — Phase 5 wiring design: mapped topology consumers, selected
-  the additive-builder + field-data-test-harness slice, deferred corners.
-  **DESIGN/SCOPING ONLY, CLOSED** (header, §7, §9).
-- `p111_*` — implemented the Phase-5 slice: additive builder + field-data
-  harness. layout=1x1 real-kernel regression bitwise-clean (0/20736
-  failures). layout=2x2 found `launch_halo_transfer`'s `peer_send`
-  index gated to `nb.tile` in `[1,6]`, a whole-subsystem fixed-6-tile
-  constraint. **IMPLEMENTED + GPU EXECUTED, BLOCKED, CLOSED** — blocker
-  fixed by Prompt 112 (header, §7, §9).
-- `p112_*` — generalized `launch_halo_transfer`/`MpiHaloTransport` peer
-  storage to separate physical face from transport-peer identity;
-  GPU-executed a real 24-rank synthetic MPI test (0/22224 failures, 0
-  sanitizer errors/rank); fixed-6 re-audit found no remaining
-  ungeneralized transport storage; corrected two prior docs' inaccurate
-  "`launch_halo_unpack` never reads `.tile`" claim. Bridge/MPI-factory
-  `comm_size==6` gates untouched. **IMPLEMENTED + GPU EXECUTED +
-  NUMERICALLY VALIDATED, CLOSED** (header, §5, §7, §9).
-- `p113_*`/`p114_*` — 113 designed, 114 implemented, the FMS
-  decomposition-metadata -> CUDA bridge integration: `Atm%layout(1:2)`
-  is the authoritative `layout_x/layout_y` source; threaded additively
-  through ABI/bridge/runtime; GPU-executed clean at C32/C512 production
-  scale, behavior-neutral within node-variance noise; all four >6-rank
-  gates re-confirmed untouched. FMS within-tile rank ordering remains an
-  unverified assumption — recommended next step is a Fortran-only
-  `layout=(2,2)` diagnostic (Option A), not a topology-builder switch.
-  **IMPLEMENTED + GPU EXECUTED, CLOSED** (header, §5, §7, §9).
+  bring-up through node-local multi-node GPU binding (PT/DELZ, REMAP_UV,
+  TRACER_2D, REMAP_Q/PRESSUREVARS, REMAP_TOTALENERGYCON, `FV_To_State`,
+  `State_To_FV`, 2-GPU C512, GPU binding) — all **CLOSED**, condensed in
+  §5/§7/§9; read a specific `p*.md` only for step-by-step detail.
+- `p108_*`-`p112_*` — C1024 sub-tile halo-exchange chain: 108 mapped the
+  24-stage architecture (design only); 109 implemented/validated the
+  topology/donor-identification layer at synthetic 24-rank scale; 110
+  designed the Phase-5 wiring slice; 111 implemented it and found the
+  `launch_halo_transfer` fixed-6-tile blocker; 112 fixed and
+  GPU-validated it at real 24-rank MPI scale (0/22224 failures). All
+  **CLOSED**, condensed in §5/§7/§9.
+- `p113_*`-`p116_*` — FMS layout metadata -> CUDA bridge integration: 113
+  designed, 114 implemented `layout_x/layout_y` ABI/bridge/runtime
+  plumbing (GPU-executed clean at C32/C512, all >6-rank gates intact);
+  115 VERIFIED the previously-UNVERIFIED within-tile rank ordering via a
+  Fortran-only 24-rank `layout=(2,2)` diagnostic
+  (`local_rank_within_tile = sub_j*layout_x+sub_i`, zero exceptions); 116
+  DESIGNED (no source change) the production `SubTileId` derivation from
+  that formula — C++-runtime location, no new ABI field, no `pelist(1)`
+  needed, exact 1×1 reduction, 24-rank oracle, shadow-mode-first builder
+  migration. All **CLOSED**, condensed in §5/§7/§9.
 
 ---
 

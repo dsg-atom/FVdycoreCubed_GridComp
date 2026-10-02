@@ -2033,3 +2033,50 @@ decision point pending explicit authorization to implement. See
     change, no CUDA-aware MPI, no production-default change, no R4
     change, no commit/push. See
     `docs/performance/p114_fms_layout_bridge_abi_plumbing_2026-09-30.md`.
+
+30. **Prompt 115 (2026-10-01, VERIFIED, CLOSED)**: executed Prompt 114's
+    recommended Option A — added a single `get_environment_variable`
+    ('RUN_FV3_LOG_FMS_LAYOUT_DIAG')-gated diagnostic print inside
+    `domain_decomp` (`fv_mp_mod.F90`), printing each rank's `gid`/`mpp_pe()`
+    /`Atm%tile`/`Atm%layout`/compute-and-data-domain bounds/
+    `MPI_Comm_rank`. Ran a 6-rank `layout=(1,1)` control (clean, sane) then
+    a real 24-rank `layout=(2,2)` Fortran-only test (C8, `RUN_CUDA_FV3=0`,
+    `compute` partition, no GPU requested) — both `rc=0`, zero FATAL/error,
+    zero CUDA/GPU string matches. Result: the row-major/x-fastest
+    convention assumed (but previously flagged UNVERIFIED) by Prompts
+    113/114 is **VERIFIED exactly**, zero exceptions across all 6 tiles —
+    `local_rank_within_tile = sub_j*layout_x + sub_i`, tile-major-contiguous
+    (4 ranks/tile), `mpp_pe()==MPI_Comm_rank()` identically (no
+    translation needed). Diagnostic is env-gated off by default — zero
+    production behavior change by construction. No CUDA source file
+    touched; none of the four >6-rank bridge/runtime gates read or
+    exercised. No gate relaxed, no corner transport, no numerical/seam-math
+    change, no CUDA-aware MPI, no production-default change, no R4 change,
+    no commit/push. Recommended next task: use the now-verified formula to
+    *design* (not yet implement) the CUDA bridge's sub-tile
+    rank->(sub_i,sub_j) derivation, before any gate relaxation. See
+    `docs/performance/p115_fms_within_tile_rank_ordering_2026-10-01.md`.
+
+31. **Prompt 116 (2026-10-01, DESIGN ONLY, CLOSED)**: designed the
+    production `SubTileId{face,sub_i,sub_j}` derivation from
+    `(mpi_rank, tile, layout_x, layout_y)` using Prompt 115's verified
+    formula. Key findings: derivation belongs in the **C++ runtime** (not
+    the Fortran bridge) — every required input (`mpi_rank`, `tile`,
+    `layout_x`, `layout_y`) already crosses the ABI unchanged, so **no new
+    ABI field is needed**; `pelist(1)` is **not required** (zero-based
+    `tile_start` is safe both structurally — single shared world
+    communicator, no FMS sub-communicator split anywhere in this
+    architecture — and empirically, per Prompt 115); the layout=1×1
+    reduction is **exact** (already proven by Prompt 111's own regression
+    tests); constructed the full 24-rank derivation oracle table; recommended
+    builder-migration strategy is **shadow-mode first** (generalized builder
+    runs env-gated/default-off alongside the unchanged legacy builder,
+    FATAL-on-mismatch in debug/test mode, proving exact equivalence before
+    any gate or call-site switch); `build_rank_of_tile`'s role narrows to
+    cluster-wide validation only, never derivation. Recommended bounded next
+    slice (SMALL): add the pure `subtile_id_from_rank(...)` helper + a
+    24-rank test-only oracle unit test (no MPI, no gate) + the env-gated 1×1
+    shadow-topology equivalence check — no ABI change, no gate relaxation,
+    no topology-builder switch, no real >6-rank CUDA run. All four >6-rank
+    gates confirmed untouched/unread for mutation. No commit/push. See
+    `docs/performance/p116_subtile_id_derivation_design_2026-10-01.md`.
